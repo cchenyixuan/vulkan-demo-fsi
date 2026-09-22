@@ -1,12 +1,10 @@
 """
 _run_v1_viewer.py — Lightweight single-GPU Vulkan + GLFW SPH viewer (V1).
 
-Single-GPU V1.0a "V0-collapse" mode (leading_ghost_pool_size =
-trailing_ghost_pool_size = 0): the V1 buffer layout collapses to V0's pid
-range, no ghost_send / install_migrations / worker threads / transfer queues —
-just one GPU running the classic 5-kernel step and one window rendering every
-particle. This is the LIGHTEST way to watch a case; the dual-GPU stack lives in
-_run_v1_dual_viewer.py (and the v5 tree) if you want the multi-GPU version.
+One GPU running the 5-kernel leapfrog step (predict → update_voxel →
+correction → density → force) and one window rendering every particle.
+This branch is single-GPU only; the multi-GPU stack lives on the
+v4-multigpu-orchestration branch.
 
 Two performance levers for a smooth demo:
   * validation is OFF by default (Vulkan validation layers cost real fps on a
@@ -121,8 +119,7 @@ def main() -> None:
         create_kwargs["device_index"] = args.device
 
     with VulkanContext.create(**create_kwargs) as ctx:
-        # V0-collapse mode: leading = trailing = 0 -> identical pid/voxel layout
-        # to V0, single-GPU, no ghost flow.
+        # Single GPU: pid layout [1, POOL_SIZE], voxel layout [1, NX*NY*NZ].
         sim = SphSimulatorV1(ctx, case)
         try:
             sim.bootstrap()

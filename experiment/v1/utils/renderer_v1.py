@@ -1,20 +1,11 @@
 """
-renderer_v1.py — V1.0a fork of utils/sph/renderer.py for SphSimulatorV1.
+renderer_v1.py — Vulkan + GLFW point-sprite renderer for SphSimulatorV1.
 
-Forked because V0's renderer assumes pid range starts at 1 (slot 0 unused) and
-spans [1, OWN_POOL_SIZE]. In V1 dual-GPU, GPU 1's own pid range is shifted to
-[LEADING_GHOST_POOL_SIZE+1, LEADING+OWN_POOL_SIZE], with leading-ghost-pid
-[1, LEADING] holding peer's replicas (NOT this GPU's own particles), and
-own's tail [OWN_POOL+1 .. own_last_pid] holding migration arrivals from peer.
-
-V0's `vkCmdDraw(cmd, OWN_POOL_SIZE, 1, 0, 0)` + `gl_VertexIndex+1u`
-=> draws pids [1, OWN_POOL_SIZE], which on GPU 1 paints leading-ghost-pid
-replicas as if they were own AND misses the tail where install_migrations
-writes — newly arrived migrants are invisible.
-
-Fix is one-line on host: `firstVertex = own_first_pid - 1` so vertex shader's
-`gl_VertexIndex + 1u` yields particle_id ∈ [own_first_pid, own_last_pid].
-Vertex shader is unchanged (V0 SPV reused).
+Draws the simulator's pid range [own_first_pid, own_last_pid] by passing
+firstVertex = own_first_pid - 1 to vkCmdDraw (single-GPU: own_first_pid = 1,
+so the whole pool is drawn). Owns its render shaders
+(experiment/v1/shaders/render/) so color modes (e.g. vorticity) can evolve
+together with the compute kernels.
 
 Attaches to an SphSimulatorV1 without modifying it.
 Reads particle SSBOs by binding them as descriptor inputs to a graphics
@@ -87,12 +78,12 @@ PUSH_CONSTANT_SIZE = 64 + 4 * 8
 
 
 class SphRendererV1:
-    """V1 fork of SphRenderer; draws OWN pid range only (skipping ghost-pid
-    slots) by passing firstVertex = own_first_pid - 1 to vkCmdDraw.
+    """Point-sprite renderer for SphSimulatorV1; draws the simulator's pid
+    range by passing firstVertex = own_first_pid - 1 to vkCmdDraw.
 
     Use:
-        sim = SphSimulatorV1(ctx, slab_case, leading_ghost_pool_size=L, ...)
-        sim.bootstrap()  (or dual-GPU bootstrap dance)
+        sim = SphSimulatorV1(ctx, case)
+        sim.bootstrap()
         viewer = SphRendererV1(sim, window_width=1280, window_height=720)
         viewer.run()
         viewer.destroy()
@@ -841,11 +832,9 @@ class SphRendererV1:
             0, PUSH_CONSTANT_SIZE, push_cdata,
         )
 
-        # V1 fix: draw OWN pid range only, skipping leading-ghost-pid slots
-        # (which hold peer's replicas, not this GPU's own particles).
         # firstVertex = own_first_pid - 1 shifts gl_VertexIndex so that the
         # vertex shader's `gl_VertexIndex + 1u` lands at own_first_pid for
-        # vertex 0 and own_last_pid for vertex (OWN_POOL_SIZE - 1).
+        # vertex 0 and own_last_pid for vertex (POOL_SIZE - 1).
         own_pool = self.case.capacities.pool_size
         first_vertex = self.simulator.own_first_pid() - 1
         vkCmdDraw(cmd, own_pool, 1, first_vertex, 0)

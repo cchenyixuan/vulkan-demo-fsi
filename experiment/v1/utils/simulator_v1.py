@@ -1,50 +1,30 @@
 """
-simulator_v1.py — V1.0a SPH simulator for ONE GPU's slab.
+simulator_v1.py — V1 SPH simulator, single GPU.
 
-Mirrors utils/sph/simulator.py (V0) structurally, with V1.0a merged-buffer
-extensions:
-  * set 0 (particle SoA) sized for own + leading_ghost + trailing_ghost
-  * set 1 (voxel cells) sized for the EXTENDED grid (own + ghost columns)
-  * set 2 unused (V1.0a merges ghost into set 0 / set 1); placeholder layout
-  * GlobalStatusBuffer (set 3 binding 0) uses the V1 16-uint layout
-  * adds ghost_send.comp + install_migrations.comp pipelines, one per
-    direction (leading / trailing) — only created when the corresponding
-    ghost voxel range is non-empty (V1.0a path 2)
-  * defrag.comp picks up its V1.0a own-pid scatter (own_first_pid base) and
-    its post-dispatch host orchestration includes resetting
-    `migration_install_count` for the next defrag cycle
+Structure mirrors utils/sph/simulator.py (V0) with the V1 additions that
+survived the single-GPU cut:
+  * set 0 (particle SoA, 10 bindings incl. density scratch + extension_fields)
+  * set 1 (voxel cells: inside / incoming counts + index lists + base offset)
+  * set 2 unused (kept as an empty placeholder layout so common.glsl's
+    descriptor numbering is unchanged)
+  * set 3 (global_status 16-uint block, overflow log, inlet template,
+    dispatch indirect, material_parameters, defrag scratch counter)
+  * defrag.comp with copy-back (scratch set 4 → set 0) on a fixed cadence
 
-Single-GPU mode (default kwargs):
-  leading_ghost_pool_size   = 0
-  trailing_ghost_pool_size  = 0
-  leading_ghost_voxel_count = 0
-  trailing_ghost_voxel_count= 0
+Pid layout is [1, POOL_SIZE] and voxel layout is [1, NX*NY*NZ]; slot 0 is the
+dead / unallocated sentinel everywhere (see shaders/README.md). The ghost
+pool / ghost voxel spec constants that common.glsl still declares are pinned
+to 0, so every multi-GPU branch inside the kernels is dead-code-eliminated
+and the layout collapses to the V0 one. The multi-GPU ghost / migration
+drivers live on the v4-multigpu-orchestration branch, not here.
 
-  → pid layout collapses to [1, OWN_POOL_SIZE], voxel layout collapses to
-  [1, OWN_NX*NY*NZ]. ghost_send / install_migrations pipelines are NOT
-  created. Step cmd reduces to V0 sequence. Numerically equivalent to V0
-  on the same case, used for #40 validation.
+Per-step command buffer (leapfrog, 5 kernels):
+    predict → update_voxel → correction → density → (scratch→primary copy)
+    → force
 
-Dual-GPU mode (called from #38 driver):
-  Pool sizes + voxel counts + per-direction transport configs (boundary
-  x_local, ghost x_local, pid offset, voxel-id offset) are provided.
-  ghost_send / install_migrations are created and dispatched. Cross-GPU
-  transport is the driver's responsibility — this simulator records the
-  GPU-local part only. Driver inserts its own vkCmdCopyBuffer / CPU-stage
-  between bootstrap_pre_sync_cmd and bootstrap_post_sync_cmd, and between
-  step_pre_sync_cmd and step_post_sync_cmd.
-
-V1 isolation rule (memory: feedback_v1_isolation): this file lives under
-experiment/v1/ and may IMPORT shared algorithm-spec types (Case,
-VulkanContext) from utils/sph/, but never modifies them.
-
-Density staging: scratch+copy. Same as V0 — density.comp writes
-`density_pressure_scratch` (set 0 binding 2), then vkCmdCopyBuffer copies
-scratch → primary inside the same step cmd.
-
-Defrag: V1.0a copy-back (matches V0). The V1 defrag.comp docstring
-mentions a future bank-swap optimization; this simulator uses copy-back
-for now to keep descriptor-set wiring static.
+Density staging: scratch+copy. density.comp writes `density_pressure_scratch`
+(set 0 binding 2), then vkCmdCopyBuffer copies scratch → primary inside the
+same step cmd so force.comp sees ρ_{n+1}, P_{n+1}.
 """
 
 import pathlib
@@ -77,22 +57,7 @@ SHADER_NAMES_HOT = [
     "force",
     "bootstrap_half_kick",
 ]
-# V1.0a additions. Each ghost_send / install_migrations pipeline is per-direction
-# via spec const id 90; we compile two specializations per shader at pipeline
-# creation time (one for leading, one for trailing).
-SHADER_NAME_GHOST_SEND = "ghost_send"
-SHADER_NAME_INSTALL_MIGRATIONS = "install_migrations"
 SHADER_NAME_DEFRAG = "defrag"
-
-# Direction spec const values (id=90 in ghost_send.comp + install_migrations.comp).
-DIRECTION_LEADING = 0
-DIRECTION_TRAILING = 1
-
-# Per-direction pipeline keys (used for self.pipelines / self.shader_modules dicts).
-PIPELINE_KEY_GHOST_SEND_LEADING            = "ghost_send_leading"
-PIPELINE_KEY_GHOST_SEND_TRAILING           = "ghost_send_trailing"
-PIPELINE_KEY_INSTALL_MIGRATIONS_LEADING    = "install_migrations_leading"
-PIPELINE_KEY_INSTALL_MIGRATIONS_TRAILING   = "install_migrations_trailing"
 
 
 # Spec const ids (mirrors experiment/v1/shaders/common.glsl id ranges).
@@ -135,17 +100,14 @@ SPEC_ID_MAX_PARTICLES_PER_VOXEL             = 50
 SPEC_ID_WORKGROUP_SIZE                      = 51
 SPEC_ID_MAX_INCOMING_PER_VOXEL              = 52
 SPEC_ID_OWN_POOL_SIZE                       = 53
+# Ghost pool / ghost voxel ids are still declared in common.glsl (V1
+# merged-buffer layout). This branch is single-GPU only: they are pinned
+# to 0 so every ghost branch in the kernels is dead-code-eliminated and
+# the pid / voxel layout collapses to [1, POOL_SIZE] / [1, NX*NY*NZ].
 SPEC_ID_LEADING_GHOST_POOL_SIZE             = 54
 SPEC_ID_TRAILING_GHOST_POOL_SIZE            = 55
 SPEC_ID_LEADING_GHOST_VOXEL_COUNT           = 80
 SPEC_ID_TRAILING_GHOST_VOXEL_COUNT          = 81
-
-# Per-pipeline (ghost_send / install_migrations only).
-SPEC_ID_GHOST_DIRECTION                     = 90
-SPEC_ID_BOUNDARY_VOXEL_X_LOCAL              = 91
-SPEC_ID_GHOST_VOXEL_X_LOCAL                 = 92
-SPEC_ID_GHOST_PID_OFFSET_TO_RECEIVER        = 93
-SPEC_ID_GHOST_VOXEL_ID_OFFSET_TO_RECEIVER   = 94
 
 
 # ============================================================================
@@ -171,46 +133,20 @@ class _BufferSpec:
     usage: int
 
 
-@dataclass
-class GhostTransportConfig:
-    """Per-direction spec const block for ghost_send + install_migrations.
-
-    Computed by the dual-GPU driver (#38) from the partition + each peer's
-    own pool/grid layout. In single-GPU standalone mode, leave the
-    corresponding direction's config = None and the simulator skips creating
-    that direction's pipelines.
-    """
-    boundary_voxel_x_local: int          # outermost own column on send side, in local extended-grid x
-    ghost_voxel_x_local: int             # ghost column adjacent to boundary on send side (= 0 or extended_nx-1)
-    ghost_pid_offset_to_receiver: int    # signed: peer.dest_first_pid - my.dest_first_pid
-    ghost_voxel_id_offset_to_receiver: int  # signed: Option B convention (helpers.glsl)
-
-
 # ============================================================================
 # SphSimulatorV1
 # ============================================================================
 
 
 class SphSimulatorV1:
-    """V1.0a SPH simulator — single-GPU slab core.
+    """V1 SPH simulator — single GPU.
 
-    Lifecycle (matches V0):
+    Lifecycle:
         with VulkanContext.create() as ctx:
-            sim = SphSimulatorV1(ctx, case)            # V0-collapse: standalone
+            sim = SphSimulatorV1(ctx, case)
             sim.bootstrap()
             sim.run_until(total_time=1.0)
             sim.destroy()
-
-    Multi-GPU usage (#38, sketched):
-        sim = SphSimulatorV1(ctx, slab_case,
-                             leading_ghost_pool_size=L,
-                             trailing_ghost_pool_size=T,
-                             leading_ghost_voxel_count=Lv,
-                             trailing_ghost_voxel_count=Tv,
-                             leading_transport_config=cfg_lead,    # or None at end-of-chain
-                             trailing_transport_config=cfg_trail)
-        # driver records cross-GPU transport between sim_a's pre_sync_cmd
-        # and sim_a's post_sync_cmd.
     """
 
     # Defrag set 4 mirrors set 0 except binding 2 (density_pressure_scratch
@@ -221,93 +157,28 @@ class SphSimulatorV1:
     # Construction
     # ------------------------------------------------------------------
 
-    def __init__(
-        self,
-        ctx: VulkanContext,
-        case: Case,
-        *,
-        leading_ghost_pool_size: int = 0,
-        trailing_ghost_pool_size: int = 0,
-        leading_ghost_voxel_count: int = 0,
-        trailing_ghost_voxel_count: int = 0,
-        leading_transport_config: Optional[GhostTransportConfig] = None,
-        trailing_transport_config: Optional[GhostTransportConfig] = None,
-        ghost_voxel_x_thickness_leading: int = 0,
-        ghost_voxel_x_thickness_trailing: int = 0,
-    ):
+    def __init__(self, ctx: VulkanContext, case: Case):
         self.ctx = ctx
         self.case = case
         self._destroyed = False
 
-        # ---- Ghost dimensions (V1 spec const inputs) ------------------------
-        self.leading_ghost_pool_size    = int(leading_ghost_pool_size)
-        self.trailing_ghost_pool_size   = int(trailing_ghost_pool_size)
-        self.leading_ghost_voxel_count  = int(leading_ghost_voxel_count)
-        self.trailing_ghost_voxel_count = int(trailing_ghost_voxel_count)
-        self.ghost_voxel_x_thickness_leading  = int(ghost_voxel_x_thickness_leading)
-        self.ghost_voxel_x_thickness_trailing = int(ghost_voxel_x_thickness_trailing)
-
-        # Sanity: ghost_voxel_count must equal NY * NZ * thickness when nonzero.
-        own_nx, ny, nz = (int(case.grid["dimension"][0]),
-                          int(case.grid["dimension"][1]),
-                          int(case.grid["dimension"][2]))
-        per_column = ny * nz
-        if self.leading_ghost_voxel_count and (
-                self.leading_ghost_voxel_count
-                != per_column * self.ghost_voxel_x_thickness_leading):
-            raise ValueError(
-                f"leading_ghost_voxel_count={self.leading_ghost_voxel_count} "
-                f"must equal NY*NZ*thickness="
-                f"{per_column}*{self.ghost_voxel_x_thickness_leading}")
-        if self.trailing_ghost_voxel_count and (
-                self.trailing_ghost_voxel_count
-                != per_column * self.ghost_voxel_x_thickness_trailing):
-            raise ValueError(
-                f"trailing_ghost_voxel_count={self.trailing_ghost_voxel_count} "
-                f"must equal NY*NZ*thickness="
-                f"{per_column}*{self.ghost_voxel_x_thickness_trailing}")
-
-        # ---- Extended grid dimensions (= own + leading + trailing thickness) ----
-        # V1 GRID_DIMENSION_X is the EXTENDED nx (helpers.glsl line 89).
-        # OWN_ORIGIN_X is shifted so voxel (0,0,0) sits at the leading-most edge.
-        self.extended_nx = own_nx \
-            + self.ghost_voxel_x_thickness_leading \
-            + self.ghost_voxel_x_thickness_trailing
-        self.own_nx_local = own_nx
-        self.ny = ny
-        self.nz = nz
-        h = float(case.physics.h)
+        # ---- Grid dimensions + origin (straight from the case) --------------
+        self.nx = int(case.grid["dimension"][0])
+        self.ny = int(case.grid["dimension"][1])
+        self.nz = int(case.grid["dimension"][2])
         case_origin = case.grid["origin"]
-        self.own_origin_x = float(case_origin[0]) - self.ghost_voxel_x_thickness_leading * h
+        self.own_origin_x = float(case_origin[0])
         self.own_origin_y = float(case_origin[1])
         self.own_origin_z = float(case_origin[2])
-
-        # ---- Per-direction transport configs --------------------------------
-        # Either both nonzero (real peer on this side) or both zero (no peer).
-        if (self.leading_ghost_pool_size > 0) != (leading_transport_config is not None):
-            raise ValueError(
-                "leading_ghost_pool_size > 0 requires leading_transport_config "
-                "(and vice versa)")
-        if (self.trailing_ghost_pool_size > 0) != (trailing_transport_config is not None):
-            raise ValueError(
-                "trailing_ghost_pool_size > 0 requires trailing_transport_config "
-                "(and vice versa)")
-        self.leading_transport_config  = leading_transport_config
-        self.trailing_transport_config = trailing_transport_config
-
-        # has_leading_peer / has_trailing_peer: drives conditional pipeline creation
-        # + step cmd dispatch inclusion. In V0-collapse mode both are False.
-        self.has_leading_peer  = self.leading_ghost_pool_size > 0
-        self.has_trailing_peer = self.trailing_ghost_pool_size > 0
 
         # ---- Run state ------------------------------------------------------
         self.simulation_time = 0.0
         self.step_count = 0
 
-        # ---- Pre-flight + setup pipeline (mirrors V0 ordering) --------------
+        # ---- Pre-flight + setup pipeline -------------------------------------
         self._check_workgroup_limit()
 
-        # Section 1: load shader modules (hot + ghost + defrag).
+        # Section 1: load shader modules (hot + defrag).
         self.shader_modules: dict = self._load_shader_modules()
 
         # Section 2 + 3: allocate buffers, then upload initial state.
@@ -327,26 +198,18 @@ class SphSimulatorV1:
         # Section 5: pipeline layout(s) + spec consts + pipelines.
         self.pipeline_layout = self._build_pipeline_layout()
         self.defrag_pipeline_layout = self._build_defrag_pipeline_layout()
-        # Spec const data + entry list + per-direction copies are kept alive on
-        # self for the lifetime of all pipelines (Vulkan does NOT copy them).
+        # Spec const data + entry list are kept alive on self for the lifetime
+        # of all pipelines (Vulkan does NOT copy them).
         self._spec_keepalive: list = []
         self.spec_info_global = self._build_global_spec_info()
         self.pipelines: dict = self._build_compute_pipelines()
         self.defrag_pipeline = self._build_defrag_pipeline()
 
-        # Section 6: pre-recorded command buffers.
-        # Single-GPU path (`step()`, `bootstrap()`) submits the COMBINED cmd
-        # buffer in one queue submission — minimal fence overhead.
-        # Multi-GPU driver (#38) submits PRE_SYNC, runs cross-GPU transport,
-        # then submits POST_SYNC — paying 2 fences but unblocking transport
-        # between phases.
+        # Section 6: pre-recorded command buffers. `step()` / `bootstrap()`
+        # submit one combined cmd buffer per call — minimal fence overhead.
         self.bootstrap_cmd = self._record_bootstrap_cmd()
         self.step_cmd = self._record_step_cmd()
         self.defrag_cmd = self._record_defrag_cmd()
-        self.step_pre_sync_cmd = self._record_step_pre_sync_cmd()
-        self.step_post_sync_cmd = self._record_step_post_sync_cmd()
-        self.bootstrap_pre_sync_cmd = self._record_bootstrap_pre_sync_cmd()
-        self.bootstrap_post_sync_cmd = self._record_bootstrap_post_sync_cmd()
 
     # ==================================================================
     # Section 0: pre-flight
@@ -375,9 +238,6 @@ class SphSimulatorV1:
     def _load_shader_modules(self) -> dict:
         modules: dict = {}
         names = list(SHADER_NAMES_HOT) + [SHADER_NAME_DEFRAG]
-        # Conditional ghost shaders.
-        if self.has_leading_peer or self.has_trailing_peer:
-            names += [SHADER_NAME_GHOST_SEND, SHADER_NAME_INSTALL_MIGRATIONS]
         for name in names:
             spv_path = SHADER_DIR / f"{name}.comp.spv"
             if not spv_path.exists():
@@ -400,16 +260,11 @@ class SphSimulatorV1:
     def _build_buffer_specs(self) -> list[_BufferSpec]:
         case = self.case
         own_pool_size = int(case.capacities.pool_size)
-        # V1 buffer total size for set 0:
-        #   slot 0 unused + leading ghost + own + trailing ghost
-        pool_capacity = (1
-                         + self.leading_ghost_pool_size
-                         + own_pool_size
-                         + self.trailing_ghost_pool_size)
+        # Set 0: slot 0 unused + POOL_SIZE particles.
+        pool_capacity = 1 + own_pool_size
 
-        # V1 voxel total size for set 1:
-        #   slot 0 unused + extended_nx * ny * nz
-        voxel_capacity = 1 + self.extended_nx * self.ny * self.nz
+        # Set 1: slot 0 unused + nx * ny * nz voxels.
+        voxel_capacity = 1 + self.nx * self.ny * self.nz
 
         cap_inside = int(case.capacities.max_per_voxel)
         cap_incoming = int(case.capacities.max_incoming)
@@ -440,7 +295,7 @@ class SphSimulatorV1:
             _BufferSpec("incoming_particle_index",      1, 3,  4 * voxel_capacity * cap_incoming,   BSU | TRANSFER),
             _BufferSpec("voxel_base_offset",            1, 4,  4 * voxel_capacity,                  BSU | TRANSFER),
 
-            # ---- Set 2: UNUSED in V1.0a (no bindings) — placeholder layout
+            # ---- Set 2: UNUSED (no bindings) — placeholder layout
             # is built in _build_descriptor_layouts. No buffer specs.
 
             # ---- Set 3: global / transport / materials ---------------------
@@ -517,23 +372,19 @@ class SphSimulatorV1:
     # ==================================================================
 
     def own_first_pid(self) -> int:
-        """Mirror helpers.glsl own_first_pid()."""
-        return self.leading_ghost_pool_size + 1
+        """Mirror helpers.glsl own_first_pid(): the pid range starts at 1
+        (slot 0 is the dead / unallocated sentinel)."""
+        return 1
 
     def own_last_pid(self) -> int:
         """Mirror helpers.glsl own_last_pid()."""
-        return self.leading_ghost_pool_size + int(self.case.capacities.pool_size)
+        return int(self.case.capacities.pool_size)
 
     def _build_initial_data(self) -> dict[str, bytes]:
-        """Place own particles starting at own_first_pid() (V1 layout).
-        Ghost-pid range stays zero-init; sync 1 of step 1 (or bootstrap sync)
-        will populate it from peer."""
+        """Place particles starting at own_first_pid() (= 1; slot 0 unused)."""
         case = self.case
         own_pool_size = int(case.capacities.pool_size)
-        pool_capacity = (1
-                         + self.leading_ghost_pool_size
-                         + own_pool_size
-                         + self.trailing_ghost_pool_size)
+        pool_capacity = 1 + own_pool_size
         data: dict[str, bytes] = {}
 
         own_first = self.own_first_pid()
@@ -840,9 +691,9 @@ class SphSimulatorV1:
             (SPEC_ID_OWN_ORIGIN_X,                 float(self.own_origin_x),                  'f'),
             (SPEC_ID_OWN_ORIGIN_Y,                 float(self.own_origin_y),                  'f'),
             (SPEC_ID_OWN_ORIGIN_Z,                 float(self.own_origin_z),                  'f'),
-            # V1 default: STRICT_BIT_EXACT off in single-GPU; #38 driver may override.
+            # STRICT_BIT_EXACT only mattered for multi-GPU ghost integration; off.
             (SPEC_ID_STRICT_BIT_EXACT,             0,                                         'I'),
-            (SPEC_ID_GRID_DIMENSION_X,             int(self.extended_nx),                     'I'),
+            (SPEC_ID_GRID_DIMENSION_X,             int(self.nx),                              'I'),
             (SPEC_ID_GRID_DIMENSION_Y,             int(self.ny),                              'I'),
             (SPEC_ID_GRID_DIMENSION_Z,             int(self.nz),                              'I'),
             (SPEC_ID_REGULARIZATION_XI,            float(numerics.regularization.xi),         'f'),
@@ -868,35 +719,19 @@ class SphSimulatorV1:
             (SPEC_ID_WORKGROUP_SIZE,               int(capacities.workgroup),                 'I'),
             (SPEC_ID_MAX_INCOMING_PER_VOXEL,       int(capacities.max_incoming),              'I'),
             (SPEC_ID_OWN_POOL_SIZE,                int(capacities.pool_size),                 'I'),
-            (SPEC_ID_LEADING_GHOST_POOL_SIZE,      int(self.leading_ghost_pool_size),         'I'),
-            (SPEC_ID_TRAILING_GHOST_POOL_SIZE,     int(self.trailing_ghost_pool_size),        'I'),
-            (SPEC_ID_LEADING_GHOST_VOXEL_COUNT,    int(self.leading_ghost_voxel_count),       'I'),
-            (SPEC_ID_TRAILING_GHOST_VOXEL_COUNT,   int(self.trailing_ghost_voxel_count),      'I'),
+            # Single-GPU: no ghost pool / ghost voxels (see SPEC_ID_*_GHOST_* note).
+            (SPEC_ID_LEADING_GHOST_POOL_SIZE,      0,                                         'I'),
+            (SPEC_ID_TRAILING_GHOST_POOL_SIZE,     0,                                         'I'),
+            (SPEC_ID_LEADING_GHOST_VOXEL_COUNT,    0,                                         'I'),
+            (SPEC_ID_TRAILING_GHOST_VOXEL_COUNT,   0,                                         'I'),
         ]
 
     def _build_global_spec_info(self):
         """Spec const for non-ghost pipelines (hot kernels + defrag)."""
         return self._pack_spec_blob(self._global_spec_entries())
 
-    def _build_ghost_spec_info(self, direction: int, transport: GhostTransportConfig):
-        """Spec const for one direction of ghost_send / install_migrations.
-        Adds the per-pipeline ids (90-94) on top of the global set."""
-        entries = list(self._global_spec_entries())
-        entries.append((SPEC_ID_GHOST_DIRECTION,                       int(direction),                                 'I'))
-        entries.append((SPEC_ID_BOUNDARY_VOXEL_X_LOCAL,                int(transport.boundary_voxel_x_local),          'I'))
-        entries.append((SPEC_ID_GHOST_VOXEL_X_LOCAL,                   int(transport.ghost_voxel_x_local),             'I'))
-        entries.append((SPEC_ID_GHOST_PID_OFFSET_TO_RECEIVER,          int(transport.ghost_pid_offset_to_receiver),    'i'))
-        entries.append((SPEC_ID_GHOST_VOXEL_ID_OFFSET_TO_RECEIVER,     int(transport.ghost_voxel_id_offset_to_receiver), 'i'))
-        return self._pack_spec_blob(entries)
-
-    def _build_install_migrations_spec_info(self, direction: int):
-        """install_migrations only needs id 90 (GHOST_DIRECTION) on top of globals."""
-        entries = list(self._global_spec_entries())
-        entries.append((SPEC_ID_GHOST_DIRECTION, int(direction), 'I'))
-        return self._pack_spec_blob(entries)
-
     def _build_compute_pipelines(self) -> dict:
-        """Hot kernels + (conditionally) per-direction ghost_send + install_migrations."""
+        """Hot kernels (all share the global spec consts)."""
         pipelines: dict = {}
 
         # ---- Hot kernels (use global spec consts) --------------------------
@@ -915,47 +750,7 @@ class SphSimulatorV1:
             len(create_infos), create_infos, None)
         pipelines.update(zip(SHADER_NAMES_HOT, result))
 
-        # ---- Per-direction ghost_send + install_migrations ------------------
-        if self.has_leading_peer:
-            self._add_ghost_direction_pipelines(
-                pipelines, DIRECTION_LEADING, self.leading_transport_config,
-                PIPELINE_KEY_GHOST_SEND_LEADING,
-                PIPELINE_KEY_INSTALL_MIGRATIONS_LEADING)
-        if self.has_trailing_peer:
-            self._add_ghost_direction_pipelines(
-                pipelines, DIRECTION_TRAILING, self.trailing_transport_config,
-                PIPELINE_KEY_GHOST_SEND_TRAILING,
-                PIPELINE_KEY_INSTALL_MIGRATIONS_TRAILING)
-
         return pipelines
-
-    def _add_ghost_direction_pipelines(
-        self, pipelines: dict, direction: int,
-        transport: GhostTransportConfig,
-        ghost_send_key: str, install_key: str,
-    ) -> None:
-        gs_spec = self._build_ghost_spec_info(direction, transport)
-        im_spec = self._build_install_migrations_spec_info(direction)
-
-        gs_stage = VkPipelineShaderStageCreateInfo(
-            stage=VK_SHADER_STAGE_COMPUTE_BIT,
-            module=self.shader_modules[SHADER_NAME_GHOST_SEND],
-            pName="main",
-            pSpecializationInfo=gs_spec,
-        )
-        im_stage = VkPipelineShaderStageCreateInfo(
-            stage=VK_SHADER_STAGE_COMPUTE_BIT,
-            module=self.shader_modules[SHADER_NAME_INSTALL_MIGRATIONS],
-            pName="main",
-            pSpecializationInfo=im_spec,
-        )
-        result = vkCreateComputePipelines(
-            self.ctx.device, VK_NULL_HANDLE, 2, [
-                VkComputePipelineCreateInfo(stage=gs_stage, layout=self.pipeline_layout),
-                VkComputePipelineCreateInfo(stage=im_stage, layout=self.pipeline_layout),
-            ], None)
-        pipelines[ghost_send_key] = result[0]
-        pipelines[install_key]    = result[1]
 
     def _build_defrag_pipeline(self):
         stage = VkPipelineShaderStageCreateInfo(
@@ -1001,12 +796,8 @@ class SphSimulatorV1:
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 1, [compute_to_transfer], 0, None, 0, None)
-        # Copy ONLY the own pid range. The ghost-pid range was just populated
-        # by sync 1 transport (with peer's density values); the scratch buffer
-        # is zero-init for ghost-pid slots (density.comp dispatches over own
-        # only, doesn't touch scratch in ghost range), so a full-buffer copy
-        # would overwrite ghost density with zeros and break force.comp's
-        # neighbor reads (volume = mass / 0 = inf → nan).
+        # Copy the particle pid range [own_first_pid, own_last_pid]; slot 0 is
+        # the unused sentinel and is left untouched.
         primary = self.buffers["density_pressure"]
         scratch = self.buffers["density_pressure_scratch"]
         density_stride = 8
@@ -1052,125 +843,17 @@ class SphSimulatorV1:
         own = int(self.case.capacities.pool_size)
         return (own + wg - 1) // wg
 
-    def _per_extended_voxel_dispatch_count(self) -> int:
-        """Per-voxel kernels (update_voxel, defrag) iterate the extended grid."""
+    def _per_voxel_dispatch_count(self) -> int:
+        """Per-voxel kernels (update_voxel, defrag) iterate the whole grid."""
         wg = int(self.case.capacities.workgroup)
-        voxel_count = self.extended_nx * self.ny * self.nz
+        voxel_count = self.nx * self.ny * self.nz
         return (voxel_count + wg - 1) // wg
-
-    def _per_yz_face_dispatch_count(self) -> int:
-        """ghost_send dispatches one thread per (y,z) face pair = NY*NZ."""
-        wg = int(self.case.capacities.workgroup)
-        face = self.ny * self.nz
-        return (face + wg - 1) // wg
-
-    def _per_ghost_pid_dispatch_count(self, pool_size: int) -> int:
-        """install_migrations dispatches over the receiver's ghost-pid range."""
-        wg = int(self.case.capacities.workgroup)
-        return (pool_size + wg - 1) // wg
 
     # ---- Step / bootstrap / defrag --------------------------------------------
 
-    def _record_reset_ghost_send_counts(self, cmd) -> None:
-        """Zero the GlobalStatusBuffer ghost_send_*_count fields BEFORE
-        ghost_send. ghost_send.comp uses atomicAdd on these to allocate
-        slots in the ghost-pid range; if non-zero from a previous step,
-        the slot offset overflows past the ghost pool and corrupts own
-        pid SoA. Per common.glsl docstring this reset is required.
-
-        Resets BOTH leading and trailing (4 bytes each) — cheap. Even if
-        only one direction has a peer, the unused field is no-op write.
-
-        Field offsets (V1 layout, 16-uint GlobalStatusBuffer):
-          [8] ghost_send_leading_count   → byte 32
-          [9] ghost_send_trailing_count  → byte 36
-        """
-        if not (self.has_leading_peer or self.has_trailing_peer):
-            return
-        gs = self.buffers["global_status"].handle
-        vkCmdFillBuffer(cmd, gs, 32, 4, 0)   # ghost_send_leading_count
-        vkCmdFillBuffer(cmd, gs, 36, 4, 0)   # ghost_send_trailing_count
-        # transfer-write → compute-shader-read barrier so ghost_send's
-        # atomicAdd sees the fresh zero.
-        barrier = VkMemoryBarrier(
-            sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
-            dstAccessMask=VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        )
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, [barrier], 0, None, 0, None)
-
-    def _record_ghost_send_phase(self, cmd) -> None:
-        """ghost_send dispatches (per-direction). Single-GPU collapse mode is
-        a no-op (no peer pipelines created). Caller MUST have reset the
-        ghost_send_*_count fields before this (see _record_reset_ghost_send_counts)."""
-        if not (self.has_leading_peer or self.has_trailing_peer):
-            return
-        per_yz = self._per_yz_face_dispatch_count()
-        if self.has_leading_peer:
-            self._bind_pipeline_and_sets(cmd, PIPELINE_KEY_GHOST_SEND_LEADING)
-            vkCmdDispatch(cmd, per_yz, 1, 1)
-            self._record_compute_barrier(cmd)
-        if self.has_trailing_peer:
-            self._bind_pipeline_and_sets(cmd, PIPELINE_KEY_GHOST_SEND_TRAILING)
-            vkCmdDispatch(cmd, per_yz, 1, 1)
-            self._record_compute_barrier(cmd)
-
-    def _record_install_migrations_phase(self, cmd) -> None:
-        """install_migrations dispatches (per-direction). No-op in standalone."""
-        if not (self.has_leading_peer or self.has_trailing_peer):
-            return
-        if self.has_leading_peer:
-            self._bind_pipeline_and_sets(cmd, PIPELINE_KEY_INSTALL_MIGRATIONS_LEADING)
-            vkCmdDispatch(cmd,
-                self._per_ghost_pid_dispatch_count(self.leading_ghost_pool_size), 1, 1)
-            self._record_compute_barrier(cmd)
-        if self.has_trailing_peer:
-            self._bind_pipeline_and_sets(cmd, PIPELINE_KEY_INSTALL_MIGRATIONS_TRAILING)
-            vkCmdDispatch(cmd,
-                self._per_ghost_pid_dispatch_count(self.trailing_ghost_pool_size), 1, 1)
-            self._record_compute_barrier(cmd)
-
-    def _record_ghost_sync_phase(self, cmd) -> None:
-        """Combined ghost_send + install_migrations. Used by single-GPU step
-        cmd (and standalone bootstrap). Multi-GPU driver bypasses this and
-        uses the split pre/post cmds with cross-GPU transport between."""
-        self._record_ghost_send_phase(cmd)
-        self._record_install_migrations_phase(cmd)
-
-    def _record_compute_to_transfer_read_barrier(self, cmd) -> None:
-        """Compute write → transfer read: lets cross-GPU readback see the
-        just-written ghost-pid / ghost-vid / send_count. Used at the end of
-        the pre_sync cmd buffer for multi-GPU pipelines."""
-        barrier = VkMemoryBarrier(
-            sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
-            dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT,
-        )
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 1, [barrier], 0, None, 0, None)
-
-    def _record_transfer_write_to_compute_barrier(self, cmd) -> None:
-        """Transfer write → compute read: lets install_migrations / hot
-        kernels see the just-uploaded ghost data. Used at the start of the
-        post_sync cmd buffer for multi-GPU pipelines."""
-        barrier = VkMemoryBarrier(
-            sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
-            dstAccessMask=VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        )
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, [barrier], 0, None, 0, None)
-
     def _record_bootstrap_cmd(self):
-        """initialize_voxelization → bootstrap sync → correction → density →
-        density_copy → force → bootstrap_half_kick."""
+        """initialize_voxelization → correction → density → density_copy →
+        force → bootstrap_half_kick."""
         cmd = self._allocate_oneshot_cmd()
         vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
             flags=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
@@ -1181,10 +864,6 @@ class SphSimulatorV1:
         self._bind_pipeline_and_sets(cmd, "initialize_voxelization")
         vkCmdDispatch(cmd, per_p, 1, 1)
         self._record_compute_barrier(cmd)
-
-        # Bootstrap ghost sync (degenerate: no migrations, only replicas).
-        self._record_reset_ghost_send_counts(cmd)
-        self._record_ghost_sync_phase(cmd)
 
         self._bind_pipeline_and_sets(cmd, "correction")
         vkCmdDispatch(cmd, per_p, 1, 1)
@@ -1204,153 +883,17 @@ class SphSimulatorV1:
         vkEndCommandBuffer(cmd)
         return cmd
 
-    # ---- Split cmd buffers for multi-GPU driver --------------------------
-    # The dual-GPU driver (#38) submits pre_sync_cmd on each GPU, waits for
-    # the fences, runs cross-GPU transport (CPU staging or P2P), then submits
-    # post_sync_cmd on each GPU. The pre/post combined cmd is also kept (for
-    # single-GPU step()) so the standalone path doesn't pay 2× submit cost.
-
-    def _record_step_pre_sync_cmd(self):
-        """predict → update_voxel → ghost_send (per-dir, conditional) →
-        compute→transfer barrier."""
-        cmd = self._allocate_oneshot_cmd()
-        vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
-            flags=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
-        self._record_compute_barrier(cmd)
-
-        per_p = self._per_own_particle_dispatch_count()
-        per_v = self._per_extended_voxel_dispatch_count()
-
-        self._bind_pipeline_and_sets(cmd, "predict")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-        self._record_compute_barrier(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "update_voxel")
-        vkCmdDispatch(cmd, per_v, 1, 1)
-        self._record_compute_barrier(cmd)
-
-        # Reset ghost_send_*_count BEFORE ghost_send (atomicAdd needs fresh 0).
-        self._record_reset_ghost_send_counts(cmd)
-
-        # ghost_send (writes ghost-pid range + ghost-vid count/index +
-        # ghost_send_*_count). Skipped in single-GPU collapse.
-        self._record_ghost_send_phase(cmd)
-
-        # End-of-pre barrier so cross-GPU readback sees the writes. Only
-        # meaningful when there's a peer; single-GPU mode also no-ops above
-        # so this barrier becomes redundant but harmless.
-        if self.has_leading_peer or self.has_trailing_peer:
-            self._record_compute_to_transfer_read_barrier(cmd)
-
-        vkEndCommandBuffer(cmd)
-        return cmd
-
-    def _record_step_post_sync_cmd(self):
-        """transfer→compute barrier → install_migrations (per-dir) →
-        correction → density → density_copy → force."""
-        cmd = self._allocate_oneshot_cmd()
-        vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
-            flags=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
-
-        # Initial barrier: cross-GPU upload (TRANSFER_WRITE) → install_migrations
-        # / hot kernels (SHADER_READ). In single-GPU collapse, fall back to a
-        # plain compute→compute barrier (defensive leading barrier matching
-        # step_cmd's behaviour).
-        if self.has_leading_peer or self.has_trailing_peer:
-            self._record_transfer_write_to_compute_barrier(cmd)
-        else:
-            self._record_compute_barrier(cmd)
-
-        per_p = self._per_own_particle_dispatch_count()
-
-        # install_migrations (receiver side). Skipped in single-GPU collapse.
-        self._record_install_migrations_phase(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "correction")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-        self._record_compute_barrier(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "density")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-        self._record_density_scratch_to_primary_copy(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "force")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-
-        vkEndCommandBuffer(cmd)
-        return cmd
-
-    def _record_bootstrap_pre_sync_cmd(self):
-        """initialize_voxelization → ghost_send (per-dir, conditional) →
-        compute→transfer barrier."""
-        cmd = self._allocate_oneshot_cmd()
-        vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
-            flags=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
-        self._record_compute_barrier(cmd)
-
-        per_p = self._per_own_particle_dispatch_count()
-
-        self._bind_pipeline_and_sets(cmd, "initialize_voxelization")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-        self._record_compute_barrier(cmd)
-
-        # Reset ghost_send_*_count BEFORE ghost_send.
-        self._record_reset_ghost_send_counts(cmd)
-
-        self._record_ghost_send_phase(cmd)
-
-        if self.has_leading_peer or self.has_trailing_peer:
-            self._record_compute_to_transfer_read_barrier(cmd)
-
-        vkEndCommandBuffer(cmd)
-        return cmd
-
-    def _record_bootstrap_post_sync_cmd(self):
-        """transfer→compute barrier → install_migrations → correction →
-        density → density_copy → force → bootstrap_half_kick."""
-        cmd = self._allocate_oneshot_cmd()
-        vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
-            flags=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
-
-        if self.has_leading_peer or self.has_trailing_peer:
-            self._record_transfer_write_to_compute_barrier(cmd)
-        else:
-            self._record_compute_barrier(cmd)
-
-        per_p = self._per_own_particle_dispatch_count()
-
-        self._record_install_migrations_phase(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "correction")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-        self._record_compute_barrier(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "density")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-        self._record_density_scratch_to_primary_copy(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "force")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-        self._record_compute_barrier(cmd)
-
-        self._bind_pipeline_and_sets(cmd, "bootstrap_half_kick")
-        vkCmdDispatch(cmd, per_p, 1, 1)
-
-        vkEndCommandBuffer(cmd)
-        return cmd
-
-    # ---- Combined cmd buffers (single-GPU path) ---------------------------
+    # ---- Per-step cmd buffer ------------------------------------------------
 
     def _record_step_cmd(self):
-        """predict → update_voxel → ghost_send → install_migrations →
-        correction → density → density_copy → force."""
+        """predict → update_voxel → correction → density → density_copy → force."""
         cmd = self._allocate_oneshot_cmd()
         vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
             flags=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
         self._record_compute_barrier(cmd)
 
         per_p = self._per_own_particle_dispatch_count()
-        per_v = self._per_extended_voxel_dispatch_count()
+        per_v = self._per_voxel_dispatch_count()
 
         self._bind_pipeline_and_sets(cmd, "predict")
         vkCmdDispatch(cmd, per_p, 1, 1)
@@ -1359,10 +902,6 @@ class SphSimulatorV1:
         self._bind_pipeline_and_sets(cmd, "update_voxel")
         vkCmdDispatch(cmd, per_v, 1, 1)
         self._record_compute_barrier(cmd)
-
-        # V1.0a sync 1 (ghost_send + install_migrations).
-        self._record_reset_ghost_send_counts(cmd)
-        self._record_ghost_sync_phase(cmd)
 
         self._bind_pipeline_and_sets(cmd, "correction")
         vkCmdDispatch(cmd, per_p, 1, 1)
@@ -1379,7 +918,7 @@ class SphSimulatorV1:
         return cmd
 
     def _record_defrag_cmd(self):
-        """V1.0a defrag with copy-back + migration_install_count reset."""
+        """Defrag with copy-back (scratch set 4 → set 0) + alive count refresh."""
         cmd = self._allocate_oneshot_cmd()
         vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
             flags=VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT))
@@ -1399,9 +938,9 @@ class SphSimulatorV1:
                 dstAccessMask=VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)],
             0, None, 0, None)
 
-        # 2. Defrag dispatch (per extended voxel).
+        # 2. Defrag dispatch (per voxel).
         self._bind_pipeline_and_sets(cmd, "defrag", defrag=True)
-        vkCmdDispatch(cmd, self._per_extended_voxel_dispatch_count(), 1, 1)
+        vkCmdDispatch(cmd, self._per_voxel_dispatch_count(), 1, 1)
 
         # compute → transfer (read scratch for copy-back)
         vkCmdPipelineBarrier(cmd,
@@ -1432,28 +971,7 @@ class SphSimulatorV1:
             self.buffers["global_status"].handle, 1,
             [VkBufferCopy(srcOffset=0, dstOffset=0, size=4)])
 
-        # 5. Reset migration_install_count for the next defrag cycle.
-        # V1 GlobalStatusBuffer layout (16 uints; see common.glsl): order is
-        #   [0] alive_particle_count          (uint, just refreshed above)
-        #   [1] maximum_velocity              (float)
-        #   [2] overflow_inside_count         (uint)
-        #   [3] overflow_incoming_count       (uint)
-        #   [4] first_overflow_voxel_inside   (uint)
-        #   [5] first_overflow_voxel_incoming (uint)
-        #   [6] correction_fallback_count     (uint)
-        #   [7] overflow_ghost_count          (uint)
-        #   [8] ghost_send_leading_count      (uint)
-        #   [9] ghost_send_trailing_count     (uint)
-        #   [10] ghost_recv_leading_count     (uint)
-        #   [11] ghost_recv_trailing_count    (uint)
-        #   [12] migration_install_count      (uint)   ← reset target
-        #   [13] overflow_install_tail        (uint)
-        #   [14] overflow_install_inside      (uint)
-        #   [15] first_overflow_voxel_install (uint)
-        # offsetof(migration_install_count) = 12 * 4 = 48 B
-        vkCmdFillBuffer(cmd, self.buffers["global_status"].handle, 48, 4, 0)
-
-        # 6. transfer (copy-back / fill) → compute (next step's predict reads set 0).
+        # 5. transfer (copy-back) → compute (next step's predict reads set 0).
         vkCmdPipelineBarrier(cmd,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1560,7 +1078,8 @@ class SphSimulatorV1:
 
     def readback_global_status(self) -> dict:
         """V1 GlobalStatusBuffer layout (16 × 4 B = 64 B). Field order matches
-        experiment/v1/shaders/common.glsl."""
+        experiment/v1/shaders/common.glsl. The ghost_* / migration_* fields
+        are always 0 on this single-GPU branch."""
         raw = self._readback_buffer(self.buffers["global_status"])
         unpacked = struct.unpack("I f I I I I I I I I I I I I I I", raw)
         return {
@@ -1593,101 +1112,6 @@ class SphSimulatorV1:
             "density_pressure":  self.buffers["density_pressure"].handle,
             "global_status":     self.buffers["global_status"].handle,
         }
-
-    # ---- Cross-GPU transport spec ----------------------------------------
-    # Each set-0 SoA buffer has a fixed stride per pid. Set 1 inside_count
-    # is 4 B / vid; inside_index is 4 B × MAX_PARTICLES_PER_VOXEL / vid.
-    # GlobalStatusBuffer field offsets (uint indices into the 16-uint block):
-    #   8  ghost_send_leading_count
-    #   9  ghost_send_trailing_count
-    #   10 ghost_recv_leading_count
-    #   11 ghost_recv_trailing_count
-
-    _SET0_GHOST_BUFFERS_AND_STRIDES = (
-        ("position_voxel_id",            16),
-        ("density_pressure",              8),
-        ("velocity_mass",                16),
-        ("acceleration",                 16),
-        ("shift",                        16),
-        ("material",                      4),
-        ("correction_inverse",           32),   # 2 vec4 / pid
-        ("density_gradient_kernel_sum",  16),
-        ("extension_fields",             16),
-    )
-
-    def _build_direction_handles(self, direction: int) -> dict:
-        if direction == DIRECTION_LEADING:
-            ghost_pid_first_slot = 1
-            ghost_pid_pool       = self.leading_ghost_pool_size
-            ghost_vid_first      = 1
-            ghost_vid_count      = self.leading_ghost_voxel_count
-            send_count_uidx      = 8    # ghost_send_leading_count
-            recv_count_uidx      = 10   # ghost_recv_leading_count
-        else:
-            own_pool = int(self.case.capacities.pool_size)
-            extended_voxel = self.extended_nx * self.ny * self.nz
-            ghost_pid_first_slot = self.leading_ghost_pool_size + own_pool + 1
-            ghost_pid_pool       = self.trailing_ghost_pool_size
-            ghost_vid_first      = extended_voxel - self.trailing_ghost_voxel_count + 1
-            ghost_vid_count      = self.trailing_ghost_voxel_count
-            send_count_uidx      = 9    # ghost_send_trailing_count
-            recv_count_uidx      = 11   # ghost_recv_trailing_count
-
-        # Set 0 SoA byte ranges (9 entries; binding 2 scratch is excluded)
-        ghost_pid = []
-        for name, stride in self._SET0_GHOST_BUFFERS_AND_STRIDES:
-            buf = self.buffers[name]
-            ghost_pid.append((buf.handle,
-                              ghost_pid_first_slot * stride,
-                              ghost_pid_pool * stride))
-
-        # Set 1 voxel structures
-        cap_inside = int(self.case.capacities.max_per_voxel)
-        ghost_vid_count_range = (
-            self.buffers["inside_particle_count"].handle,
-            ghost_vid_first * 4,
-            ghost_vid_count * 4,
-        )
-        ghost_vid_index_range = (
-            self.buffers["inside_particle_index"].handle,
-            ghost_vid_first * cap_inside * 4,
-            ghost_vid_count * cap_inside * 4,
-        )
-
-        # Set 3 GlobalStatusBuffer 32-bit fields
-        gs_handle = self.buffers["global_status"].handle
-        return {
-            "ghost_pid":       ghost_pid,                        # list of (h, off, size) ×9
-            "ghost_vid_count": ghost_vid_count_range,            # (h, off, size)
-            "ghost_vid_index": ghost_vid_index_range,            # (h, off, size)
-            "send_count":     (gs_handle, send_count_uidx * 4, 4),
-            "recv_count":     (gs_handle, recv_count_uidx * 4, 4),
-        }
-
-    def get_ghost_transport_handles(self) -> dict:
-        """Per-direction byte ranges this GPU exposes for cross-GPU transport.
-
-        Returned dict has 'leading' and/or 'trailing' keys, each present only
-        if the corresponding ghost pool is non-empty. Each entry has:
-            ghost_pid       : list of 9 (handle, offset, size) — set 0 SoA
-            ghost_vid_count : (handle, offset, size)            — set 1 inside_count subrange
-            ghost_vid_index : (handle, offset, size)            — set 1 inside_index subrange
-            send_count      : (handle, offset, size=4)          — ghost_send_<dir>_count
-            recv_count      : (handle, offset, size=4)          — ghost_recv_<dir>_count
-
-        Driver pairs across two GPUs in opposite directions:
-            GPU A 'leading' ↔ GPU B 'trailing'  (data flows GPU A → leading peer)
-        For each pair, copy A.send_count → B.recv_count and the
-        ghost_pid / ghost_vid_count / ghost_vid_index byte ranges from
-        A's leading slots into B's trailing slots. Sizes must match
-        (post-partition validation).
-        """
-        result: dict = {}
-        if self.has_leading_peer:
-            result["leading"] = self._build_direction_handles(DIRECTION_LEADING)
-        if self.has_trailing_peer:
-            result["trailing"] = self._build_direction_handles(DIRECTION_TRAILING)
-        return result
 
     # ==================================================================
     # Section 9: Cleanup
