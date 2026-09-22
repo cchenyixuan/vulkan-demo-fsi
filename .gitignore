@@ -10,5 +10,3 @@ viewer_run.log
 tools/
 logs/
 
-# V5 compiled shaders are shipped to air-gapped cluster nodes (no glslc there); keep them tracked
-!experiment/v5/shaders/spv/*.spv
