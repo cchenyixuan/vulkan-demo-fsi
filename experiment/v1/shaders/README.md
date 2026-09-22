@@ -1,9 +1,9 @@
-# SPH V0 Compute Shaders
+# SPH V1 Compute Shaders (single GPU)
 
-Vulkan compute shader implementation of δ-plus WCSPH for the V0 single-GPU
-milestone. See `docs/sph_design.md` (multi-GPU architecture) and
-`docs/sph_v0_design.md` (this milestone's buffer layout + pipeline) for the
-full design.
+Vulkan compute shader implementation of δ-plus WCSPH, single-GPU. See
+`docs/sph_v0_design.md` (buffer layout + pipeline), `docs/sph_v1_design.md`
+(the V1 merged-buffer layout — its ghost parts are pinned to zero on this
+branch) and `docs/sph_design.md` (method choices) for the full design.
 
 This README is a quick orientation for anyone (including future Claude
 sessions) opening this directory. Authoritative details live in the design
@@ -37,7 +37,11 @@ the canonical `density_pressure` (set 0 binding 1) inside the same step
 cmd, so force.comp sees the freshly-written values. The next step's
 predict consumes force's outputs (`acceleration`, `shift`).
 
-Multi-GPU ghost handling and inlet/outlet kernels are deferred (V0+ work). `defrag.comp` is implemented (separate path from the per-step main loop, triggered periodically — see file inventory below).
+Inlet / outlet kernels are not implemented yet (that is this branch's
+boundary-condition work). `defrag.comp` is implemented (separate path from
+the per-step main loop, triggered every `defrag_cadence` steps — see file
+inventory below). `initialize_voxelization.comp` fills the voxel lists on the
+GPU at bootstrap.
 
 ---
 
@@ -47,17 +51,20 @@ Multi-GPU ghost handling and inlet/outlet kernels are deferred (V0+ work). `defr
 |---|---|
 | `common.glsl` | All spec constants, descriptor set bindings, scalar constants (kind tags, sentinels). Single source of truth. |
 | `helpers.glsl` | Shared device functions: Wendland C4 kernel + gradient, voxel coord conversions, symmetric mat3 unpack. |
+| `initialize_voxelization.comp` | Bootstrap — GPU-side initial voxelization (fills `inside_particle_count` / `inside_particle_index`). |
 | `bootstrap_half_kick.comp` | One-time backward half-kick at t=0 (`v_0 → v_{-1/2}`). |
 | `predict.comp` | Stage 1 — kick + drift + crossing detection. |
 | `update_voxel.comp` | Stage 2 — per-voxel compaction + incoming merge. |
 | `correction.comp` | Stage 3 — KCG correction matrix + density gradient + kernel sum. |
 | `density.comp` | Stage 4 — continuity equation + EOS. |
-| `force.comp` | Stage 5 — pressure + viscosity + gravity + PST shift. |
+| `force.comp` | Stage 5 — pressure + viscosity + gravity + PST shift (+ vorticity ω_z into `acceleration.w` for the viewer). |
+| `defrag.comp` | Periodic — re-packs the pool in voxel order into scratch set 4; the simulator copies it back. |
 | `_test_common.comp` | Smoke test: empty kernel including `common.glsl`, used to detect regressions in bindings/spec constants. |
+| `render/particle.vert`, `render/particle.frag` | Point-sprite render shaders for `SphRendererV1` (color modes incl. vorticity). |
 
-Compiled `.spv` artifacts coexist alongside source. Build via
-`compile_shaders.py` at repo root. `_test_common.comp` is auto-skipped from
-optimized build (compiled once unoptimized as a sanity check).
+Compiled `.spv` artifacts go to `spv/` (gitignored). Build via
+`experiment/v1/compile_shaders_v1.py` (the run scripts call it automatically).
+Underscore-prefixed `.comp` files are skipped.
 
 ---
 
@@ -73,8 +80,8 @@ with `0` reserved as the universal "unallocated / dead / empty" sentinel:
 Shader entry: `uint self_particle_id = gl_GlobalInvocationID.x + 1u;`
 followed by `if (self_particle_id > POOL_SIZE) return;` for padding threads.
 
-Per-voxel kernels (currently only `update_voxel`) use `TOTAL_VOXEL_COUNT`
-in the bound check.
+Per-voxel kernels (`update_voxel`, `defrag`) use `TOTAL_VOXEL_COUNT` in the
+bound check.
 
 **Voxel coords stay 0-based** (spatial coord `0..GRID_DIM-1`). The 1-based
 voxel_id is encoded as `coord.x + coord.y·Dx + coord.z·Dx·Dy + 1` (the +1
@@ -103,7 +110,7 @@ every `.comp` file. Both are header-guarded.
 | `correction` | run | run | run | run* | skip |
 | `density` | run | run | run | skip | skip |
 | `force` | run | run | run | skip | skip |
-| `defrag` (TBD) | — | — | — | — | — |
+| `defrag` | per-voxel kernel; walks `inside_particle_index` only (INLET particles are not preserved — see below) | | | | |
 
 \* `correction` does not skip INLET because doing so would require pulling in
 `material[pid] + material_parameters[group]` (~52 B/particle) just for the
@@ -176,8 +183,12 @@ Summarized here for orientation:
 
 4. **1-based id everywhere** with 0 = sentinel (see Conventions above).
 
-5. **Bit-exact integration on Kernel A on ghost** (V1 multi-GPU only;
-   not active in V0).
+5. **Ghost remnants are inert.** `common.glsl` / `helpers.glsl` still carry
+   the V1 ghost pool / ghost voxel spec constants (ids 54, 55, 80, 81) and
+   the `own_first_pid()` / `is_own_voxel()` helpers. `simulator_v1.py` pins
+   the constants to 0, so `own_first_pid() = 1`, every voxel is "own", and
+   the ghost branches are dead-code-eliminated. They may be removed once BC /
+   FSI work touches these headers.
 
 ---
 
@@ -198,8 +209,8 @@ fresh `a_1`, introducing a permanent O(dt²) trajectory error from step 1.
 
 Full bootstrap sequence (run once before main loop):
 
-1. Python: populate particle buffers from scene IC; run initial voxelization
-   to fill `inside_particle_index` (skip inlet).
+1. Python: populate particle buffers from scene IC; `initialize_voxelization.comp`
+   fills `inside_particle_index` (skip inlet).
 2. `correction.comp` on x_0
 3. `density.comp` on x_0 → ρ_0, P_0
 4. `force.comp` on x_0, v_0, ρ_0 → a_0, shift_0
@@ -210,37 +221,42 @@ Full bootstrap sequence (run once before main loop):
 
 ## Compile
 
-`python compile_shaders.py` at repo root produces `.comp.spv` for every
-`.comp` (and the smoke test). Uses `glslc` from VULKAN_SDK with:
+`python experiment/v1/compile_shaders_v1.py` (run from repo root) produces
+`spv/<name>.comp.spv` for every `.comp` and `spv/render/particle.{vert,frag}.spv`
+for the render shaders. Uses `glslc` from VULKAN_SDK with:
 
 - `-O` optimization (dead-code-eliminates unused bindings declared in
   `common.glsl`)
-- `-I shaders/sph` so `#include` resolves
-- `--target-env=vulkan1.2`
+- `-I experiment/v1/shaders` so `#include` resolves
+- `--target-env=vulkan1.2` (SPIR-V 1.5; the VkInstance is Vulkan 1.2)
 
-Underscore-prefixed `.comp` (currently only `_test_common.comp`) compile as
-smoke tests, unoptimized, useful as regression check after `common.glsl`
-edits.
+Underscore-prefixed `.comp` (currently only `_test_common.comp`) are skipped;
+compile `_test_common.comp` by hand as a regression check after
+`common.glsl` edits.
 
 ---
 
 ## Spec constant ID range plan (see `common.glsl`)
 
 ```
-0  - 9   : core physics scalars + own grid origin  (id=3 reserved)
-10       : multi-GPU bit-exactness toggle (V1)
-11 - 13  : own grid dimensions (and TOTAL_VOXEL_COUNT derived)
+0  - 9   : core physics scalars + grid origin  (id=3 reserved)
+10       : STRICT_BIT_EXACT (multi-GPU remnant, pinned 0)
+11 - 13  : grid dimensions (and TOTAL_VOXEL_COUNT derived)
 14 - 16  : correction regularization tunables
 17 - 19  : gravity
-20 - 29  : voxel layout / micropolar (V0+ reserved)
+20 - 29  : voxel layout / micropolar (reserved)
 30 - 33  : dimension + kernel coefficients
-34 - 39  : reserved
-40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, ...)
+34 - 39  : free
+40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, toggles, ...)
 50 - 53  : capacities + workgroup size + POOL_SIZE
-54 - 79  : reserved
-80 - 88  : multi-GPU ghost grid (V1)
-89 - 127 : reserved
+54 - 55  : ghost pool sizes (multi-GPU remnant, pinned 0)
+56 - 79  : free
+80 - 81  : ghost voxel counts (multi-GPU remnant, pinned 0)
+82 - 127 : free (90-94 were the removed ghost_send / install_migrations ids)
 ```
+
+New constants for boundary conditions / FSI go into the free ranges; add the
+matching `SPEC_ID_*` + `_global_spec_entries()` line in `simulator_v1.py`.
 
 ---
 
@@ -268,9 +284,8 @@ edits.
   spawn must redesign the defrag path (e.g. dedicated inlet pool list, or
   rebuild inlet slots from `inlet_template` post-defrag).
 
-- **No async multi-GPU**: ghost bindings declared in `common.glsl` (set 2)
-  but `GHOST_DIMENSION_*` spec constants are 0, so all ghost-related branches
-  are dead-code-eliminated.
+- **Single GPU**: the ghost pool / ghost voxel spec constants are pinned to
+  0 (see invariant 5), so all ghost-related branches are dead-code-eliminated.
 
 - **Per-particle dispatch over POOL_SIZE**: inlet/dead particles are not
   excluded at the dispatch level. Each kernel does its own bounds + kind
@@ -278,17 +293,15 @@ edits.
   until inlet/outlet logic is implemented.
 
 - **No bit-exact integration**: `STRICT_BIT_EXACT` spec constant exists but
-  is unused in V0 (no `precise` qualifiers in main kernels). V1 multi-GPU
-  ghost integration will need this.
+  is pinned to 0 (no `precise` qualifiers in main kernels); it only mattered
+  for multi-GPU ghost integration.
 
 ---
 
 ## What's NOT here yet
 
 - `update_dispatch.comp` — 1-thread helper to update DispatchIndirectBuffer.
-  Skipped in V0 because all kernels dispatch over POOL_SIZE directly.
-- `inlet_spawn.comp` — spawn new fluid particles from inlet templates. V0+.
-- Ghost-related kernels (pack/unpack/sync) — V1 multi-GPU.
-- Python pipeline glue (buffer allocation, descriptor set build, dispatch
-  scheduling) — next step.
-- Numerical validation against legacy OpenGL — gated on Python pipeline.
+  Skipped because all kernels dispatch over POOL_SIZE directly.
+- `inlet_spawn.comp` — spawn new fluid particles from inlet templates.
+- Moving / deformable boundaries and FSI coupling — this branch's work.
+- Numerical validation against the legacy OpenGL solver — not done.
