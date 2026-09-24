@@ -1210,6 +1210,24 @@ class SphSimulatorV1:
         raw = self._readback_buffer(self.buffers["extension_fields"])
         return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
 
+    def live_slot_mask(self, positions: np.ndarray) -> np.ndarray:
+        """Boolean mask of the slots that hold live particles.
+
+        Defrag packs the live particles into slots [1, alive_particle_count]
+        and only that range is copied back; slots beyond the packed tail keep
+        STALE copies from before the defrag (voxel_id != 0, not referenced by
+        any voxel list, invisible to the kernels). A plain `voxel_id > 0` test
+        therefore over-counts after any particle has been killed. Between two
+        defrags no particle is created, so live == (slot <= alive count at the
+        last defrag) and (voxel_id > 0). Found 2026-09-25 during the power-
+        number campaign (stale rotor copies contaminated the torque sum once
+        a run had lost particles)."""
+        alive_count = int(self.readback_global_status()["alive_particle_count"])
+        mask = np.zeros(positions.shape[0], dtype=bool)
+        mask[1:alive_count + 1] = True
+        mask &= positions[:, 3] > 0
+        return mask
+
     def rotor_group_ids(self) -> list[int]:
         return [m.group_id for m in self.case.materials if m.kind == KIND_ROTOR]
 
@@ -1232,7 +1250,7 @@ class SphSimulatorV1:
         is_rotor = np.isin(material, groups)
         is_rotor[0] = False
         positions = self.readback_positions()
-        alive = positions[:, 3] > 0
+        alive = self.live_slot_mask(positions)
         sel = is_rotor & alive
         x = positions[sel, :3].astype(np.float64)
         a = self.readback_acceleration()[sel, :3].astype(np.float64)

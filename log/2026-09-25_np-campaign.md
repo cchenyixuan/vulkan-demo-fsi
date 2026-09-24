@@ -40,3 +40,20 @@ Np = τω / (ρ N³ D⁵)，ρ = 998，N = 200/60 rev/s，D = 0.096 m（Rushton 
   取消后在作业脚本里加 `__GL_SHADER_DISK_CACHE_PATH=/tmp/nvcache_$SLURM_JOB_ID`，重新提交为 31770，正常。
 - 存储服务器时钟比计算节点慢约 35 分钟，文件修改时间不能用来判断作业是否停滞。
 - Slurm 的 cgroup 让每个作业都把自己的卡看成 0 号，nvidia-smi 里的 `CUDA_VISIBLE_DEVICES=0` 不代表物理 0 号卡。
+
+## C4 结果：4 mm、重力开（c₀ = 20 U_tip，无静压初始化）— 失败
+
+- 前 23.5 s 正常：力矩 0.06–0.10 N·m，瞬时 Np 中位数约 4.4，轴向力 −1.8 N（转子排开体积的浮力量级，方向合理）。
+- t ≈ 23.5 s 起发散：最终 alive 154,180（初始 557,622），overflow_inside 1.7×10⁶、overflow_incoming 6.2×10⁷、
+  correction_fallback 2.2×10⁷。起因未知，力矩日志里看不到前兆（Np 有零星尖峰但无持续增长）。
+- 需要重跑并定期读回 GlobalStatus 才能定位溢出起点。候选原因：顶盖处压力接近零仍有拉伸态；重力下底部压缩使体素占用逼近
+  max_per_voxel = 64（4 mm、h/dx = 3 时标称 27）；incoming 上限 32。
+- 结论：重力开不是今晚能下结论的路线；静压初始化和容量参数要先处理。
+
+## 读回层面的发现：defrag 后的残留槽位
+
+- defrag 只把存活粒子打包到槽位 [1, alive_count] 并拷回这一段，尾部保留 defrag 前的旧数据（体素号非零，但不在任何体素列表里，
+  kernel 看不到）。一旦有粒子被杀，`voxel_id > 0` 就会多算。3 mm 基准里转子粒子数恰好 7785，力矩未受影响；
+  C4 里 alive 崩到 15 万后残留的转子副本把力矩算成 NaN。
+- 修正：`SphSimulatorV1.live_slot_mask()` 按 GlobalStatus 的 alive_particle_count 截断，`readback_rotor_torque()` 改用它。
+  分析脚本同样按此处理（`leak_check2.py` 的做法）。正在运行的作业用的是旧代码，力矩结果需用"转子粒子数是否等于初始数"来判断是否可信。
