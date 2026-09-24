@@ -195,7 +195,7 @@ physics:
   speed_of_sound: {c0:.3f}
   power: 7
   cfl: 0.15
-  gravity: [0.0, 0.0, 0.0]
+  gravity: [0.0, {gravity_y:.3f}, 0.0]
 
 numerics:
   use_density_diffusion: true
@@ -305,6 +305,8 @@ def main() -> int:
     parser.add_argument("--max-incoming", type=int, default=32)
     parser.add_argument("--ramp-time", type=float, default=0.05, help="rotor spin-up time (s)")
     parser.add_argument("--c0-factor", type=float, default=10.0, help="speed of sound = factor * tip speed")
+    parser.add_argument("--gravity", type=float, default=0.0,
+                        help="gravity magnitude along -y (0 = off; with gravity on use --c0-factor 20 so that c0 >= 10*sqrt(g*H))")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
@@ -368,7 +370,7 @@ def main() -> int:
         dx=dx, h=h, hdx=args.hdx, thin_layers=args.thin_layers, n_fluid=n_fluid, n_wall=n_wall,
         n_rotor=n_rotor, liquid_height=LIQUID_HEIGHT, tip_speed=TIP_SPEED, radius=0.5 * dx, c0=c0,
         pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming,
-        ramp_time=args.ramp_time), encoding="utf-8")
+        ramp_time=args.ramp_time, gravity_y=-abs(args.gravity)), encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega), encoding="utf-8")
     print(f"wrote fluid.obj wall.obj rotor.obj frame.obj case.yaml materials.yaml -> {out}")
     if not args.no_preview:
