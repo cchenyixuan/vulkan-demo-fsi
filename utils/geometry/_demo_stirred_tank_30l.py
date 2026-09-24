@@ -304,6 +304,7 @@ def main() -> int:
     parser.add_argument("--max-per-voxel", type=int, default=None)
     parser.add_argument("--max-incoming", type=int, default=32)
     parser.add_argument("--ramp-time", type=float, default=0.05, help="rotor spin-up time (s)")
+    parser.add_argument("--c0-factor", type=float, default=10.0, help="speed of sound = factor * tip speed")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
@@ -347,7 +348,7 @@ def main() -> int:
     # Voxel capacity: closest-packing bound for h^3 cube on a grid lattice.
     bound = int(math.ceil(math.sqrt(2) * args.hdx ** 3))
     max_per_voxel = args.max_per_voxel or max(64, int(2 ** math.ceil(math.log2(bound * 1.3))))
-    c0 = 10.0 * TIP_SPEED
+    c0 = args.c0_factor * TIP_SPEED
     omega = -2 * math.pi * IMPELLER_RPM / 60.0          # signed: -200 rpm about +y
 
     liquid_volume = math.pi * TANK_RADIUS ** 2 * LIQUID_HEIGHT
