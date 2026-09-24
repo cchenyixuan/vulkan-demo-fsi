@@ -735,7 +735,15 @@ class SphSimulatorV1:
         pipelines: dict = {}
 
         # ---- Hot kernels (use global spec consts) --------------------------
+        # The stage structs are copied BY VALUE into each create info, but the
+        # C string behind pName="main" is owned by the Python stage object. If
+        # that object dies before vkCreateComputePipelines runs, the driver
+        # reads a dangling entry-point pointer and fails with VK_ERROR_UNKNOWN
+        # for a random subset of the kernels (seen on RTX 4070 Ti SUPER,
+        # driver 616.92, python-vulkan 1.3.275.1). Keep every stage alive
+        # until the call returns.
         create_infos = []
+        stage_keepalive = []
         for name in SHADER_NAMES_HOT:
             stage = VkPipelineShaderStageCreateInfo(
                 stage=VK_SHADER_STAGE_COMPUTE_BIT,
@@ -743,6 +751,7 @@ class SphSimulatorV1:
                 pName="main",
                 pSpecializationInfo=self.spec_info_global,
             )
+            stage_keepalive.append(stage)
             create_infos.append(VkComputePipelineCreateInfo(
                 stage=stage, layout=self.pipeline_layout))
         result = vkCreateComputePipelines(
