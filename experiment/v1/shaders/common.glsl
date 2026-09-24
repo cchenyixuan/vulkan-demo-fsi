@@ -169,6 +169,21 @@ layout(constant_id = 53) const uint OWN_POOL_SIZE              = 1000000u;
 layout(constant_id = 54) const uint LEADING_GHOST_POOL_SIZE    = 0u;
 layout(constant_id = 55) const uint TRAILING_GHOST_POOL_SIZE   = 0u;
 
+// --- Rotor (prescribed rigid-body rotation of MATERIAL_ROTOR particles) ---
+// One rotor per case. Axis is a unit vector, pivot a point on the axis, both
+// in world coordinates (case.yaml `rotor:` block). The time-dependent part
+// (cos/sin of the accumulated angle and the current angular velocity) is NOT
+// a spec constant: the CPU writes it every step into RotorStateBuffer
+// (set 3 binding 9) because the step command buffer is pre-recorded.
+// Rotation sense: right-hand rule about +axis; the signed angular velocity
+// comes from the rotor material's rotor_angular_velocity (rad/s).
+layout(constant_id = 56) const float ROTOR_AXIS_X  = 0.0;
+layout(constant_id = 57) const float ROTOR_AXIS_Y  = 0.0;
+layout(constant_id = 58) const float ROTOR_AXIS_Z  = 1.0;
+layout(constant_id = 59) const float ROTOR_PIVOT_X = 0.0;
+layout(constant_id = 60) const float ROTOR_PIVOT_Y = 0.0;
+layout(constant_id = 61) const float ROTOR_PIVOT_Z = 0.0;
+
 // --- Multi-GPU ghost (V1 merged-buffer scheme) ---
 // V1 partitions along X. The voxel_id encoding (helpers.glsl) is "x-slowest"
 // so that each x-column of voxels is a contiguous voxel_id segment. Ghost
@@ -333,10 +348,10 @@ layout(std430, set = 0, binding = 8) buffer DensityGradientKernelSumBuffer {
 layout(std430, set = 0, binding = 9) buffer ExtensionFieldsBuffer {
     // Per-particle scalar fields not core to V0 SPH physics. Reserved slots
     // for future / debug use. V0 pipeline reads and writes nothing here.
-    //   .x : temperature (passive transport or heat diffusion, future)
-    //   .y : reserved (future: micropolar angular velocity scalar, or species concentration)
-    //   .z : reserved
-    //   .w : reserved
+    //   .xyz : ROTOR particles only — reference (initial) position used by
+    //          predict.comp's rigid-body update (2026-09-25). Uploaded from
+    //          the initial positions for every particle; other kinds ignore it.
+    //   .w   : reserved (future: species concentration)
     vec4 extension_fields[];
 };
 
@@ -548,6 +563,27 @@ struct MaterialParameters {
 
 layout(std430, set = 3, binding = 7) buffer MaterialParametersBuffer {
     MaterialParameters material_parameters[];
+};
+
+// ----------------------------------------------------------------------------
+// RotorStateBuffer — per-step rigid-body state of the (single) rotor, written
+// by the CPU (host-visible, coherent) before every step submission.
+//   cos_theta / sin_theta : accumulated rotation angle theta(t_{n+1}) about
+//                           ROTOR_AXIS through ROTOR_PIVOT (angle computed in
+//                           float64 on the CPU from the ramped angular
+//                           velocity; never accumulated in float32 on GPU)
+//   angular_velocity      : omega(t_{n+1}), signed, rad/s (ramp applied)
+//   time                  : t_{n+1}, informational
+// predict.comp: ROTOR particles get
+//   x_{n+1} = pivot + R(theta) (x_ref - pivot),   v = omega * axis x (x_{n+1} - pivot)
+// where x_ref = extension_fields.xyz (uploaded = initial position; carried
+// through defrag like every other set-0 field).
+// ----------------------------------------------------------------------------
+layout(std430, set = 3, binding = 9) buffer RotorStateBuffer {
+    float rotor_cos_theta;
+    float rotor_sin_theta;
+    float rotor_angular_velocity_now;
+    float rotor_time;
 };
 
 layout(std430, set = 3, binding = 8) buffer DefragScratchCounterBuffer {

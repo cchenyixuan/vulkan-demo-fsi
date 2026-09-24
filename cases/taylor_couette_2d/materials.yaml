@@ -1,0 +1,17 @@
+schema_version: 1
+
+couette_fluid:
+  kind: fluid
+  rest_density: 1000.0
+  viscosity: 0.001
+
+couette_wall:
+  kind: boundary
+  rest_density: 1000.0
+  viscosity: 0.001
+
+couette_rotor:
+  kind: rotor
+  rest_density: 1000.0
+  viscosity: 0.001
+  rotor_angular_velocity: 2.0

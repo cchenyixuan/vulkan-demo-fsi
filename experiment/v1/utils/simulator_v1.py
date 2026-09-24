@@ -27,6 +27,7 @@ Density staging: scratch+copy. density.comp writes `density_pressure_scratch`
 same step cmd so force.comp sees ρ_{n+1}, P_{n+1}.
 """
 
+import math
 import pathlib
 import struct
 import sys
@@ -37,7 +38,7 @@ import numpy as np
 from vulkan import *
 from vulkan._vulkancache import ffi
 
-from utils.sph.case import Case
+from utils.sph.case import Case, KIND_ROTOR
 from utils.sph.vulkan_context import VulkanContext
 
 
@@ -106,6 +107,14 @@ SPEC_ID_OWN_POOL_SIZE                       = 53
 # the pid / voxel layout collapses to [1, POOL_SIZE] / [1, NX*NY*NZ].
 SPEC_ID_LEADING_GHOST_POOL_SIZE             = 54
 SPEC_ID_TRAILING_GHOST_POOL_SIZE            = 55
+# Rotor (2026-09-25): axis + pivot of the prescribed rigid rotation. The
+# time-dependent angle lives in the host-visible rotor_state buffer.
+SPEC_ID_ROTOR_AXIS_X                        = 56
+SPEC_ID_ROTOR_AXIS_Y                        = 57
+SPEC_ID_ROTOR_AXIS_Z                        = 58
+SPEC_ID_ROTOR_PIVOT_X                       = 59
+SPEC_ID_ROTOR_PIVOT_Y                       = 60
+SPEC_ID_ROTOR_PIVOT_Z                       = 61
 SPEC_ID_LEADING_GHOST_VOXEL_COUNT           = 80
 SPEC_ID_TRAILING_GHOST_VOXEL_COUNT          = 81
 
@@ -131,6 +140,7 @@ class _BufferSpec:
     binding: int
     size: int
     usage: int
+    host_visible: bool = False      # True: HOST_VISIBLE | HOST_COHERENT, persistently mapped
 
 
 # ============================================================================
@@ -174,6 +184,7 @@ class SphSimulatorV1:
         # ---- Run state ------------------------------------------------------
         self.simulation_time = 0.0
         self.step_count = 0
+        self.rotor_angle = 0.0          # theta written for the most recent step (rad)
 
         # ---- Pre-flight + setup pipeline -------------------------------------
         self._check_workgroup_limit()
@@ -308,6 +319,10 @@ class SphSimulatorV1:
             _BufferSpec("diagnostic",                   3, 6,  16,                       BSU | TRANSFER),
             _BufferSpec("material_parameters",          3, 7,  48 * max(n_materials, 1), BSU | TRANSFER),
             _BufferSpec("defrag_scratch_counter",       3, 8,   4,                       BSU | TRANSFER),
+            # Rotor state (cos, sin, omega, t): CPU-written every step, GPU-read
+            # by predict.comp. Host-visible + coherent, mapped for the lifetime
+            # of the simulator (see _rotor_write_state).
+            _BufferSpec("rotor_state",                  3, 9,  16,                       BSU | TRANSFER, host_visible=True),
         ]
 
     def _allocate_buffer(self, size: int, usage: int, memory_properties: int) -> Buffer:
@@ -333,13 +348,24 @@ class SphSimulatorV1:
     def _allocate_buffers(self) -> dict[str, Buffer]:
         specs = self._build_buffer_specs()
         buffers: dict[str, Buffer] = {}
+        self._mapped: dict[str, object] = {}
         total_bytes = 0
         for spec in specs:
-            buffers[spec.name] = self._allocate_buffer(
-                size=spec.size,
-                usage=spec.usage,
-                memory_properties=VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            )
+            if spec.host_visible:
+                buffers[spec.name] = self._allocate_buffer(
+                    size=spec.size,
+                    usage=spec.usage,
+                    memory_properties=(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                       | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                )
+                self._mapped[spec.name] = vkMapMemory(
+                    self.ctx.device, buffers[spec.name].memory, 0, spec.size, 0)
+            else:
+                buffers[spec.name] = self._allocate_buffer(
+                    size=spec.size,
+                    usage=spec.usage,
+                    memory_properties=VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                )
             total_bytes += spec.size
         self._buffer_specs = specs
         print(f"[SimV1] allocated {len(buffers)} buffers, "
@@ -397,6 +423,13 @@ class SphSimulatorV1:
             positions[cursor:cursor + n, 0:3] = source.vertices
             cursor += n
         data["position_voxel_id"] = positions.tobytes()
+
+        # ---- extension_fields.xyz = reference (initial) position --------------
+        # Used by predict.comp's ROTOR branch (x_ref); harmless for other kinds.
+        # Carried through defrag with the other set-0 fields.
+        reference = positions.copy()
+        reference[:, 3] = 0.0
+        data["extension_fields"] = reference.tobytes()
 
         # ---- velocity_mass (initial_velocity, mass = ρ₀ * volume) -----------
         velocity_mass = np.zeros((pool_capacity, 4), dtype=np.float32)
@@ -496,6 +529,8 @@ class SphSimulatorV1:
     def _upload_initial_state(self) -> None:
         initial_data = self._build_initial_data()
         for name, buffer in self.buffers.items():
+            if name in self._mapped:
+                continue                      # host-visible: written directly
             if name in initial_data:
                 payload = initial_data[name]
                 if len(payload) < buffer.size:
@@ -504,6 +539,7 @@ class SphSimulatorV1:
             else:
                 self._zero_buffer(buffer)
         print(f"[SimV1] uploaded initial state to {len(self.buffers)} buffers")
+        self._rotor_write_state(0.0)
 
     # ==================================================================
     # Section 4: Descriptor sets
@@ -722,6 +758,13 @@ class SphSimulatorV1:
             # Single-GPU: no ghost pool / ghost voxels (see SPEC_ID_*_GHOST_* note).
             (SPEC_ID_LEADING_GHOST_POOL_SIZE,      0,                                         'I'),
             (SPEC_ID_TRAILING_GHOST_POOL_SIZE,     0,                                         'I'),
+            # Rotor axis / pivot (defaults: z axis through the origin when no rotor block).
+            (SPEC_ID_ROTOR_AXIS_X,                 float(case.rotor.axis[0]  if case.rotor else 0.0), 'f'),
+            (SPEC_ID_ROTOR_AXIS_Y,                 float(case.rotor.axis[1]  if case.rotor else 0.0), 'f'),
+            (SPEC_ID_ROTOR_AXIS_Z,                 float(case.rotor.axis[2]  if case.rotor else 1.0), 'f'),
+            (SPEC_ID_ROTOR_PIVOT_X,                float(case.rotor.pivot[0] if case.rotor else 0.0), 'f'),
+            (SPEC_ID_ROTOR_PIVOT_Y,                float(case.rotor.pivot[1] if case.rotor else 0.0), 'f'),
+            (SPEC_ID_ROTOR_PIVOT_Z,                float(case.rotor.pivot[2] if case.rotor else 0.0), 'f'),
             (SPEC_ID_LEADING_GHOST_VOXEL_COUNT,    0,                                         'I'),
             (SPEC_ID_TRAILING_GHOST_VOXEL_COUNT,   0,                                         'I'),
         ]
@@ -1013,8 +1056,45 @@ class SphSimulatorV1:
             print(f"[SimV1] init defrag complete "
                   f"(cadence={self.case.numerics.defrag_cadence})")
 
+    # ==================================================================
+    # Rotor: prescribed rigid rotation (2026-09-25)
+    # ==================================================================
+
+    def rotor_angle_and_rate(self, time: float) -> tuple[float, float]:
+        """(theta, omega) at absolute time `time` for the case's rotor,
+        computed in float64. omega ramps linearly from 0 over ramp_time (if
+        > 0) to the signed material value; theta is its exact integral:
+            t <  T:  omega = w t / T,       theta = w t^2 / (2 T)
+            t >= T:  omega = w,             theta = w (t - T / 2)
+        Returns (0, 0) when the case has no rotor."""
+        if self.case.rotor is None:
+            return 0.0, 0.0
+        w = float(self.case.rotor_angular_velocity)
+        T = float(self.case.rotor.ramp_time)
+        if T <= 0.0 or time >= T:
+            return w * (time - 0.5 * T), w
+        return w * time * time / (2.0 * T), w * time / T
+
+    def _rotor_write_state(self, time_next: float) -> None:
+        """Write (cos theta, sin theta, omega, t) for t_{n+1} into the
+        host-visible rotor_state buffer read by predict.comp. Must be called
+        only when no submitted step is still executing (step(wait=True)
+        guarantees that; step(wait=False) waits for the queue first)."""
+        if "rotor_state" not in self._mapped:
+            return
+        theta, omega = self.rotor_angle_and_rate(time_next)
+        payload = struct.pack("ffff", math.cos(theta), math.sin(theta), omega, time_next)
+        self._mapped["rotor_state"][:16] = payload
+        self.rotor_angle = theta
+
     def step(self, *, wait: bool = True) -> None:
         cmd = self.step_cmd
+        if self.case.rotor is not None:
+            if not wait:
+                # predict.comp of the previous (unwaited) step may still be
+                # reading rotor_state; finish it before overwriting.
+                vkQueueWaitIdle(self.ctx.compute_queue)
+            self._rotor_write_state(self.simulation_time + self.case.timestep)
         if wait:
             self.ctx.submit_and_wait(cmd)
         else:
@@ -1114,6 +1194,64 @@ class SphSimulatorV1:
         raw = self._readback_buffer(self.buffers["position_voxel_id"])
         return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
 
+    def readback_velocity_mass(self) -> np.ndarray:
+        raw = self._readback_buffer(self.buffers["velocity_mass"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
+
+    def readback_acceleration(self) -> np.ndarray:
+        raw = self._readback_buffer(self.buffers["acceleration"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
+
+    def readback_material(self) -> np.ndarray:
+        raw = self._readback_buffer(self.buffers["material"])
+        return np.frombuffer(raw, dtype=np.uint32)
+
+    def readback_extension_fields(self) -> np.ndarray:
+        raw = self._readback_buffer(self.buffers["extension_fields"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
+
+    def rotor_group_ids(self) -> list[int]:
+        return [m.group_id for m in self.case.materials if m.kind == KIND_ROTOR]
+
+    def readback_rotor_torque(self) -> dict:
+        """Hydrodynamic force and torque on the rotor from the last force.comp.
+
+        force.comp writes, for every ROTOR particle, its acceleration from the
+        pressure + viscous interaction with all neighbours plus gravity (the
+        PST shift is a separate buffer and not part of it). The fluid force on
+        particle i is therefore f_i = m_i (a_i - g); the rigid body's force is
+        F = sum_i f_i and its torque about the rotor axis is
+            tau = axis . sum_i (x_i - pivot) x f_i.
+        Rotor-rotor pair forces are antisymmetric and cancel in both sums.
+        Returns force (3,), torque (3,), torque_axis (scalar), the rotor
+        particle count, the rotor angle, time and step."""
+        if self.case.rotor is None:
+            raise RuntimeError("case has no rotor")
+        groups = np.asarray(self.rotor_group_ids(), dtype=np.uint32)
+        material = self.readback_material()
+        is_rotor = np.isin(material, groups)
+        is_rotor[0] = False
+        positions = self.readback_positions()
+        alive = positions[:, 3] > 0
+        sel = is_rotor & alive
+        x = positions[sel, :3].astype(np.float64)
+        a = self.readback_acceleration()[sel, :3].astype(np.float64)
+        m = self.readback_velocity_mass()[sel, 3].astype(np.float64)
+        g = np.asarray(self.case.physics.gravity, dtype=np.float64)
+        force_per_particle = (a - g) * m[:, None]
+        axis = np.asarray(self.case.rotor.axis, dtype=np.float64)
+        pivot = np.asarray(self.case.rotor.pivot, dtype=np.float64)
+        torque = np.cross(x - pivot, force_per_particle).sum(axis=0)
+        return {
+            "force": force_per_particle.sum(axis=0),
+            "torque": torque,
+            "torque_axis": float(np.dot(torque, axis)),
+            "rotor_particle_count": int(sel.sum()),
+            "rotor_angle": float(self.rotor_angle),
+            "time": float(self.simulation_time),
+            "step": int(self.step_count),
+        }
+
     def get_render_buffers(self) -> dict:
         return {
             "position_voxel_id": self.buffers["position_voxel_id"].handle,
@@ -1148,7 +1286,10 @@ class SphSimulatorV1:
             vkDestroyDescriptorSetLayout(device, layout, None)
         vkDestroyDescriptorSetLayout(device, self.defrag_set4_layout, None)
 
-        # Buffers
+        # Buffers (unmap the persistently mapped ones first)
+        for name in list(self._mapped):
+            vkUnmapMemory(device, self.buffers[name].memory)
+        self._mapped.clear()
         for buffer in self.buffers.values():
             vkDestroyBuffer(device, buffer.handle, None)
             vkFreeMemory(device, buffer.memory, None)

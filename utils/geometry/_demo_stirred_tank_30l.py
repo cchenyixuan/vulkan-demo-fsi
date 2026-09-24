@@ -176,8 +176,10 @@ schema_version: 2
 # Flat lid at y = {liquid_height} (no free surface), gravity off: with a closed
 # single-phase tank gravity only adds a hydrostatic offset, so c0 is set from
 # the impeller tip speed only (10 * {tip_speed:.3f} m/s).
-# NOTE: rotor motion is not implemented in the solver yet; with the current
-# code the impeller is a static body (geometry / stability check only).
+# Rotor: shaft + both impellers rotate rigidly about +y through the origin
+# (predict.comp ROTOR branch, 2026-09-25). M-Star's "-200 rpm about +y" is
+# a NEGATIVE angular velocity in the right-hand sense, i.e. the blades move
+# from +x toward +z; the PBT (y decreasing toward +theta) then pumps DOWN.
 
 time:
   total: null
@@ -218,6 +220,11 @@ capacities:
 
 material_library: materials.yaml
 
+rotor:
+  axis: [0.0, 1.0, 0.0]
+  pivot: [0.0, 0.0, 0.0]
+  ramp_time: {ramp_time:.4f}      # s, linear spin-up (M-Star used 0.0092 s)
+
 geometry:
   frame: frame.obj
   particles:
@@ -244,7 +251,7 @@ impeller:
   kind: rotor
   rest_density: 998.0
   viscosity: 1.0e-6
-  rotor_angular_velocity: {omega:.5f}   # rad/s, magnitude of -200 rpm about +y (axis handling TBD in solver)
+  rotor_angular_velocity: {omega:.5f}   # rad/s, signed: -200 rpm about +y (right-hand rule)
 """
 
 
@@ -296,6 +303,7 @@ def main() -> int:
     parser.add_argument("--out", default="cases/stirred_tank_30l")
     parser.add_argument("--max-per-voxel", type=int, default=None)
     parser.add_argument("--max-incoming", type=int, default=32)
+    parser.add_argument("--ramp-time", type=float, default=0.05, help="rotor spin-up time (s)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
@@ -340,7 +348,7 @@ def main() -> int:
     bound = int(math.ceil(math.sqrt(2) * args.hdx ** 3))
     max_per_voxel = args.max_per_voxel or max(64, int(2 ** math.ceil(math.log2(bound * 1.3))))
     c0 = 10.0 * TIP_SPEED
-    omega = 2 * math.pi * IMPELLER_RPM / 60.0
+    omega = -2 * math.pi * IMPELLER_RPM / 60.0          # signed: -200 rpm about +y
 
     liquid_volume = math.pi * TANK_RADIUS ** 2 * LIQUID_HEIGHT
     print(f"fluid={n_fluid:,} wall={n_wall:,} rotor={n_rotor:,} total={total:,} pool={pool_size:,}")
@@ -358,7 +366,8 @@ def main() -> int:
     (out / "case.yaml").write_text(CASE_YAML.format(
         dx=dx, h=h, hdx=args.hdx, thin_layers=args.thin_layers, n_fluid=n_fluid, n_wall=n_wall,
         n_rotor=n_rotor, liquid_height=LIQUID_HEIGHT, tip_speed=TIP_SPEED, radius=0.5 * dx, c0=c0,
-        pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming), encoding="utf-8")
+        pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming,
+        ramp_time=args.ramp_time), encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega), encoding="utf-8")
     print(f"wrote fluid.obj wall.obj rotor.obj frame.obj case.yaml materials.yaml -> {out}")
     if not args.no_preview:

@@ -7,8 +7,10 @@ schema_version: 2
 # Flat lid at y = 0.4265 (no free surface), gravity off: with a closed
 # single-phase tank gravity only adds a hydrostatic offset, so c0 is set from
 # the impeller tip speed only (10 * 1.028 m/s).
-# NOTE: rotor motion is not implemented in the solver yet; with the current
-# code the impeller is a static body (geometry / stability check only).
+# Rotor: shaft + both impellers rotate rigidly about +y through the origin
+# (predict.comp ROTOR branch, 2026-09-25). M-Star's "-200 rpm about +y" is
+# a NEGATIVE angular velocity in the right-hand sense, i.e. the blades move
+# from +x toward +z; the PBT (y decreasing toward +theta) then pumps DOWN.
 
 time:
   total: null
@@ -48,6 +50,11 @@ capacities:
   workgroup: 128
 
 material_library: materials.yaml
+
+rotor:
+  axis: [0.0, 1.0, 0.0]
+  pivot: [0.0, 0.0, 0.0]
+  ramp_time: 0.0500      # s, linear spin-up (M-Star used 0.0092 s)
 
 geometry:
   frame: frame.obj

@@ -56,6 +56,10 @@ def parse_args() -> argparse.Namespace:
                         help="enable Vulkan validation layer (slower)")
     parser.add_argument("--dump", type=str, default=None, metavar="PATH",
                         help="save final positions + global status to this .npz")
+    parser.add_argument("--torque-every", type=int, default=0, metavar="N",
+                        help="rotor cases: read back the hydrodynamic torque every N steps")
+    parser.add_argument("--torque-log", type=str, default=None, metavar="PATH",
+                        help="append torque samples as CSV (step,time,angle,torque_axis,fx,fy,fz)")
     return parser.parse_args()
 
 
@@ -83,10 +87,34 @@ def main() -> None:
         try:
             sim.bootstrap()
             start = time.perf_counter()
-            sim.run_until(max_steps=args.max_steps)
+            if args.torque_every > 0:
+                if case.rotor is None:
+                    raise SystemExit("--torque-every needs a case with a rotor")
+                log_handle = open(args.torque_log, "a") if args.torque_log else None
+                if log_handle is not None and log_handle.tell() == 0:
+                    log_handle.write("step,time,angle,torque_axis,fx,fy,fz\n")
+                while sim.step_count < args.max_steps:
+                    sim.step()
+                    if sim.step_count % args.torque_every == 0:
+                        torque = sim.readback_rotor_torque()
+                        fx, fy, fz = torque["force"]
+                        print(f"[v1-headless] step={torque['step']} t={torque['time']:.4f}s "
+                              f"angle={torque['rotor_angle']:.3f}rad "
+                              f"torque_axis={torque['torque_axis']:.6e} N·m "
+                              f"force=({fx:.3e}, {fy:.3e}, {fz:.3e}) N")
+                        if log_handle is not None:
+                            log_handle.write(f"{torque['step']},{torque['time']:.6e},{torque['rotor_angle']:.6e},"
+                                             f"{torque['torque_axis']:.6e},{fx:.6e},{fy:.6e},{fz:.6e}\n")
+                            log_handle.flush()
+                if log_handle is not None:
+                    log_handle.close()
+            else:
+                sim.run_until(max_steps=args.max_steps)
             elapsed = time.perf_counter() - start
             status = sim.readback_global_status()
             positions = sim.readback_positions() if args.dump else None
+            material = sim.readback_material() if args.dump else None
+            velocity_mass = sim.readback_velocity_mass() if args.dump else None
         finally:
             sim.destroy()
 
@@ -102,7 +130,8 @@ def main() -> None:
               file=sys.stderr)
 
     if args.dump:
-        np.savez(args.dump, positions=positions, status=json.dumps(status))
+        np.savez(args.dump, positions=positions, material=material, velocity_mass=velocity_mass,
+                 status=json.dumps(status))
         print(f"[v1-headless] dumped positions + status to {args.dump}")
 
 

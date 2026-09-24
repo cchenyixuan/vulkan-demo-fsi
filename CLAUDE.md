@@ -108,11 +108,21 @@ run scripts.
   particles in the pool are lost at the first defrag.** Inlet / outlet work
   must redesign this path.
 - **Material kinds** FLUID / BOUNDARY / INLET / ROTOR come from
-  `materials/standard.yaml`. `predict` moves only FLUID; BOUNDARY particles are
+  `materials/standard.yaml`. `predict` moves FLUID (leapfrog) and ROTOR
+  (prescribed rigid rotation, see below); BOUNDARY particles are
   static and a moving wall is expressed purely through `initial_velocity`
   (the cavity lid: `kind=boundary`, `initial_velocity=[1,0,0]`, positions never
-  change). Moving boundaries / FSI bodies will need `predict` (or a new kernel)
-  to advance non-fluid kinds and to re-voxelize them.
+  change). Other moving boundaries / FSI bodies will need `predict` (or a new
+  kernel) to advance them and to re-voxelize them.
+- **ROTOR (test branch, 2026-09-25)**: a case with a rotor-kind material must
+  have a `rotor:` block (`axis`, `pivot`, `ramp_time`); the signed angular
+  velocity is the material's `rotor_angular_velocity`. `predict` places each
+  ROTOR particle at `pivot + R(θ)(x_ref − pivot)` with `x_ref =
+  extension_fields.xyz` (uploaded = initial position, carried through defrag)
+  and θ from the host-visible `rotor_state` buffer (set 3 binding 9) that the
+  CPU writes every step in float64. `density` treats ROTOR like BOUNDARY.
+  `readback_rotor_torque()` sums `m (a − g)` over rotor particles.
+  Details and validation: `log/2026-09-25_rotor-motion.md`.
 - **Per-kernel kind table and buffer access matrix** are in
   `experiment/v1/shaders/README.md`.
 - **Spec constants**: ids and ranges are listed in `common.glsl` and mirrored by
@@ -120,7 +130,7 @@ run scripts.
   Free ranges for new constants: 34–39, 56–79, 89+.
 - **Uniform-material simplifications** inherited from V0: `force.comp` uses
   self's mass / viscosity / volume for pair quantities (no multi-phase), no
-  micropolar terms, no rotor motion, no inlet spawn kernel.
+  micropolar terms, no inlet spawn kernel (rotor motion added on the test branch, see above).
 - **Overflow counters** in `GlobalStatusBuffer` (`readback_global_status()`)
   are the first thing to check after any change: `overflow_inside_count`,
   `overflow_incoming_count`, `correction_fallback_count` must stay 0.

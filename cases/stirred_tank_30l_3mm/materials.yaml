@@ -15,4 +15,4 @@ impeller:
   kind: rotor
   rest_density: 998.0
   viscosity: 1.0e-6
-  rotor_angular_velocity: 20.94395   # rad/s, magnitude of -200 rpm about +y (axis handling TBD in solver)
+  rotor_angular_velocity: -20.94395   # rad/s, signed: -200 rpm about +y (right-hand rule)

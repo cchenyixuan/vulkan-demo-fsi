@@ -189,4 +189,23 @@ mat3 unpack_correction_inverse(uint particle_id) {
     );
 }
 
+// ============================================================================
+// Rotor helpers (2026-09-25)
+// ============================================================================
+
+// BOUNDARY and ROTOR are both walls from the fluid's point of view: static
+// density (rest density stored), no PST, solid-solid pairs skipped in the
+// continuity equation. Only their motion differs (ROTOR is prescribed).
+bool is_solid_kind(uint kind) {
+    return kind == MATERIAL_BOUNDARY || kind == MATERIAL_ROTOR;
+}
+
+// Rodrigues rotation of `vector` about the unit `axis` by the angle whose
+// cosine / sine are given (right-hand rule).
+vec3 rotate_about_axis(vec3 vector, vec3 axis, float cos_theta, float sin_theta) {
+    return vector * cos_theta
+         + cross(axis, vector) * sin_theta
+         + axis * dot(axis, vector) * (1.0 - cos_theta);
+}
+
 #endif  // SPH_HELPERS_GLSL_INCLUDED

@@ -105,10 +105,10 @@ every `.comp` file. Both are header-guarded.
 | Kernel | FLUID | BOUNDARY | ROTOR | INLET | DEAD (vid=0) |
 |---|---|---|---|---|---|
 | `bootstrap_half_kick` | run | skip | skip | skip | skip |
-| `predict` | run | skip | skip | skip | skip |
+| `predict` | run | skip | rigid-body update (prescribed rotation, 2026-09-25) | skip | skip |
 | `update_voxel` | per-voxel kernel; not per-particle | | | | |
 | `correction` | run | run | run | run* | skip |
-| `density` | run | run | run | skip | skip |
+| `density` | run | run (stores ρ₀) | run (stores ρ₀, as BOUNDARY) | skip | skip |
 | `force` | run | run | run | skip | skip |
 | `defrag` | per-voxel kernel; walks `inside_particle_index` only (INLET particles are not preserved — see below) | | | | |
 

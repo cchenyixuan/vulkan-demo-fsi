@@ -136,9 +136,14 @@ void main() {
                     // their kernel-deficient drift terms still feed back into
                     // the boundary's apparent pressure. Branch is uniform per
                     // workgroup since voxel-sorted boundaries cluster together.
-                    if (self_params.kind == MATERIAL_BOUNDARY) {
+                    // ROTOR counts as a wall here too (2026-09-25): a rotor
+                    // particle's density must reflect only fluid neighbours,
+                    // not other rotor / boundary particles (rotor-rotor pairs
+                    // have zero relative velocity anyway; rotor-wall pairs at
+                    // the shaft / lid crossing would otherwise inject noise).
+                    if (is_solid_kind(self_params.kind)) {
                         uint neighbor_group_id = material[neighbor_particle_id];
-                        if (material_parameters[neighbor_group_id].kind == MATERIAL_BOUNDARY) continue;
+                        if (is_solid_kind(material_parameters[neighbor_group_id].kind)) continue;
                     }
 
                     // --- Distance check (Wendland C4 support = h) -----------
@@ -241,7 +246,11 @@ void main() {
     // a static solid). Matches the legacy "property buffer = ρ₀ forever,
     // runtime buffer = per-step new_pressure" architecture.
     // ========================================================================
-    float density_to_store = (self_params.kind == MATERIAL_BOUNDARY)
+    // ROTOR: same treatment as BOUNDARY (2026-09-25) — it is a moving wall;
+    // its pressure still comes from the per-step new_density, which includes
+    // the fluid-relative velocity divergence term, so fluid approaching a
+    // blade sees a rising pressure exactly as at a static wall.
+    float density_to_store = is_solid_kind(self_params.kind)
         ? self_params.rest_density
         : new_density;
     density_pressure_scratch[self_particle_id] = vec2(density_to_store, new_pressure);

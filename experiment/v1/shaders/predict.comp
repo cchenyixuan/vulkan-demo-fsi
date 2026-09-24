@@ -17,8 +17,22 @@
 //                        so this only fires at the physical domain edge of an
 //                        end-of-chain GPU's outward side.
 //
-// Skipped kinds: BOUNDARY (static), ROTOR (deferred coupling), INLET (emitter).
-// Dead particles (old voxel_id = 0) also skip.
+// Skipped kinds: BOUNDARY (static), INLET (emitter). Dead particles (old
+// voxel_id = 0) also skip.
+//
+// ROTOR kind (2026-09-25): prescribed rigid-body rotation instead of the
+// leapfrog kick/drift. The particle is placed at
+//     x_{n+1} = pivot + R(theta_{n+1}) (x_ref - pivot)
+// with x_ref = extension_fields.xyz (its initial position) and theta from
+// RotorStateBuffer (cos/sin written by the CPU each step, accumulated in
+// float64 there — no per-step incremental rotation, so the radius of every
+// rotor particle is preserved to float32 round-off for any number of steps).
+// Its velocity is the rigid-body velocity omega * axis x (x_{n+1} - pivot),
+// stored in velocity_mass.xyz so that force.comp's viscous term and
+// density.comp's continuity term see the moving wall (no-slip is automatic).
+// acceleration / shift of a rotor particle are ignored here (force.comp still
+// computes its acceleration = fluid force per unit mass, which the CPU reads
+// back for the torque). Voxel-crossing bookkeeping is identical to fluid.
 //
 // Data flow:
 //   acceleration[pid]  : written by previous step's force.comp  (a_n)
@@ -66,8 +80,8 @@ void main() {
     uint self_group_id = material[self_particle_id];
     MaterialParameters self_params = material_parameters[self_group_id];
     if (self_params.kind == MATERIAL_BOUNDARY) return;   // static walls
-    if (self_params.kind == MATERIAL_ROTOR)    return;   // V0: coupling deferred
     if (self_params.kind == MATERIAL_INLET)    return;   // emitter templates
+    bool is_rotor = (self_params.kind == MATERIAL_ROTOR);
 
     // --- Read self position + voxel_id ---------------------------------------
     vec4 self_position_voxel_id = position_voxel_id[self_particle_id];
@@ -94,6 +108,19 @@ void main() {
     //     x_{n+1} = x_n + v_{n+1/2} · dt + shift_n
     // ========================================================================
     vec3 new_position = self_position + new_velocity * TIMESTEP + self_shift;
+
+    // ========================================================================
+    // ROTOR: overwrite kick + drift with the prescribed rigid-body motion.
+    // ========================================================================
+    if (is_rotor) {
+        vec3 rotor_axis  = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
+        vec3 rotor_pivot = vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
+        vec3 reference_arm = extension_fields[self_particle_id].xyz - rotor_pivot;
+        vec3 rotated_arm   = rotate_about_axis(reference_arm, rotor_axis,
+                                               rotor_cos_theta, rotor_sin_theta);
+        new_position = rotor_pivot + rotated_arm;
+        new_velocity = rotor_angular_velocity_now * cross(rotor_axis, rotated_arm);
+    }
 
     // ========================================================================
     // Determine new voxel_id.

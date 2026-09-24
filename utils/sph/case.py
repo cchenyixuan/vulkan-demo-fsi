@@ -424,6 +424,39 @@ class MaterialEntry:
 
 
 @dataclass
+class RotorConfig:
+    """Prescribed rigid-body rotation of every MATERIAL_ROTOR particle
+    (case.yaml optional block ``rotor:``, added 2026-09-25).
+
+    ``axis``      unit vector of the rotation axis (world coordinates)
+    ``pivot``     any point on the axis (world coordinates)
+    ``ramp_time`` seconds over which the angular velocity rises linearly from
+                  0 to the material's ``rotor_angular_velocity`` (0 = no ramp)
+
+    The signed angular velocity itself lives on the rotor material
+    (``rotor_angular_velocity``, rad/s, right-hand rule about ``axis``).
+    One rotor per case: all rotor-kind materials must share the same value.
+    """
+    axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    pivot: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ramp_time: float = 0.0
+
+    def __post_init__(self):
+        axis = np.asarray(self.axis, dtype=np.float64)
+        if axis.shape != (3,) or np.linalg.norm(axis) == 0.0:
+            raise ValueError(f"rotor.axis must be a non-zero 3-vector, got {self.axis}")
+        axis = axis / np.linalg.norm(axis)
+        self.axis = (float(axis[0]), float(axis[1]), float(axis[2]))
+        pivot = np.asarray(self.pivot, dtype=np.float64)
+        if pivot.shape != (3,):
+            raise ValueError(f"rotor.pivot must be a 3-vector, got {self.pivot}")
+        self.pivot = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
+        self.ramp_time = float(self.ramp_time)
+        if self.ramp_time < 0.0:
+            raise ValueError(f"rotor.ramp_time must be >= 0, got {self.ramp_time}")
+
+
+@dataclass
 class ParticleSource:
     """One obj file's vertices + its material assignment."""
     obj_path: pathlib.Path
@@ -462,6 +495,19 @@ class Case:
     materials: list[MaterialEntry]                  # ordered by group_id 0..N-1
     particle_sources: list[ParticleSource]
     case_dir: pathlib.Path                          # for relative path debugging
+    rotor: Optional["RotorConfig"] = None           # present iff case.yaml has a `rotor:` block
+
+    @property
+    def rotor_angular_velocity(self) -> float:
+        """Signed angular velocity (rad/s) shared by all rotor-kind materials;
+        0.0 when the case has no rotor material."""
+        values = {float(m.rotor_angular_velocity) for m in self.materials if m.kind == KIND_ROTOR}
+        if not values:
+            return 0.0
+        if len(values) > 1:
+            raise ValueError(
+                f"all rotor-kind materials must share one rotor_angular_velocity, got {sorted(values)}")
+        return values.pop()
 
     def __post_init__(self):
         # Cross-block validation: max_per_voxel must accommodate the
@@ -618,6 +664,13 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (51,  lambda case: case.capacities.workgroup,                      'I'),
     (52,  lambda case: case.capacities.max_incoming,                   'I'),
     (53,  lambda case: case.capacities.pool_size,                      'I'),
+    # 56-61 rotor axis / pivot (world coords); defaults when no rotor block.
+    (56,  lambda case: (case.rotor.axis[0]  if case.rotor else 0.0),   'f'),
+    (57,  lambda case: (case.rotor.axis[1]  if case.rotor else 0.0),   'f'),
+    (58,  lambda case: (case.rotor.axis[2]  if case.rotor else 1.0),   'f'),
+    (59,  lambda case: (case.rotor.pivot[0] if case.rotor else 0.0),   'f'),
+    (60,  lambda case: (case.rotor.pivot[1] if case.rotor else 0.0),   'f'),
+    (61,  lambda case: (case.rotor.pivot[2] if case.rotor else 0.0),   'f'),
     # V0-a ghost grid: all disabled (GHOST_DIMENSION_* = 0 dead-code-eliminates branches)
     (80,  lambda case: 0,                                              'I'),
     (81,  lambda case: 0,                                              'I'),
@@ -727,6 +780,19 @@ def load_case(case_yaml_path) -> Case:
     # consistent with the grid we just computed.
     _cross_validate(physics, capacities, particle_sources, frame_min, frame_max)
 
+    # Optional rotor block (prescribed rigid rotation of rotor-kind materials).
+    rotor = None
+    if case_data.get("rotor") is not None:
+        rotor = RotorConfig(**case_data["rotor"])
+    uses_rotor_material = any(m.kind == KIND_ROTOR for m in materials)
+    if uses_rotor_material and rotor is None:
+        raise ValueError(
+            f"{case_yaml_path}: a rotor-kind material is used but the case has no "
+            f"`rotor:` block (axis / pivot / ramp_time)")
+    if rotor is not None and not uses_rotor_material:
+        raise ValueError(
+            f"{case_yaml_path}: `rotor:` block present but no rotor-kind material is used")
+
     return Case(
         physics=physics,
         numerics=numerics,
@@ -736,6 +802,7 @@ def load_case(case_yaml_path) -> Case:
         materials=materials,
         particle_sources=particle_sources,
         case_dir=case_dir,
+        rotor=rotor,
     )
 
 
