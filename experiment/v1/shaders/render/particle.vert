@@ -63,6 +63,24 @@ vec3 colormap_viridis(float t) {
     return mix(c2, c3, (t - 0.666) / 0.334);
 }
 
+// Classic CFD "jet" colormap for unsigned [0, 1] values: dark blue → blue →
+// cyan → green → yellow → red → dark red. Used for speed / acceleration so
+// the picture reads like a Fluent / ParaView contour plot.
+vec3 colormap_jet(float t) {
+    t = clamp(t, 0.0, 1.0);
+    vec3 c0 = vec3(0.000, 0.000, 0.500);   // dark blue   (t=0)
+    vec3 c1 = vec3(0.000, 0.000, 1.000);   // blue        (t=0.125)
+    vec3 c2 = vec3(0.000, 1.000, 1.000);   // cyan        (t=0.375)
+    vec3 c3 = vec3(1.000, 1.000, 0.000);   // yellow      (t=0.625)
+    vec3 c4 = vec3(1.000, 0.000, 0.000);   // red         (t=0.875)
+    vec3 c5 = vec3(0.500, 0.000, 0.000);   // dark red    (t=1)
+    if (t < 0.125) return mix(c0, c1, t / 0.125);
+    if (t < 0.375) return mix(c1, c2, (t - 0.125) / 0.25);
+    if (t < 0.625) return mix(c2, c3, (t - 0.375) / 0.25);
+    if (t < 0.875) return mix(c3, c4, (t - 0.625) / 0.25);
+    return mix(c4, c5, (t - 0.875) / 0.125);
+}
+
 // Diverging blue-white-red for signed [-1, +1] values (density deviation).
 vec3 colormap_diverging(float t) {
     t = clamp(t, -1.0, 1.0);
@@ -132,10 +150,10 @@ void main() {
     // ---- per-mode colorization ---------------------------------------------
     if (pc.color_mode == 0u) {
         float speed = length(velocity_mass[particle_id].xyz);
-        frag_color = colormap_viridis(speed * pc.velocity_scale);
+        frag_color = colormap_jet(speed * pc.velocity_scale);
     } else if (pc.color_mode == 1u) {
         float accel_mag = length(acceleration[particle_id].xyz);
-        frag_color = colormap_viridis(accel_mag * pc.acceleration_scale);
+        frag_color = colormap_jet(accel_mag * pc.acceleration_scale);
     } else if (pc.color_mode == 2u) {
         // density_pressure is the canonical ρ at binding 1; the simulator's
         // step cmd has already copied scratch → primary by render time, so
