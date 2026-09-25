@@ -145,113 +145,138 @@ void main() {
     float volume_ij_uniform       = self_params.volume;
     float kernel_value_at_delta_x = evaluate_kernel(delta_x_uniform);  // computed once
 
-    int neighbor_z_range = int(NEIGHBOR_Z_RANGE);
-
     // ------------------------------------------------------------------------
-    // 27-voxel neighbor loop (9 in 2D).
+    // Neighbour loop (2026-09-25). Two candidate sources, chosen at pipeline
+    // creation by USE_NEIGHBOR_LIST (the other branch is dead code):
+    //   list mode : one "cell" = this particle's row of the per-step
+    //               neighbour list (build_neighbor_list.comp); every entry
+    //               already passed the support test, nothing is filtered here.
+    //   voxel mode: 27 cells (9 in 2D) = the surrounding voxels, walked
+    //               z-slowest / x-fastest exactly like the original triple
+    //               loop; the support test is applied per candidate.
+    // Both modes visit the same pairs in the same order, so their sums agree
+    // to floating-point rounding.
     // ------------------------------------------------------------------------
-    for (int delta_z = -neighbor_z_range; delta_z <= neighbor_z_range; delta_z++) {
-        for (int delta_y = -1; delta_y <= 1; delta_y++) {
-            for (int delta_x = -1; delta_x <= 1; delta_x++) {
-                ivec3 neighbor_coord = self_voxel_coord + ivec3(delta_x, delta_y, delta_z);
-                if (!in_own_grid(neighbor_coord)) continue;
+    uint cell_count = USE_NEIGHBOR_LIST ? 1u : (NEIGHBOR_Z_RANGE == 0u ? 9u : 27u);
+    for (uint cell = 0u; cell < cell_count; cell++) {
+        uint candidate_count;
+        uint candidate_base = 0u;   // voxel mode: flat index of the voxel's slot 0
+        if (USE_NEIGHBOR_LIST) {
+            candidate_count = neighbor_count[self_particle_id];
+        } else {
+            ivec3 delta = ivec3(int(cell % 3u) - 1,
+                                int((cell / 3u) % 3u) - 1,
+                                int(cell / 9u) - int(NEIGHBOR_Z_RANGE));
+            ivec3 neighbor_coord = self_voxel_coord + delta;
+            if (!in_own_grid(neighbor_coord)) continue;
+            uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
+            candidate_count = inside_particle_count[neighbor_voxel_id];
+            candidate_base  = neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL;
+        }
 
-                uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
-                uint neighbor_voxel_particle_count = inside_particle_count[neighbor_voxel_id];
+        for (uint candidate = 0u; candidate < candidate_count; candidate++) {
+            uint neighbor_particle_id;
+            if (USE_NEIGHBOR_LIST) {
+                neighbor_particle_id = neighbor_list[candidate * neighbor_list_stride() + self_particle_id];
+            } else {
+                neighbor_particle_id = inside_particle_index[candidate_base + candidate];
+                if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
+                if (neighbor_particle_id == self_particle_id) continue;
+            }
 
-                for (uint slot_index = 0u; slot_index < neighbor_voxel_particle_count; slot_index++) {
-                    uint neighbor_particle_id = inside_particle_index[neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL + slot_index];
-                    if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
-                    if (neighbor_particle_id == self_particle_id) continue;
+            // --- Distance check (Wendland C4 support radius = h) ----
+            vec3 neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
+            vec3 position_difference_neighbor_to_self = self_position - neighbor_position; // x_ij = r_i - r_j
+            // Squared test first (2026-09-25): the sqrt is only paid for
+            // the ~15 % of candidates inside the support, not for all 27
+            // voxels' worth. Same accept set as `length(x) >= h` up to
+            // rounding at q = 1 where W and grad W are exactly 0 anyway.
+            float distance_squared = dot(position_difference_neighbor_to_self, position_difference_neighbor_to_self);
+            if (!USE_NEIGHBOR_LIST) {
+                if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
+            }
+            float distance = sqrt(distance_squared);
 
-                    // --- Distance check (Wendland C4 support radius = h) ----
-                    vec3 neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
-                    vec3 position_difference_neighbor_to_self = self_position - neighbor_position; // x_ij = r_i - r_j
-                    float distance = length(position_difference_neighbor_to_self);
-                    if (distance >= SMOOTHING_LENGTH || distance < 1e-12) continue;
+            // --- Neighbor dynamic state (no material lookup in V0) --
+            // V0 uniformity: self_mass used for neighbor mass; ν / R / V
+            // also taken from self_params outside the loop.
+            vec3  neighbor_velocity = velocity_mass[neighbor_particle_id].xyz;
+            vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
+            float neighbor_density  = neighbor_density_pressure.x;
+            float neighbor_pressure = neighbor_density_pressure.y;
+            float neighbor_volume_dynamic = self_mass / neighbor_density;
 
-                    // --- Neighbor dynamic state (no material lookup in V0) --
-                    // V0 uniformity: self_mass used for neighbor mass; ν / R / V
-                    // also taken from self_params outside the loop.
-                    vec3  neighbor_velocity = velocity_mass[neighbor_particle_id].xyz;
-                    vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
-                    float neighbor_density  = neighbor_density_pressure.x;
-                    float neighbor_pressure = neighbor_density_pressure.y;
-                    float neighbor_volume_dynamic = self_mass / neighbor_density;
+            // --- Kernel gradient (raw + M_i-corrected) + kernel value ---
+            vec3  kernel_gradient_raw       = evaluate_kernel_gradient_unguarded(position_difference_neighbor_to_self, distance);
+            vec3  kernel_gradient_corrected = self_correction_matrix * kernel_gradient_raw;
+            float kernel_value              = evaluate_kernel_unguarded(distance);
 
-                    // --- Kernel gradient (raw + M_i-corrected) + kernel value ---
-                    vec3  kernel_gradient_raw       = evaluate_kernel_gradient(position_difference_neighbor_to_self, distance);
-                    vec3  kernel_gradient_corrected = self_correction_matrix * kernel_gradient_raw;
-                    float kernel_value              = evaluate_kernel(distance);
-
-                    // ==== Pressure force (TIC) ==============================
-                    // Symmetric (P_i + P_j) form when self is compressive (P_i > 0);
-                    // anti-symmetric (P_j - P_i) otherwise to suppress tensile
-                    // instability in the interior.
-                    float pressure_combined =
-                        (self_pressure > 0.0 || near_surface)
-                            ? (neighbor_pressure + self_pressure)
-                            : (neighbor_pressure - self_pressure);
-                    a_pressure -= neighbor_volume_dynamic * pressure_combined / self_density
-                                * kernel_gradient_corrected;
-
-                    // ==== Viscosity (Morris) ================================
-                    a_viscosity +=
-                        morris_coefficient * viscosity_uniform * neighbor_volume_dynamic
-                        * dot(self_velocity - neighbor_velocity,
-                              position_difference_neighbor_to_self)
-                        / (distance * distance + EPS_H_SQUARED)
+            // ==== Pressure force (TIC) ==============================
+            // Symmetric (P_i + P_j) form when self is compressive (P_i > 0);
+            // anti-symmetric (P_j - P_i) otherwise to suppress tensile
+            // instability in the interior.
+            float pressure_combined =
+                (self_pressure > 0.0 || near_surface)
+                    ? (neighbor_pressure + self_pressure)
+                    : (neighbor_pressure - self_pressure);
+            a_pressure -= neighbor_volume_dynamic * pressure_combined / self_density
                         * kernel_gradient_corrected;
 
-                    // ==== Vorticity (ω_z = [∇×v]_z) — diagnostic for viz =====
-                    // (∇×v)_i ≈ Σ_j V_j (v_i - v_j) × ∇W̃_ij ; z-component in 2D.
-                    // The (v_i - v_j) ordering (not v_j - v_i) makes the sign
-                    // physical: with the M-corrected gradient this reduces to
-                    // +2Ω for a solid-body rotation Ω (positive = CCW).
-                    vec3 velocity_difference_self_minus_neighbor =
-                        self_velocity - neighbor_velocity;
-                    vorticity_z += neighbor_volume_dynamic
-                        * (velocity_difference_self_minus_neighbor.x * kernel_gradient_corrected.y
-                         - velocity_difference_self_minus_neighbor.y * kernel_gradient_corrected.x);
+            // ==== Viscosity (Morris) ================================
+            a_viscosity +=
+                morris_coefficient * viscosity_uniform * neighbor_volume_dynamic
+                * dot(self_velocity - neighbor_velocity,
+                      position_difference_neighbor_to_self)
+                / (distance * distance + EPS_H_SQUARED)
+                * kernel_gradient_corrected;
 
-                    // ==== Particle shifting (PST) ===========================
-                    // Gated by USE_PST spec const: glslc -O DCE-removes the entire
-                    // block (including the kernel_value / kernel_value_at_delta_x
-                    // computations and pst_base_factor / volume_ij_uniform pre-loop
-                    // constants once their consumers are gone) when USE_PST = false.
-                    if (USE_PST) {
-                        // disorder ∈ [-1, 0]: negative if particles overlap (r < Δx).
-                        float distance_ratio = (distance - delta_x_uniform) / delta_x_uniform;
-                        float disorder =
-                            (distance_ratio > 0.0)
-                                ? 0.0
-                                : distance_ratio * min(neighbor_density / self_density, 1.0);
+            // ==== Vorticity (ω_z = [∇×v]_z) — diagnostic for viz =====
+            // (∇×v)_i ≈ Σ_j V_j (v_i - v_j) × ∇W̃_ij ; z-component in 2D.
+            // The (v_i - v_j) ordering (not v_j - v_i) makes the sign
+            // physical: with the M-corrected gradient this reduces to
+            // +2Ω for a solid-body rotation Ω (positive = CCW).
+            vec3 velocity_difference_self_minus_neighbor =
+                self_velocity - neighbor_velocity;
+            vorticity_z += neighbor_volume_dynamic
+                * (velocity_difference_self_minus_neighbor.x * kernel_gradient_corrected.y
+                 - velocity_difference_self_minus_neighbor.y * kernel_gradient_corrected.x);
 
-                        // Crowding term: W(r) / W(Δx), raised to 4th power.
-                        // kernel_value_at_delta_x is a loop invariant (computed above).
-                        float crowding_ratio =
-                            (kernel_value_at_delta_x > 1e-12)
-                                ? kernel_value / kernel_value_at_delta_x
-                                : 0.0;
-                        float crowding_term = crowding_ratio * crowding_ratio;
-                        crowding_term *= crowding_term;  // (W/W_ref)^4
+            // ==== Particle shifting (PST) ===========================
+            // Gated by USE_PST spec const: glslc -O DCE-removes the entire
+            // block (including the kernel_value / kernel_value_at_delta_x
+            // computations and pst_base_factor / volume_ij_uniform pre-loop
+            // constants once their consumers are gone) when USE_PST = false.
+            if (USE_PST) {
+                // disorder ∈ [-1, 0]: negative if particles overlap (r < Δx).
+                float distance_ratio = (distance - delta_x_uniform) / delta_x_uniform;
+                float disorder =
+                    (distance_ratio > 0.0)
+                        ? 0.0
+                        : distance_ratio * min(neighbor_density / self_density, 1.0);
 
-                        // Main (repulsion + structure) shift.
-                        // The 0.1 and 0.2 weights mix kernel_sum (free-surface signal)
-                        // and crowding (local packing density) into the shift driver.
-                        // Both are δ-plus empirical constants — kept at legacy values
-                        // pending profile-driven retuning.
-                        float main_scalar =
-                            1.0 - disorder + 0.1 * self_kernel_sum + 0.2 * crowding_term;
-                        particle_shift_main +=
-                            -pst_base_factor * main_scalar * kernel_gradient_corrected * volume_ij_uniform;
+                // Crowding term: W(r) / W(Δx), raised to 4th power.
+                // kernel_value_at_delta_x is a loop invariant (computed above).
+                float crowding_ratio =
+                    (kernel_value_at_delta_x > 1e-12)
+                        ? kernel_value / kernel_value_at_delta_x
+                        : 0.0;
+                float crowding_term = crowding_ratio * crowding_ratio;
+                crowding_term *= crowding_term;  // (W/W_ref)^4
 
-                        // Anti (cohesion-like) shift.
-                        float anti_scalar = (distance / delta_x_uniform) * PST_ANTI_SHIFT_COEFFICIENT;
-                        particle_shift_anti +=
-                            pst_base_factor * anti_scalar * kernel_gradient_corrected * volume_ij_uniform;
-                    }
-                }
+                // Main (repulsion + structure) shift.
+                // The 0.1 and 0.2 weights mix kernel_sum (free-surface signal)
+                // and crowding (local packing density) into the shift driver.
+                // Both are δ-plus empirical constants — kept at legacy values
+                // pending profile-driven retuning.
+                float main_scalar =
+                    1.0 - disorder + 0.1 * self_kernel_sum + 0.2 * crowding_term;
+                particle_shift_main +=
+                    -pst_base_factor * main_scalar * kernel_gradient_corrected * volume_ij_uniform;
+
+                // Anti (cohesion-like) shift.
+                float anti_scalar = (distance / delta_x_uniform) * PST_ANTI_SHIFT_COEFFICIENT;
+                particle_shift_anti +=
+                    pst_base_factor * anti_scalar * kernel_gradient_corrected * volume_ij_uniform;
             }
         }
     }

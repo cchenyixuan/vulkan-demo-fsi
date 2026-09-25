@@ -32,6 +32,11 @@
 //   ∇W     = KERNEL_GRADIENT_COEFFICIENT · dW/dq · r̂
 // ============================================================================
 
+// Support radius squared. glslang rejects a global `const` built from a spec
+// constant, so this is a function; the driver folds it at pipeline creation.
+// Neighbour loops compare squared distances against it before taking a sqrt.
+float smoothing_length_squared() { return SMOOTHING_LENGTH * SMOOTHING_LENGTH; }
+
 float evaluate_kernel(float distance) {
     float normalized_distance = distance / SMOOTHING_LENGTH;
     if (normalized_distance >= 1.0) return 0.0;
@@ -65,6 +70,36 @@ vec3 evaluate_kernel_gradient(vec3 relative_position, float distance) {
         KERNEL_GRADIENT_COEFFICIENT * one_minus_q_5 * derivative_polynomial;
 
     return gradient_magnitude_scalar * (relative_position / distance);
+}
+
+// ----------------------------------------------------------------------------
+// Unguarded variants for neighbour loops that have ALREADY tested
+// 1e-24 <= r^2 < h^2 on the squared distance. The guarded functions above
+// re-test q >= 1 and r < 1e-12; once the loop test moved to squared
+// distances the compiler can no longer prove those re-tests redundant, and
+// the extra compares cost ~6 % of the neighbour-loop time (measured
+// 2026-09-25, RTX 4070 Ti SUPER, 3 mm tank). Callers guarantee the range.
+// ----------------------------------------------------------------------------
+float evaluate_kernel_unguarded(float distance) {
+    float normalized_distance = distance / SMOOTHING_LENGTH;
+    float one_minus_q    = 1.0 - normalized_distance;
+    float one_minus_q_sq = one_minus_q * one_minus_q;
+    float one_minus_q_6  = one_minus_q_sq * one_minus_q_sq * one_minus_q_sq;
+    float profile_polynomial =
+        normalized_distance * ((35.0 / 3.0) * normalized_distance + 6.0) + 1.0;
+    return KERNEL_COEFFICIENT * one_minus_q_6 * profile_polynomial;
+}
+
+vec3 evaluate_kernel_gradient_unguarded(vec3 relative_position, float distance) {
+    float normalized_distance = distance / SMOOTHING_LENGTH;
+    float one_minus_q    = 1.0 - normalized_distance;
+    float one_minus_q_sq = one_minus_q * one_minus_q;
+    float one_minus_q_4  = one_minus_q_sq * one_minus_q_sq;
+    float one_minus_q_5  = one_minus_q_4 * one_minus_q;
+    float derivative_profile =
+        normalized_distance * ((-280.0 / 3.0) * normalized_distance + (-56.0 / 3.0));
+    return KERNEL_GRADIENT_COEFFICIENT * one_minus_q_5 * derivative_profile
+         * (relative_position / distance);
 }
 
 // ============================================================================
@@ -159,6 +194,12 @@ uint own_first_pid() {
 
 uint own_last_pid() {
     return LEADING_GHOST_POOL_SIZE + OWN_POOL_SIZE;
+}
+
+// Row stride of the transposed neighbour list = pool capacity incl. slot 0
+// (own + both ghost pools + 1). Must match SphSimulatorV1._build_buffer_specs.
+uint neighbor_list_stride() {
+    return OWN_POOL_SIZE + LEADING_GHOST_POOL_SIZE + TRAILING_GHOST_POOL_SIZE + 1u;
 }
 
 uint leading_ghost_first_pid() { return 1u; }

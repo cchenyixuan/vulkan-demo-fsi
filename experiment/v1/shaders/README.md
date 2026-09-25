@@ -11,12 +11,13 @@ docs and in `common.glsl`.
 
 ---
 
-## Pipeline (Leapfrog, 5 main stages + bootstrap)
+## Pipeline (Leapfrog, 5 main stages + neighbour-list build + bootstrap)
 
 ```
 Bootstrap (once at t = 0)
     ┌────────────────────────────────┐
     │ Python: voxelize x_0 → buffers │
+    │ build_neighbor_list            │  (when USE_NEIGHBOR_LIST)
     │ correction → density → force   │  produces a_0, ρ_0, P_0, shift_0, M_0⁻¹
     │ bootstrap_half_kick            │  v_0 → v_{-1/2}
     └────────────────────────────────┘
@@ -25,6 +26,8 @@ Bootstrap (once at t = 0)
 Main loop (uniform, every step):
     1. predict        kick (v_{n-1/2} → v_{n+1/2}) + drift + voxel-crossing detection
     2. update_voxel   compact inside_particle_index + merge incoming events
+    2b. build_neighbor_list   (USE_NEIGHBOR_LIST, opt-in, default OFF, 2026-09-25) one 27-voxel
+                      scan per particle → neighbor_count / neighbor_list (set 1, 5-6)
     3. correction     KCG matrix M⁻¹ + ∇ρ + kernel_sum
     4. density        continuity (ρ_{n+1}) + Tait EOS (P_{n+1})
     5. force          pressure (TIC) + viscosity (Morris) + gravity + PST shift
@@ -55,6 +58,7 @@ GPU at bootstrap.
 | `bootstrap_half_kick.comp` | One-time backward half-kick at t=0 (`v_0 → v_{-1/2}`). |
 | `predict.comp` | Stage 1 — kick + drift + crossing detection. |
 | `update_voxel.comp` | Stage 2 — per-voxel compaction + incoming merge. |
+| `build_neighbor_list.comp` | Stage 2b (2026-09-25) — per-particle support-sphere neighbour ids, transposed layout; lets stages 3-5 skip the 27-voxel candidate scan. Default off (measured slower, see log); on via `numerics.use_neighbor_list: true`. |
 | `correction.comp` | Stage 3 — KCG correction matrix + density gradient + kernel sum. |
 | `density.comp` | Stage 4 — continuity equation + EOS. |
 | `force.comp` | Stage 5 — pressure + viscosity + gravity + PST shift (+ vorticity ω_z into `acceleration.w` for the viewer). |
@@ -107,6 +111,7 @@ every `.comp` file. Both are header-guarded.
 | `bootstrap_half_kick` | run | skip | skip | skip | skip |
 | `predict` | run | skip | rigid-body update (prescribed rotation, 2026-09-25) | skip | skip |
 | `update_voxel` | per-voxel kernel; not per-particle | | | | |
+| `build_neighbor_list` | run | run | run | count 0 | count 0 |
 | `correction` | run | run | run | run* | skip |
 | `density` | run | run (stores ρ₀) | run (stores ρ₀, as BOUNDARY) | skip | skip |
 | `force` | run | run | run | skip | skip |
@@ -139,8 +144,9 @@ Reads (R) and Writes (W) per kernel. See `common.glsl` for binding numbers.
 | `material` (group_id) | R | R | — | — | R | R |
 | `correction_inverse` | — | — | — | W | R | R (self) |
 | `density_gradient_kernel_sum` | — | — | — | W | R | R (.w only, self) |
-| `inside_particle_count` (set 1) | — | — | R/W | R | R | R |
-| `inside_particle_index` (set 1) | — | — | R/W | R | R | R |
+| `inside_particle_count` (set 1) | — | — | R/W | R (voxel mode) | R (voxel mode) | R (voxel mode) |
+| `inside_particle_index` (set 1) | — | — | R/W | R (voxel mode) | R (voxel mode) | R (voxel mode) |
+| `neighbor_count` / `neighbor_list` (set 1) | W (build) | — | — (W by build_neighbor_list after it) | R (list mode) | R (list mode) | R (list mode) |
 | `incoming_particle_count` (set 1) | — | atomic R/W | R/W (reset) | — | — | — |
 | `incoming_particle_index` (set 1) | — | atomic W | R | — | — | — |
 | `material_parameters` (set 3) | R (kind) | R (kind) | — | — | R (kind, eos, ρ_0) | R (kind, ν, R, V) |
@@ -153,6 +159,13 @@ Notes:
   canonical `density_pressure` (binding 1) holds ρ_{n+1}, P_{n+1}.
   No ping-pong, no descriptor parity.
 - `correction` does not read `material` to skip INLET (see notes above).
+- Neighbour loop (2026-09-25): `correction` / `density` / `force` share one
+  loop shape with two candidate sources selected by the `USE_NEIGHBOR_LIST`
+  spec constant. List mode reads `neighbor_list[k * stride + pid]`
+  (transposed, coalesced per warp) and applies no distance test; voxel mode
+  walks the 27 voxels z-slowest / x-fastest and tests the squared distance.
+  The in-loop kernel evaluations use the `*_unguarded` helpers because the
+  range 1e-24 ≤ r² < h² is already guaranteed by the loop (or the build).
 - `force` is the most expensive: reads neighbor M, ∇ρ, mass, density, vel for
   pair-averaged formulas; uniform V0 lets us compute pair quantities from
   self only (see `force.comp` header for what's hoisted).

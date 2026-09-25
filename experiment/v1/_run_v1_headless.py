@@ -124,7 +124,12 @@ def main() -> None:
           f"{steps_per_second:.1f} steps/s")
     print(f"[v1-headless]   overflow_inside={status['overflow_inside_count']} "
           f"overflow_incoming={status['overflow_incoming_count']} "
-          f"correction_fallback={status['correction_fallback_count']}")
+          f"correction_fallback={status['correction_fallback_count']} "
+          f"overflow_neighbor={status['overflow_neighbor_count']}")
+    if status["overflow_neighbor_count"] != 0:
+        print(f"[v1-headless] WARNING: {status['overflow_neighbor_count']} particles exceeded "
+              f"capacities.max_neighbors (first pid {status['first_overflow_neighbor_pid']}); "
+              f"their extra neighbours were dropped", file=sys.stderr)
     if status["alive_particle_count"] != expected_alive:
         print("[v1-headless] WARNING: alive count differs from the loaded particle count",
               file=sys.stderr)

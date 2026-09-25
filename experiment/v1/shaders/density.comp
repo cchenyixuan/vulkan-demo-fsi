@@ -109,114 +109,139 @@ void main() {
     float density_drift     = 0.0;
     float density_diffusion = 0.0;
 
-    int neighbor_z_range = int(NEIGHBOR_Z_RANGE);
-
     // ------------------------------------------------------------------------
-    // 27-voxel neighbor loop (9 in 2D).
+    // Neighbour loop (2026-09-25). Two candidate sources, chosen at pipeline
+    // creation by USE_NEIGHBOR_LIST (the other branch is dead code):
+    //   list mode : one "cell" = this particle's row of the per-step
+    //               neighbour list (build_neighbor_list.comp); every entry
+    //               already passed the support test, nothing is filtered here.
+    //   voxel mode: 27 cells (9 in 2D) = the surrounding voxels, walked
+    //               z-slowest / x-fastest exactly like the original triple
+    //               loop; the support test is applied per candidate.
+    // Both modes visit the same pairs in the same order, so their sums agree
+    // to floating-point rounding.
     // ------------------------------------------------------------------------
-    for (int delta_z = -neighbor_z_range; delta_z <= neighbor_z_range; delta_z++) {
-        for (int delta_y = -1; delta_y <= 1; delta_y++) {
-            for (int delta_x = -1; delta_x <= 1; delta_x++) {
-                ivec3 neighbor_coord = self_voxel_coord + ivec3(delta_x, delta_y, delta_z);
-                if (!in_own_grid(neighbor_coord)) continue;
+    uint cell_count = USE_NEIGHBOR_LIST ? 1u : (NEIGHBOR_Z_RANGE == 0u ? 9u : 27u);
+    for (uint cell = 0u; cell < cell_count; cell++) {
+        uint candidate_count;
+        uint candidate_base = 0u;   // voxel mode: flat index of the voxel's slot 0
+        if (USE_NEIGHBOR_LIST) {
+            candidate_count = neighbor_count[self_particle_id];
+        } else {
+            ivec3 delta = ivec3(int(cell % 3u) - 1,
+                                int((cell / 3u) % 3u) - 1,
+                                int(cell / 9u) - int(NEIGHBOR_Z_RANGE));
+            ivec3 neighbor_coord = self_voxel_coord + delta;
+            if (!in_own_grid(neighbor_coord)) continue;
+            uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
+            candidate_count = inside_particle_count[neighbor_voxel_id];
+            candidate_base  = neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL;
+        }
 
-                uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
-                uint neighbor_voxel_particle_count = inside_particle_count[neighbor_voxel_id];
-
-                for (uint slot_index = 0u; slot_index < neighbor_voxel_particle_count; slot_index++) {
-                    uint neighbor_particle_id = inside_particle_index[neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL + slot_index];
-                    if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
-                    if (neighbor_particle_id == self_particle_id) continue;
-
-                    // Skip boundary↔boundary pair when self is boundary. The
-                    // boundary's per-step new_density (and the new_pressure
-                    // derived from it via EOS) should reflect ONLY fluid
-                    // neighbor influence, not artifacts from other boundaries
-                    // — those are static and contribute zero divergence but
-                    // their kernel-deficient drift terms still feed back into
-                    // the boundary's apparent pressure. Branch is uniform per
-                    // workgroup since voxel-sorted boundaries cluster together.
-                    // ROTOR counts as a wall here too (2026-09-25): a rotor
-                    // particle's density must reflect only fluid neighbours,
-                    // not other rotor / boundary particles (rotor-rotor pairs
-                    // have zero relative velocity anyway; rotor-wall pairs at
-                    // the shaft / lid crossing would otherwise inject noise).
-                    if (is_solid_kind(self_params.kind)) {
-                        uint neighbor_group_id = material[neighbor_particle_id];
-                        if (is_solid_kind(material_parameters[neighbor_group_id].kind)) continue;
-                    }
-
-                    // --- Distance check (Wendland C4 support = h) -----------
-                    // Neighbor is guaranteed non-inlet / non-dead by InsideParticleIndexBuffer invariants.
-                    vec3  neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
-                    vec3  position_difference_neighbor_to_self = self_position - neighbor_position; // x_ij
-                    float distance = length(position_difference_neighbor_to_self);
-                    if (distance >= SMOOTHING_LENGTH || distance < 1e-12) continue;
-
-                    // --- Read neighbor state --------------------------------
-                    vec3  neighbor_velocity = velocity_mass[neighbor_particle_id].xyz;
-                    float neighbor_mass     = velocity_mass[neighbor_particle_id].w;
-                    float neighbor_density  = density_pressure[neighbor_particle_id].x;
-                    float neighbor_volume   = neighbor_mass / neighbor_density;
-
-                    // Read neighbor correction matrix and density gradient
-                    // (or identity / zero when KCG ablated; spec-const DCE'd).
-                    mat3 neighbor_correction_matrix;
-                    vec3 neighbor_density_gradient;
-                    if (USE_KCG_CORRECTION) {
-                        neighbor_correction_matrix = unpack_correction_inverse(neighbor_particle_id);
-                        neighbor_density_gradient  = density_gradient_kernel_sum[neighbor_particle_id].xyz;
-                    } else {
-                        neighbor_correction_matrix = mat3(1.0);
-                        neighbor_density_gradient  = vec3(0.0);
-                    }
-
-                    // --- Kernel gradient: raw then M_i-corrected ------------
-                    vec3 raw_gradient        = evaluate_kernel_gradient(position_difference_neighbor_to_self, distance);
-                    vec3 corrected_gradient  = self_correction_matrix * raw_gradient;
-
-                    // --- δ-SPH density diffusion (gated by USE_DENSITY_DIFFUSION) -
-                    // Spec-const branch: glslc -O DCE-removes the entire body when
-                    // USE_DENSITY_DIFFUSION = false → vanilla WCSPH continuity.
-                    if (USE_DENSITY_DIFFUSION) {
-                        // --- ψ_ij ---------------------------------------------------
-                        // V0 simplification: ψ_ij = (ρ_j - ρ_i) only (linear form).
-                        // Full Antuono δ-plus formulation also includes an antisymmetric
-                        // density-gradient projection term that improves accuracy near
-                        // sharp density jumps:
-                        //   ψ_ij = (ρ_j - ρ_i) - 0.5 · (M_i·∇ρ_i + M_j·∇ρ_j) · (-x_ij)
-                        // The second term is intentionally commented out for V0 to keep
-                        // the operator simple while validating the rest of the pipeline.
-                        // The supporting computations below (corrected gradient sums) are
-                        // also kept so the second term can be restored by uncommenting.
-                        //
-                        // V1 STALENESS NOTE: while the second term stays commented out,
-                        // neighbor_correction_matrix and neighbor_density_gradient flow
-                        // only into corrected_density_gradient_sum, which is dead code
-                        // (glslc -O should DCE the entire chain). This shields V1 from
-                        // the fact that ghost neighbours' correction_inverse and
-                        // density_gradient_kernel_sum are 1 step stale under Option B
-                        // single sync. UNCOMMENTING the second term turns those reads
-                        // live and exposes the staleness as a ~1e-4 error in ψ_ij —
-                        // would require Option D double sync (V1.0a/V1.1) or accepting
-                        // the bias.
-                        vec3 neighbor_corrected_density_gradient = neighbor_correction_matrix * neighbor_density_gradient;
-                        vec3 corrected_density_gradient_sum = self_corrected_density_gradient + neighbor_corrected_density_gradient;
-                        vec3 position_difference_self_to_neighbor = -position_difference_neighbor_to_self; // -x_ij
-                        float psi_ij = (neighbor_density - self_density);// - 0.5 * dot(corrected_density_gradient_sum, position_difference_self_to_neighbor);
-
-                        // --- D_ij = 2·ψ_ij · (-x_ij · ∇W̃_ij) / (r² + ε_h²) · V_j ---
-                        float dot_xji_gradient = dot(position_difference_self_to_neighbor, corrected_gradient);
-                        float d_ij = 2.0 * psi_ij * dot_xji_gradient / (distance * distance + EPS_H_SQUARED) * neighbor_volume;
-
-                        // --- Diffusion accumulator: δ · h · c₀ · D_ij ---------
-                        density_diffusion += DELTA_COEFFICIENT * SMOOTHING_LENGTH * SPEED_OF_SOUND * d_ij;
-                    }
-
-                    // --- Drift: -ρ_i · V_j · (v_j - v_i) · ∇W̃_ij -----------
-                    density_drift += -self_density * neighbor_volume * dot(neighbor_velocity - self_velocity, corrected_gradient);
-                }
+        for (uint candidate = 0u; candidate < candidate_count; candidate++) {
+            uint neighbor_particle_id;
+            if (USE_NEIGHBOR_LIST) {
+                neighbor_particle_id = neighbor_list[candidate * neighbor_list_stride() + self_particle_id];
+            } else {
+                neighbor_particle_id = inside_particle_index[candidate_base + candidate];
+                if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
+                if (neighbor_particle_id == self_particle_id) continue;
             }
+
+            // Skip boundary↔boundary pair when self is boundary. The
+            // boundary's per-step new_density (and the new_pressure
+            // derived from it via EOS) should reflect ONLY fluid
+            // neighbor influence, not artifacts from other boundaries
+            // — those are static and contribute zero divergence but
+            // their kernel-deficient drift terms still feed back into
+            // the boundary's apparent pressure. Branch is uniform per
+            // workgroup since voxel-sorted boundaries cluster together.
+            // ROTOR counts as a wall here too (2026-09-25): a rotor
+            // particle's density must reflect only fluid neighbours,
+            // not other rotor / boundary particles (rotor-rotor pairs
+            // have zero relative velocity anyway; rotor-wall pairs at
+            // the shaft / lid crossing would otherwise inject noise).
+            if (is_solid_kind(self_params.kind)) {
+                uint neighbor_group_id = material[neighbor_particle_id];
+                if (is_solid_kind(material_parameters[neighbor_group_id].kind)) continue;
+            }
+
+            // --- Distance check (Wendland C4 support = h) -----------
+            // Neighbor is guaranteed non-inlet / non-dead by InsideParticleIndexBuffer invariants.
+            vec3  neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
+            vec3  position_difference_neighbor_to_self = self_position - neighbor_position; // x_ij
+            // Squared test first (2026-09-25): the sqrt is only paid for
+            // the ~15 % of candidates inside the support, not for all 27
+            // voxels' worth. Same accept set as `length(x) >= h` up to
+            // rounding at q = 1 where W and grad W are exactly 0 anyway.
+            float distance_squared = dot(position_difference_neighbor_to_self, position_difference_neighbor_to_self);
+            if (!USE_NEIGHBOR_LIST) {
+                if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
+            }
+            float distance = sqrt(distance_squared);
+
+            // --- Read neighbor state --------------------------------
+            vec3  neighbor_velocity = velocity_mass[neighbor_particle_id].xyz;
+            float neighbor_mass     = velocity_mass[neighbor_particle_id].w;
+            float neighbor_density  = density_pressure[neighbor_particle_id].x;
+            float neighbor_volume   = neighbor_mass / neighbor_density;
+
+            // Read neighbor correction matrix and density gradient
+            // (or identity / zero when KCG ablated; spec-const DCE'd).
+            mat3 neighbor_correction_matrix;
+            vec3 neighbor_density_gradient;
+            if (USE_KCG_CORRECTION) {
+                neighbor_correction_matrix = unpack_correction_inverse(neighbor_particle_id);
+                neighbor_density_gradient  = density_gradient_kernel_sum[neighbor_particle_id].xyz;
+            } else {
+                neighbor_correction_matrix = mat3(1.0);
+                neighbor_density_gradient  = vec3(0.0);
+            }
+
+            // --- Kernel gradient: raw then M_i-corrected ------------
+            vec3 raw_gradient        = evaluate_kernel_gradient_unguarded(position_difference_neighbor_to_self, distance);
+            vec3 corrected_gradient  = self_correction_matrix * raw_gradient;
+
+            // --- δ-SPH density diffusion (gated by USE_DENSITY_DIFFUSION) -
+            // Spec-const branch: glslc -O DCE-removes the entire body when
+            // USE_DENSITY_DIFFUSION = false → vanilla WCSPH continuity.
+            if (USE_DENSITY_DIFFUSION) {
+                // --- ψ_ij ---------------------------------------------------
+                // V0 simplification: ψ_ij = (ρ_j - ρ_i) only (linear form).
+                // Full Antuono δ-plus formulation also includes an antisymmetric
+                // density-gradient projection term that improves accuracy near
+                // sharp density jumps:
+                //   ψ_ij = (ρ_j - ρ_i) - 0.5 · (M_i·∇ρ_i + M_j·∇ρ_j) · (-x_ij)
+                // The second term is intentionally commented out for V0 to keep
+                // the operator simple while validating the rest of the pipeline.
+                // The supporting computations below (corrected gradient sums) are
+                // also kept so the second term can be restored by uncommenting.
+                //
+                // V1 STALENESS NOTE: while the second term stays commented out,
+                // neighbor_correction_matrix and neighbor_density_gradient flow
+                // only into corrected_density_gradient_sum, which is dead code
+                // (glslc -O should DCE the entire chain). This shields V1 from
+                // the fact that ghost neighbours' correction_inverse and
+                // density_gradient_kernel_sum are 1 step stale under Option B
+                // single sync. UNCOMMENTING the second term turns those reads
+                // live and exposes the staleness as a ~1e-4 error in ψ_ij —
+                // would require Option D double sync (V1.0a/V1.1) or accepting
+                // the bias.
+                vec3 neighbor_corrected_density_gradient = neighbor_correction_matrix * neighbor_density_gradient;
+                vec3 corrected_density_gradient_sum = self_corrected_density_gradient + neighbor_corrected_density_gradient;
+                vec3 position_difference_self_to_neighbor = -position_difference_neighbor_to_self; // -x_ij
+                float psi_ij = (neighbor_density - self_density);// - 0.5 * dot(corrected_density_gradient_sum, position_difference_self_to_neighbor);
+
+                // --- D_ij = 2·ψ_ij · (-x_ij · ∇W̃_ij) / (r² + ε_h²) · V_j ---
+                float dot_xji_gradient = dot(position_difference_self_to_neighbor, corrected_gradient);
+                float d_ij = 2.0 * psi_ij * dot_xji_gradient / (distance * distance + EPS_H_SQUARED) * neighbor_volume;
+
+                // --- Diffusion accumulator: δ · h · c₀ · D_ij ---------
+                density_diffusion += DELTA_COEFFICIENT * SMOOTHING_LENGTH * SPEED_OF_SOUND * d_ij;
+            }
+
+            // --- Drift: -ρ_i · V_j · (v_j - v_i) · ∇W̃_ij -----------
+            density_drift += -self_density * neighbor_volume * dot(neighbor_velocity - self_velocity, corrected_gradient);
         }
     }
 

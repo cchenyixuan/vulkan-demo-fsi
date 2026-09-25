@@ -311,6 +311,19 @@ class NumericsConfig:
     # scratch counter (non-deterministic order, but contiguous within each
     # voxel; works standalone). Default False until prefix_sum.comp lands.
     use_prefix_sum_defrag: bool = False
+    # Per-step neighbour list (2026-09-25): when True, build_neighbor_list.comp
+    # runs once per step after update_voxel and stores, for every own
+    # particle, the ids of all particles inside the kernel support; the three
+    # neighbour kernels (correction / density / force) then iterate that list
+    # instead of scanning the 27 surrounding voxels three times. Same pair set
+    # and same summation order as the voxel scan, so results match to
+    # rounding. When False the kernels use the original 27-voxel scan and the
+    # list buffers stay unread (spec-constant DCE).
+    # DEFAULT False: measured 1.6x SLOWER on the 3 mm tank (RTX 4070 Ti SUPER,
+    # log/2026-09-25_neighbor-list.md) because the voxel scan's candidate
+    # reads are warp-broadcast while list entries are per-lane gathers. Kept
+    # as an opt-in experiment / reference implementation.
+    use_neighbor_list: bool = False
     # Particle defragmentation: rearranges the particle SoA so that, for every
     # voxel V, that voxel's particles occupy a contiguous slot range in the
     # SoA. Restores spatial locality between SoA index and voxel coordinates,
@@ -344,8 +357,15 @@ class CapacitiesConfig:
     max_per_voxel: int                              # MAX_PARTICLES_PER_VOXEL
     max_incoming: int                               # MAX_INCOMING_PER_VOXEL
     workgroup: int                                  # WORKGROUP_SIZE
+    # MAX_NEIGHBORS: per-particle neighbour-list capacity. 0 (default) means
+    # "closest-packing upper bound for this h/dx" (Case.neighbors_max_estimate);
+    # an explicit value must be at least that bound.
+    max_neighbors: int = 0
 
     def __post_init__(self):
+        if self.max_neighbors < 0:
+            raise ValueError(
+                f"capacities.max_neighbors must be >= 0, got {self.max_neighbors}")
         if self.pool_size <= 0:
             raise ValueError(f"capacities.pool_size must be > 0, got {self.pool_size}")
         if self.max_per_voxel <= 0:
@@ -523,6 +543,18 @@ class Case:
                 f"h/dx = {ratio:.3f} in {self.physics.dimension}D. Increase "
                 f"capacities.max_per_voxel in case.yaml, or coarsen geometry "
                 f"(reduce h/dx ratio).")
+        # Neighbour-list capacity: same closest-packing argument, applied to
+        # the support sphere (radius h) instead of the voxel cube.
+        neighbor_bound = self.neighbors_max_estimate
+        if self.capacities.max_neighbors == 0:
+            self.capacities.max_neighbors = neighbor_bound
+        elif self.capacities.max_neighbors < neighbor_bound:
+            raise ValueError(
+                f"capacities.max_neighbors ({self.capacities.max_neighbors}) is "
+                f"below the closest-packing upper bound ({neighbor_bound}) for the "
+                f"support sphere at h/dx = "
+                f"{self.physics.h / self.physics.particle_diameter:.3f}. Raise it "
+                f"or set 0 to use the bound.")
 
     # ------------------------------------------------------------------
     # Derived from intrinsic parameters (no geometry / materials needed)
@@ -606,6 +638,22 @@ class Case:
         density_factor = math.sqrt(2.0)
         return int(math.ceil(density_factor * ratio ** 3))
 
+    @property
+    def neighbors_max_estimate(self) -> int:
+        """Closest-packing upper bound on particles strictly inside the
+        Wendland support (a disc / sphere of radius h) around one particle,
+        excluding the particle itself. Used as the hard bound for
+        capacities.max_neighbors (MAX_NEIGHBORS), like
+        particles_per_voxel_max_estimate is for max_per_voxel.
+
+        2D: 2/(sqrt3 dx^2) * pi h^2        3D: sqrt2/dx^3 * 4/3 pi h^3
+        (h/dx = 3 in 3D gives 160; the cubic-lattice count at rest is 113.)
+        """
+        ratio = self.physics.h / self.physics.particle_diameter
+        if self.physics.dimension == 2:
+            return int(math.ceil(2.0 / math.sqrt(3.0) * math.pi * ratio * ratio))
+        return int(math.ceil(math.sqrt(2.0) * 4.0 / 3.0 * math.pi * ratio ** 3))
+
 
 # ============================================================================
 # Specialization constant assembly
@@ -660,10 +708,12 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (44,  lambda case: 1 if case.numerics.use_density_diffusion else 0, 'I'),  # USE_DENSITY_DIFFUSION
     (45,  lambda case: 1 if case.numerics.use_pst               else 0, 'I'),  # USE_PST
     (46,  lambda case: 1 if case.numerics.use_prefix_sum_defrag else 0, 'I'),  # USE_PREFIX_SUM_DEFRAG
+    (47,  lambda case: 1 if case.numerics.use_neighbor_list     else 0, 'I'),  # USE_NEIGHBOR_LIST
     (50,  lambda case: case.capacities.max_per_voxel,                  'I'),
     (51,  lambda case: case.capacities.workgroup,                      'I'),
     (52,  lambda case: case.capacities.max_incoming,                   'I'),
     (53,  lambda case: case.capacities.pool_size,                      'I'),
+    (62,  lambda case: case.capacities.max_neighbors,                  'I'),  # MAX_NEIGHBORS
     # 56-61 rotor axis / pivot (world coords); defaults when no rotor block.
     (56,  lambda case: (case.rotor.axis[0]  if case.rotor else 0.0),   'f'),
     (57,  lambda case: (case.rotor.axis[1]  if case.rotor else 0.0),   'f'),

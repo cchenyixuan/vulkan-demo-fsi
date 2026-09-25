@@ -1,0 +1,92 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "helpers.glsl"
+
+// ============================================================================
+// build_neighbor_list.comp - per-step neighbour list (2026-09-25).
+//
+// Runs once per step right after update_voxel (and once at bootstrap after
+// initialize_voxelization), one thread per own particle. It performs the
+// 27-voxel candidate scan that correction / density / force used to repeat
+// three times each step, and stores the survivors:
+//
+//   neighbor_count[i]                         = number of j with
+//                                               1e-24 <= |x_i - x_j|^2 < h^2, j != i
+//   neighbor_list[k * stride + i], k < count  = those j, in scan order
+//
+// The scan order (voxel z-slowest / x-fastest, slot order inside a voxel) is
+// the same order the kernels used, so switching USE_NEIGHBOR_LIST on or off
+// changes results only by rounding.
+//
+// Capacity: MAX_NEIGHBORS entries per particle. If a particle has more true
+// neighbours the extra ones are dropped, overflow_neighbor_count is bumped
+// and a sample pid recorded; Python treats a nonzero count as an error at
+// bootstrap and warns at run end. The default capacity is the closest-packing
+// bound for the support sphere, so overflow needs an unphysical clustering.
+//
+// Dead (voxel_id == 0) and inlet particles get count 0; the kernels return
+// early for them before reading the list.
+//
+// Cost model: this kernel pays the ~730-candidate scan once (16 B position
+// read + squared distance per candidate). The three consumers then read
+// ~113 ids each from a coalesced row and gather only true neighbours.
+// ============================================================================
+
+layout(local_size_x_id = 51, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint self_particle_id = gl_GlobalInvocationID.x + own_first_pid();
+    if (self_particle_id > own_last_pid()) return;
+
+    vec4 self_position_voxel_id = position_voxel_id[self_particle_id];
+    vec3 self_position          = self_position_voxel_id.xyz;
+    uint self_voxel_id          = uint(round(self_position_voxel_id.w));
+
+    uint self_group_id = material[self_particle_id];
+    bool skip = (self_voxel_id == VOXEL_ID_DEAD)
+             || (material_parameters[self_group_id].kind == MATERIAL_INLET);
+
+    uint written = 0u;
+    if (!skip) {
+        ivec3 self_voxel_coord = own_coord_of(self_voxel_id);
+        uint  stride           = neighbor_list_stride();
+        uint  cell_count       = (NEIGHBOR_Z_RANGE == 0u) ? 9u : 27u;
+
+        for (uint cell = 0u; cell < cell_count; cell++) {
+            ivec3 delta = ivec3(int(cell % 3u) - 1,
+                                int((cell / 3u) % 3u) - 1,
+                                int(cell / 9u) - int(NEIGHBOR_Z_RANGE));
+            ivec3 neighbor_coord = self_voxel_coord + delta;
+            if (!in_own_grid(neighbor_coord)) continue;
+
+            uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
+            uint candidate_count   = inside_particle_count[neighbor_voxel_id];
+            uint candidate_base    = neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL;
+
+            for (uint candidate = 0u; candidate < candidate_count; candidate++) {
+                uint neighbor_particle_id = inside_particle_index[candidate_base + candidate];
+                if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
+                if (neighbor_particle_id == self_particle_id) continue;
+
+                vec3  neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
+                vec3  difference        = self_position - neighbor_position;
+                float distance_squared  = dot(difference, difference);
+                if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
+
+                if (written < MAX_NEIGHBORS) {
+                    neighbor_list[written * stride + self_particle_id] = neighbor_particle_id;
+                }
+                written++;
+            }
+        }
+
+        if (written > MAX_NEIGHBORS) {
+            atomicAdd(overflow_neighbor_count, 1u);
+            atomicCompSwap(first_overflow_neighbor_pid, 0u, self_particle_id);
+            written = MAX_NEIGHBORS;
+        }
+    }
+
+    neighbor_count[self_particle_id] = written;
+}

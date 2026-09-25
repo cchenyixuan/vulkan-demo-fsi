@@ -13,7 +13,8 @@ removed from the tree; it lives on `v4-multigpu-orchestration`. Do not
 re-import it here.
 
 Solver summary: δ-plus WCSPH, explicit leapfrog (half-step velocity storage,
-5 kernels per step), persistent uniform voxel grid for neighbour search, Vulkan
+5 kernels per step plus a per-step neighbour-list build), persistent uniform
+voxel grid for neighbour search, Vulkan
 compute via `python-vulkan`, case parameters delivered to shaders as
 specialization constants.
 
@@ -127,13 +128,16 @@ run scripts.
   `experiment/v1/shaders/README.md`.
 - **Spec constants**: ids and ranges are listed in `common.glsl` and mirrored by
   `_global_spec_entries()` in `simulator_v1.py`; both must be edited together.
-  Free ranges for new constants: 34–39, 56–79, 89+.
+  Free ranges for new constants: 34–39, 48–49, 63–79, 89+ (47 = USE_NEIGHBOR_LIST,
+  62 = MAX_NEIGHBORS, both added 2026-09-25 on the test branch).
 - **Uniform-material simplifications** inherited from V0: `force.comp` uses
   self's mass / viscosity / volume for pair quantities (no multi-phase), no
   micropolar terms, no inlet spawn kernel (rotor motion added on the test branch, see above).
 - **Overflow counters** in `GlobalStatusBuffer` (`readback_global_status()`)
   are the first thing to check after any change: `overflow_inside_count`,
-  `overflow_incoming_count`, `correction_fallback_count` must stay 0.
+  `overflow_incoming_count`, `correction_fallback_count`, `overflow_neighbor_count`
+  must stay 0 (the last one is the per-particle neighbour-list capacity,
+  `capacities.max_neighbors`, default = closest-packing bound).
 
 ## Environment
 

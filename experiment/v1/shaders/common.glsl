@@ -155,6 +155,15 @@ layout(constant_id = 45) const bool USE_PST = true;
 // works standalone (no prefix_sum dependency). Default false; flip to true
 // after prefix_sum is verified.
 layout(constant_id = 46) const bool USE_PREFIX_SUM_DEFRAG = false;
+
+// Per-step neighbour list (2026-09-25): when true, build_neighbor_list.comp
+// runs after update_voxel and fills NeighborCountBuffer / NeighborListBuffer
+// (set 1, bindings 5-6); correction / density / force then iterate that list
+// instead of scanning the 27 surrounding voxels. When false the kernels use
+// the original voxel scan and never touch the list buffers (DCE).
+// Default false: measured slower than the voxel scan on sorted particles
+// (see log/2026-09-25_neighbor-list.md); kept as an opt-in experiment.
+layout(constant_id = 47) const bool USE_NEIGHBOR_LIST = false;
 // ----- end ablation toggles ------------------------------------------------
 
 // --- Capacity / dispatch ---
@@ -183,6 +192,12 @@ layout(constant_id = 58) const float ROTOR_AXIS_Z  = 1.0;
 layout(constant_id = 59) const float ROTOR_PIVOT_X = 0.0;
 layout(constant_id = 60) const float ROTOR_PIVOT_Y = 0.0;
 layout(constant_id = 61) const float ROTOR_PIVOT_Z = 0.0;
+
+// --- Neighbour list capacity (entries per particle). Python sets it to the
+// closest-packing bound for the support sphere (Case.neighbors_max_estimate,
+// 160 at h/dx = 3 in 3D) unless case.yaml overrides. Overflow is counted in
+// GlobalStatusBuffer.overflow_neighbor_count and the extra neighbours dropped.
+layout(constant_id = 62) const uint MAX_NEIGHBORS = 160u;
 
 // --- Multi-GPU ghost (V1 merged-buffer scheme) ---
 // V1 partitions along X. The voxel_id encoding (helpers.glsl) is "x-slowest"
@@ -438,7 +453,30 @@ layout(std430, set = 1, binding = 4) buffer VoxelBaseOffsetBuffer {
     // voxel buffers.
     uint voxel_base_offset[];
 };
-// binding 5 reserved
+
+// ---- Per-step neighbour list (2026-09-25) ----------------------------------
+// Written by build_neighbor_list.comp once per step (after update_voxel) and
+// once at bootstrap (after initialize_voxelization); read by correction /
+// density / force when USE_NEIGHBOR_LIST. Rebuilt from scratch every step,
+// so defrag (which renumbers particles after force) never has to carry it.
+layout(std430, set = 1, binding = 5) buffer NeighborCountBuffer {
+    // Indexed by 1-based particle_id: number of valid entries in this
+    // particle's list, already clamped to MAX_NEIGHBORS. 0 for dead / inlet.
+    uint neighbor_count[];
+};
+
+layout(std430, set = 1, binding = 6) buffer NeighborListBuffer {
+    // TRANSPOSED layout: entry k of particle pid lives at
+    //     neighbor_list[k * neighbor_list_stride() + pid]
+    // (stride = pool capacity incl. slot 0, see helpers.glsl). At loop index
+    // k the consecutive pids of one warp therefore read one contiguous run
+    // of uints (coalesced), instead of MAX_NEIGHBORS*4 B apart.
+    // Entries are 1-based particle_ids of every particle j != i with
+    // 1e-24 <= |x_i - x_j|^2 < h^2, in the same order the 27-voxel scan
+    // visits them (voxel z-slowest / x-fastest, slot order inside a voxel),
+    // so list-mode and voxel-mode sums agree to rounding.
+    uint neighbor_list[];
+};
 
 // ============================================================================
 // Descriptor set 2 — UNUSED in V1 merged-buffer scheme.
@@ -488,7 +526,14 @@ layout(std430, set = 3, binding = 0) buffer GlobalStatusBuffer {
     uint  migration_install_count;
     uint  overflow_install_tail;
     uint  overflow_install_inside;
-    uint  first_overflow_voxel_install;   // total 16 uint = 64 B, one cache line
+    uint  first_overflow_voxel_install;
+    // build_neighbor_list.comp (2026-09-25): particles whose true neighbour
+    // count exceeded MAX_NEIGHBORS (their extra neighbours were dropped) and
+    // a sample pid. Python raises at bootstrap / warns at run end if nonzero.
+    uint  overflow_neighbor_count;
+    uint  first_overflow_neighbor_pid;
+    uint  reserved_status_pad_0;
+    uint  reserved_status_pad_1;          // total 20 uint = 80 B
 };
 
 layout(std430, set = 3, binding = 1) buffer OverflowLogBuffer {

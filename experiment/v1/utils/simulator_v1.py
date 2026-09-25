@@ -7,7 +7,7 @@ survived the single-GPU cut:
   * set 1 (voxel cells: inside / incoming counts + index lists + base offset)
   * set 2 unused (kept as an empty placeholder layout so common.glsl's
     descriptor numbering is unchanged)
-  * set 3 (global_status 16-uint block, overflow log, inlet template,
+  * set 3 (global_status 20-uint block, overflow log, inlet template,
     dispatch indirect, material_parameters, defrag scratch counter)
   * defrag.comp with copy-back (scratch set 4 → set 0) on a fixed cadence
 
@@ -53,6 +53,7 @@ SHADER_NAMES_HOT = [
     "initialize_voxelization",
     "predict",
     "update_voxel",
+    "build_neighbor_list",
     "correction",
     "density",
     "force",
@@ -97,6 +98,7 @@ SPEC_ID_USE_KCG_CORRECTION                  = 43
 SPEC_ID_USE_DENSITY_DIFFUSION               = 44
 SPEC_ID_USE_PST                             = 45
 SPEC_ID_USE_PREFIX_SUM_DEFRAG               = 46
+SPEC_ID_USE_NEIGHBOR_LIST                   = 47
 SPEC_ID_MAX_PARTICLES_PER_VOXEL             = 50
 SPEC_ID_WORKGROUP_SIZE                      = 51
 SPEC_ID_MAX_INCOMING_PER_VOXEL              = 52
@@ -115,6 +117,7 @@ SPEC_ID_ROTOR_AXIS_Z                        = 58
 SPEC_ID_ROTOR_PIVOT_X                       = 59
 SPEC_ID_ROTOR_PIVOT_Y                       = 60
 SPEC_ID_ROTOR_PIVOT_Z                       = 61
+SPEC_ID_MAX_NEIGHBORS                       = 62
 SPEC_ID_LEADING_GHOST_VOXEL_COUNT           = 80
 SPEC_ID_TRAILING_GHOST_VOXEL_COUNT          = 81
 
@@ -279,6 +282,7 @@ class SphSimulatorV1:
 
         cap_inside = int(case.capacities.max_per_voxel)
         cap_incoming = int(case.capacities.max_incoming)
+        cap_neighbors = int(case.capacities.max_neighbors) if case.numerics.use_neighbor_list else 1
         n_materials = len(case.materials)
 
         BSU = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
@@ -305,12 +309,19 @@ class SphSimulatorV1:
             _BufferSpec("inside_particle_index",        1, 2,  4 * voxel_capacity * cap_inside,     BSU | TRANSFER),
             _BufferSpec("incoming_particle_index",      1, 3,  4 * voxel_capacity * cap_incoming,   BSU | TRANSFER),
             _BufferSpec("voxel_base_offset",            1, 4,  4 * voxel_capacity,                  BSU | TRANSFER),
+            # Per-particle neighbour list (2026-09-25). neighbor_list is laid
+            # out transposed, [k * pool_capacity + pid], so that at loop index
+            # k a warp of consecutive pids reads one contiguous 128 B run.
+            # Sized to 1 entry per particle when the list is disabled (the
+            # kernels then never read it, but the binding must exist).
+            _BufferSpec("neighbor_count",               1, 5,  4 * pool_capacity,                   BSU | TRANSFER),
+            _BufferSpec("neighbor_list",                1, 6,  4 * pool_capacity * cap_neighbors,   BSU | TRANSFER),
 
             # ---- Set 2: UNUSED (no bindings) — placeholder layout
             # is built in _build_descriptor_layouts. No buffer specs.
 
             # ---- Set 3: global / transport / materials ---------------------
-            _BufferSpec("global_status",                3, 0,  64,                       BSU | TRANSFER),
+            _BufferSpec("global_status",                3, 0,  80,                       BSU | TRANSFER),
             _BufferSpec("overflow_log",                 3, 1,  64,                       BSU | TRANSFER),
             _BufferSpec("inlet_template",               3, 2,  32,                       BSU | TRANSFER),
             _BufferSpec("dispatch_indirect",            3, 3,  16,                       BSU | TRANSFER),
@@ -751,6 +762,7 @@ class SphSimulatorV1:
             (SPEC_ID_USE_DENSITY_DIFFUSION,        1 if numerics.use_density_diffusion else 0, 'I'),
             (SPEC_ID_USE_PST,                      1 if numerics.use_pst else 0,              'I'),
             (SPEC_ID_USE_PREFIX_SUM_DEFRAG,        1 if numerics.use_prefix_sum_defrag else 0, 'I'),
+            (SPEC_ID_USE_NEIGHBOR_LIST,            1 if numerics.use_neighbor_list else 0,    'I'),
             (SPEC_ID_MAX_PARTICLES_PER_VOXEL,      int(capacities.max_per_voxel),             'I'),
             (SPEC_ID_WORKGROUP_SIZE,               int(capacities.workgroup),                 'I'),
             (SPEC_ID_MAX_INCOMING_PER_VOXEL,       int(capacities.max_incoming),              'I'),
@@ -765,6 +777,7 @@ class SphSimulatorV1:
             (SPEC_ID_ROTOR_PIVOT_X,                float(case.rotor.pivot[0] if case.rotor else 0.0), 'f'),
             (SPEC_ID_ROTOR_PIVOT_Y,                float(case.rotor.pivot[1] if case.rotor else 0.0), 'f'),
             (SPEC_ID_ROTOR_PIVOT_Z,                float(case.rotor.pivot[2] if case.rotor else 0.0), 'f'),
+            (SPEC_ID_MAX_NEIGHBORS,                int(capacities.max_neighbors),             'I'),
             (SPEC_ID_LEADING_GHOST_VOXEL_COUNT,    0,                                         'I'),
             (SPEC_ID_TRAILING_GHOST_VOXEL_COUNT,   0,                                         'I'),
         ]
@@ -917,6 +930,8 @@ class SphSimulatorV1:
         vkCmdDispatch(cmd, per_p, 1, 1)
         self._record_compute_barrier(cmd)
 
+        self._record_build_neighbor_list(cmd, per_p)
+
         self._bind_pipeline_and_sets(cmd, "correction")
         vkCmdDispatch(cmd, per_p, 1, 1)
         self._record_compute_barrier(cmd)
@@ -955,6 +970,8 @@ class SphSimulatorV1:
         vkCmdDispatch(cmd, per_v, 1, 1)
         self._record_compute_barrier(cmd)
 
+        self._record_build_neighbor_list(cmd, per_p)
+
         self._bind_pipeline_and_sets(cmd, "correction")
         vkCmdDispatch(cmd, per_p, 1, 1)
         self._record_compute_barrier(cmd)
@@ -968,6 +985,19 @@ class SphSimulatorV1:
 
         vkEndCommandBuffer(cmd)
         return cmd
+
+    def _record_build_neighbor_list(self, cmd, per_p: int) -> None:
+        """Neighbour-list build (2026-09-25): one dispatch per own particle
+        right after the voxel lists are final (update_voxel in a step,
+        initialize_voxelization in bootstrap). No-op when the case runs the
+        legacy 27-voxel scan (numerics.use_neighbor_list = false). Defrag
+        renumbers particles, but it runs after force and the next step
+        rebuilds the list before anything reads it, so nothing is carried."""
+        if not self.case.numerics.use_neighbor_list:
+            return
+        self._bind_pipeline_and_sets(cmd, "build_neighbor_list")
+        vkCmdDispatch(cmd, per_p, 1, 1)
+        self._record_compute_barrier(cmd)
 
     def _record_defrag_cmd(self):
         """Defrag with copy-back (scratch set 4 → set 0) + alive count refresh."""
@@ -1049,7 +1079,15 @@ class SphSimulatorV1:
                 f"inside={status['overflow_inside_count']} "
                 f"incoming={status['overflow_incoming_count']} "
                 f"first_inside_vid={status['first_overflow_voxel_inside']}")
-        print(f"[SimV1] bootstrap ok: alive={status['alive_particle_count']}")
+        if status["overflow_neighbor_count"] != 0:
+            raise RuntimeError(
+                f"neighbour list overflowed at bootstrap: "
+                f"{status['overflow_neighbor_count']} particles have more than "
+                f"capacities.max_neighbors={self.case.capacities.max_neighbors} neighbours "
+                f"(first pid {status['first_overflow_neighbor_pid']})")
+        print(f"[SimV1] bootstrap ok: alive={status['alive_particle_count']}"
+              + (f" max_neighbors={self.case.capacities.max_neighbors}"
+                 if self.case.numerics.use_neighbor_list else " (27-voxel scan)"))
 
         if self.case.numerics.defrag_enabled:
             self.ctx.submit_and_wait(self.defrag_cmd)
@@ -1166,11 +1204,11 @@ class SphSimulatorV1:
             vkFreeMemory(self.ctx.device, staging.memory, None)
 
     def readback_global_status(self) -> dict:
-        """V1 GlobalStatusBuffer layout (16 × 4 B = 64 B). Field order matches
+        """V1 GlobalStatusBuffer layout (20 × 4 B = 80 B). Field order matches
         experiment/v1/shaders/common.glsl. The ghost_* / migration_* fields
         are always 0 on this single-GPU branch."""
         raw = self._readback_buffer(self.buffers["global_status"])
-        unpacked = struct.unpack("I f I I I I I I I I I I I I I I", raw)
+        unpacked = struct.unpack("I f I I I I I I I I I I I I I I I I I I", raw)
         return {
             "alive_particle_count":          unpacked[0],
             "maximum_velocity":              unpacked[1],
@@ -1188,6 +1226,10 @@ class SphSimulatorV1:
             "overflow_install_tail":         unpacked[13],
             "overflow_install_inside":       unpacked[14],
             "first_overflow_voxel_install":  unpacked[15],
+            # Neighbour-list build (2026-09-25): particles whose true
+            # neighbour count exceeded MAX_NEIGHBORS (extra neighbours dropped).
+            "overflow_neighbor_count":       unpacked[16],
+            "first_overflow_neighbor_pid":   unpacked[17],
         }
 
     def readback_positions(self) -> np.ndarray:

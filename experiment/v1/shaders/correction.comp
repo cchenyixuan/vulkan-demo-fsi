@@ -67,56 +67,81 @@ void main() {
     vec3  density_gradient  = vec3(0.0);
     float kernel_sum        = 0.0;
 
-    int neighbor_z_range = int(NEIGHBOR_Z_RANGE);
-
     // ------------------------------------------------------------------------
-    // 27-voxel neighbor loop (9 in 2D).
+    // Neighbour loop (2026-09-25). Two candidate sources, chosen at pipeline
+    // creation by USE_NEIGHBOR_LIST (the other branch is dead code):
+    //   list mode : one "cell" = this particle's row of the per-step
+    //               neighbour list (build_neighbor_list.comp); every entry
+    //               already passed the support test, nothing is filtered here.
+    //   voxel mode: 27 cells (9 in 2D) = the surrounding voxels, walked
+    //               z-slowest / x-fastest exactly like the original triple
+    //               loop; the support test is applied per candidate.
+    // Both modes visit the same pairs in the same order, so their sums agree
+    // to floating-point rounding.
     // ------------------------------------------------------------------------
-    for (int delta_z = -neighbor_z_range; delta_z <= neighbor_z_range; delta_z++) {
-        for (int delta_y = -1; delta_y <= 1; delta_y++) {
-            for (int delta_x = -1; delta_x <= 1; delta_x++) {
-                ivec3 neighbor_coord = self_voxel_coord + ivec3(delta_x, delta_y, delta_z);
-                if (!in_own_grid(neighbor_coord)) continue;
+    uint cell_count = USE_NEIGHBOR_LIST ? 1u : (NEIGHBOR_Z_RANGE == 0u ? 9u : 27u);
+    for (uint cell = 0u; cell < cell_count; cell++) {
+        uint candidate_count;
+        uint candidate_base = 0u;   // voxel mode: flat index of the voxel's slot 0
+        if (USE_NEIGHBOR_LIST) {
+            candidate_count = neighbor_count[self_particle_id];
+        } else {
+            ivec3 delta = ivec3(int(cell % 3u) - 1,
+                                int((cell / 3u) % 3u) - 1,
+                                int(cell / 9u) - int(NEIGHBOR_Z_RANGE));
+            ivec3 neighbor_coord = self_voxel_coord + delta;
+            if (!in_own_grid(neighbor_coord)) continue;
+            uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
+            candidate_count = inside_particle_count[neighbor_voxel_id];
+            candidate_base  = neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL;
+        }
 
-                uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
-                uint neighbor_voxel_particle_count = inside_particle_count[neighbor_voxel_id];
-
-                for (uint slot_index = 0u; slot_index < neighbor_voxel_particle_count; slot_index++) {
-                    uint neighbor_particle_id = inside_particle_index[neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL + slot_index];
-                    if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
-                    if (neighbor_particle_id == self_particle_id) continue;
-
-                    // --- Distance (Wendland C4 support radius = h) ----------
-                    // Neighbor is guaranteed non-inlet / non-dead by InsideParticleIndexBuffer invariants.
-                    vec3 neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
-                    vec3 position_difference_neighbor_to_self = self_position - neighbor_position; // x_ij = r_i - r_j
-                    float distance = length(position_difference_neighbor_to_self);
-                    if (distance >= SMOOTHING_LENGTH || distance < 1e-12) continue;
-
-                    // --- Read neighbor mass / density / volume --------------
-                    float neighbor_mass    = velocity_mass[neighbor_particle_id].w;
-                    float neighbor_density = density_pressure[neighbor_particle_id].x;
-                    float neighbor_volume  = neighbor_mass / neighbor_density;
-
-                    // --- Evaluate kernel and gradient -----------------------
-                    vec3  kernel_gradient_value = evaluate_kernel_gradient(
-                                                      position_difference_neighbor_to_self,
-                                                      distance);
-                    float kernel_value          = evaluate_kernel(distance);
-
-                    // ---- KCG correction matrix: M_i = Σ V_j · (r_j - r_i) ⊗ ∇W_ij
-                    vec3 position_difference_self_to_neighbor = -position_difference_neighbor_to_self; // = r_j - r_i
-                    correction_matrix += neighbor_volume * outerProduct(position_difference_self_to_neighbor, kernel_gradient_value);
-
-                    // ---- Density gradient: ∇ρ_i = Σ V_j · (ρ_j - ρ_i) · ∇W_ij
-                    density_gradient += neighbor_volume
-                                      * (neighbor_density - self_density)
-                                      * kernel_gradient_value;
-
-                    // ---- Kernel sum: Σ V_j · W_ij
-                    kernel_sum += neighbor_volume * kernel_value;
-                }
+        for (uint candidate = 0u; candidate < candidate_count; candidate++) {
+            uint neighbor_particle_id;
+            if (USE_NEIGHBOR_LIST) {
+                neighbor_particle_id = neighbor_list[candidate * neighbor_list_stride() + self_particle_id];
+            } else {
+                neighbor_particle_id = inside_particle_index[candidate_base + candidate];
+                if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
+                if (neighbor_particle_id == self_particle_id) continue;
             }
+
+            // --- Distance (Wendland C4 support radius = h) ----------
+            // Neighbor is guaranteed non-inlet / non-dead by InsideParticleIndexBuffer invariants.
+            vec3 neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
+            vec3 position_difference_neighbor_to_self = self_position - neighbor_position; // x_ij = r_i - r_j
+            // Squared test first (2026-09-25): the sqrt is only paid for
+            // the ~15 % of candidates inside the support, not for all 27
+            // voxels' worth. Same accept set as `length(x) >= h` up to
+            // rounding at q = 1 where W and grad W are exactly 0 anyway.
+            float distance_squared = dot(position_difference_neighbor_to_self, position_difference_neighbor_to_self);
+            if (!USE_NEIGHBOR_LIST) {
+                if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
+            }
+            float distance = sqrt(distance_squared);
+
+            // --- Read neighbor mass / density / volume --------------
+            float neighbor_mass    = velocity_mass[neighbor_particle_id].w;
+            float neighbor_density = density_pressure[neighbor_particle_id].x;
+            float neighbor_volume  = neighbor_mass / neighbor_density;
+
+            // --- Evaluate kernel and gradient -----------------------
+            vec3  kernel_gradient_value = evaluate_kernel_gradient_unguarded(
+                                              position_difference_neighbor_to_self,
+                                              distance);
+            float kernel_value          = evaluate_kernel_unguarded(distance);
+
+            // ---- KCG correction matrix: M_i = Σ V_j · (r_j - r_i) ⊗ ∇W_ij
+            vec3 position_difference_self_to_neighbor = -position_difference_neighbor_to_self; // = r_j - r_i
+            correction_matrix += neighbor_volume * outerProduct(position_difference_self_to_neighbor, kernel_gradient_value);
+
+            // ---- Density gradient: ∇ρ_i = Σ V_j · (ρ_j - ρ_i) · ∇W_ij
+            density_gradient += neighbor_volume
+                              * (neighbor_density - self_density)
+                              * kernel_gradient_value;
+
+            // ---- Kernel sum: Σ V_j · W_ij
+            kernel_sum += neighbor_volume * kernel_value;
         }
     }
 
