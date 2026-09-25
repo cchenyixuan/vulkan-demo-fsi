@@ -74,7 +74,7 @@ PROBE_HALF = 0.0075
 PROBE_Y = (0.406, 0.456)
 PROBE_CENTERS = ((-0.127, -0.018), (0.053, -0.118))
 
-IMPELLER_RPM = 200.0                      # M-Star: -200 rpm about +y
+IMPELLER_RPM = 200.0                      # M-Star: -200 rpm about +y = CCW seen from above (see comment in CASE_YAML)
 TIP_SPEED = math.pi * 2 * 0.0491 * IMPELLER_RPM / 60.0
 
 
@@ -177,9 +177,16 @@ schema_version: 2
 # single-phase tank gravity only adds a hydrostatic offset, so c0 is set from
 # the impeller tip speed only (10 * {tip_speed:.3f} m/s).
 # Rotor: shaft + both impellers rotate rigidly about +y through the origin
-# (predict.comp ROTOR branch, 2026-09-25). M-Star's "-200 rpm about +y" is
-# a NEGATIVE angular velocity in the right-hand sense, i.e. the blades move
-# from +x toward +z; the PBT (y decreasing toward +theta) then pumps DOWN.
+# (predict.comp ROTOR branch, 2026-09-25). The dataset's M-Star input.xml has
+# freq = -200 rpm, rotationAxis (0,1,0). M-Star's sign convention is the mixing
+# one, NOT the right-hand rule: "a positive RPM implies clockwise motion as
+# viewed when looking into the direction of gravity" (docs.mstarcfd.com, Moving
+# Bodies). So -200 rpm = counter-clockwise seen from above = POSITIVE angular
+# velocity about +y in the right-hand sense: the blades move from +x toward -z
+# (toward -theta). The CAD's PBT blades have y decreasing toward +theta, so
+# their leading edge is the high edge and the PBT pumps DOWN. (2026-09-26 fix:
+# the sign was negative before, which made the PBT pump UP; measured +0.24 m/s
+# axial through the PBT in the c0 = 20 U_tip series, see log.)
 
 time:
   total: null
@@ -251,7 +258,7 @@ impeller:
   kind: rotor
   rest_density: 998.0
   viscosity: 1.0e-6
-  rotor_angular_velocity: {omega:.5f}   # rad/s, signed: -200 rpm about +y (right-hand rule)
+  rotor_angular_velocity: {omega:.5f}   # rad/s, right-hand sign about +y (= M-Star -200 rpm, CCW from above, PBT down-pumping)
 """
 
 
@@ -351,7 +358,7 @@ def main() -> int:
     bound = int(math.ceil(math.sqrt(2) * args.hdx ** 3))
     max_per_voxel = args.max_per_voxel or max(64, int(2 ** math.ceil(math.log2(bound * 1.3))))
     c0 = args.c0_factor * TIP_SPEED
-    omega = -2 * math.pi * IMPELLER_RPM / 60.0          # signed: -200 rpm about +y
+    omega = +2 * math.pi * IMPELLER_RPM / 60.0          # right-hand sign about +y; see CASE_YAML comment (M-Star -200 rpm = CCW from above)
 
     liquid_volume = math.pi * TANK_RADIUS ** 2 * LIQUID_HEIGHT
     print(f"fluid={n_fluid:,} wall={n_wall:,} rotor={n_rotor:,} total={total:,} pool={pool_size:,}")
