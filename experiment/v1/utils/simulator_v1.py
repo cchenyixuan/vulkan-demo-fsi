@@ -1273,7 +1273,8 @@ class SphSimulatorV1:
     def rotor_group_ids(self) -> list[int]:
         return [m.group_id for m in self.case.materials if m.kind == KIND_ROTOR]
 
-    def readback_rotor_torque(self) -> dict:
+    def readback_rotor_torque(self, split_height: Optional[float] = None,
+                              shaft_radius: Optional[float] = None) -> dict:
         """Hydrodynamic force and torque on the rotor from the last force.comp.
 
         force.comp writes, for every ROTOR particle, its acceleration from the
@@ -1284,7 +1285,15 @@ class SphSimulatorV1:
             tau = axis . sum_i (x_i - pivot) x f_i.
         Rotor-rotor pair forces are antisymmetric and cancel in both sums.
         Returns force (3,), torque (3,), torque_axis (scalar), the rotor
-        particle count, the rotor angle, time and step."""
+        particle count, the rotor angle, time and step.
+
+        Per-impeller split (2026-09-26): when split_height and shaft_radius
+        are given, rotor particles are classified by their distance r from
+        the rotor axis and their height h along it (both measured from the
+        pivot): r < shaft_radius -> "shaft", otherwise h < split_height ->
+        "lower" impeller, h >= split_height -> "upper" impeller. The result
+        then also holds torque_axis_lower / _upper / _shaft and the three
+        particle counts; the three torques sum to torque_axis exactly."""
         if self.case.rotor is None:
             raise RuntimeError("case has no rotor")
         groups = np.asarray(self.rotor_group_ids(), dtype=np.uint32)
@@ -1301,8 +1310,10 @@ class SphSimulatorV1:
         force_per_particle = (a - g) * m[:, None]
         axis = np.asarray(self.case.rotor.axis, dtype=np.float64)
         pivot = np.asarray(self.case.rotor.pivot, dtype=np.float64)
-        torque = np.cross(x - pivot, force_per_particle).sum(axis=0)
-        return {
+        arm = x - pivot
+        torque_per_particle = np.cross(arm, force_per_particle)
+        torque = torque_per_particle.sum(axis=0)
+        result = {
             "force": force_per_particle.sum(axis=0),
             "torque": torque,
             "torque_axis": float(np.dot(torque, axis)),
@@ -1311,6 +1322,17 @@ class SphSimulatorV1:
             "time": float(self.simulation_time),
             "step": int(self.step_count),
         }
+        if split_height is not None and shaft_radius is not None:
+            height = arm @ axis
+            radial = np.linalg.norm(arm - np.outer(height, axis), axis=1)
+            axial_torque = torque_per_particle @ axis
+            is_shaft = radial < shaft_radius
+            is_lower = ~is_shaft & (height < split_height)
+            is_upper = ~is_shaft & (height >= split_height)
+            for name, mask in (("lower", is_lower), ("upper", is_upper), ("shaft", is_shaft)):
+                result[f"torque_axis_{name}"] = float(axial_torque[mask].sum())
+                result[f"rotor_particle_count_{name}"] = int(mask.sum())
+        return result
 
     def get_render_buffers(self) -> dict:
         return {

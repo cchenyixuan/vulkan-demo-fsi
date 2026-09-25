@@ -20,7 +20,7 @@
 ## 改动
 
 - `utils/geometry/_demo_stirred_tank_30l.py`：`omega = +2π·200/60`，注释写明 M-Star 约定和推导。
-- 本地四个搅拌槽算例的 materials.yaml 同步改为 +20.94395（这些算例目录没有纳入 git）。
+- 四个本地搅拌槽算例的 materials.yaml 同步改为 +20.94395。其中 3 mm 算例在 git 里，随下一次提交（分桨力矩）一起提交；4 mm、2 mm、3 mm h/dx 4 三个没有纳入 git。
 
 ## 验证
 

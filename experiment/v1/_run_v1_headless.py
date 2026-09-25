@@ -59,7 +59,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torque-every", type=int, default=0, metavar="N",
                         help="rotor cases: read back the hydrodynamic torque every N steps")
     parser.add_argument("--torque-log", type=str, default=None, metavar="PATH",
-                        help="append torque samples as CSV (step,time,angle,torque_axis,fx,fy,fz)")
+                        help="append torque samples as CSV (step,time,angle,torque_axis,fx,fy,fz"
+                             "[,torque_lower,torque_upper,torque_shaft])")
+    parser.add_argument("--torque-split-height", type=float, default=None, metavar="H",
+                        help="per-impeller torque: rotor particles above/below H (m along the rotor "
+                             "axis from the pivot) count as upper/lower impeller")
+    parser.add_argument("--torque-shaft-radius", type=float, default=None, metavar="R",
+                        help="per-impeller torque: rotor particles closer than R (m) to the axis "
+                             "count as shaft (needs --torque-split-height)")
     return parser.parse_args()
 
 
@@ -90,21 +97,36 @@ def main() -> None:
             if args.torque_every > 0:
                 if case.rotor is None:
                     raise SystemExit("--torque-every needs a case with a rotor")
+                split = args.torque_split_height is not None
+                if split and args.torque_shaft_radius is None:
+                    raise SystemExit("--torque-split-height needs --torque-shaft-radius")
                 log_handle = open(args.torque_log, "a") if args.torque_log else None
                 if log_handle is not None and log_handle.tell() == 0:
-                    log_handle.write("step,time,angle,torque_axis,fx,fy,fz\n")
+                    log_handle.write("step,time,angle,torque_axis,fx,fy,fz"
+                                     + (",torque_lower,torque_upper,torque_shaft" if split else "") + "\n")
+                split_reported = False
                 while sim.step_count < args.max_steps:
                     sim.step()
                     if sim.step_count % args.torque_every == 0:
-                        torque = sim.readback_rotor_torque()
+                        torque = sim.readback_rotor_torque(args.torque_split_height,
+                                                           args.torque_shaft_radius)
+                        if split and not split_reported:
+                            print(f"[v1-headless] torque split: lower={torque['rotor_particle_count_lower']:,} "
+                                  f"upper={torque['rotor_particle_count_upper']:,} "
+                                  f"shaft={torque['rotor_particle_count_shaft']:,} rotor particles")
+                            split_reported = True
                         fx, fy, fz = torque["force"]
                         print(f"[v1-headless] step={torque['step']} t={torque['time']:.4f}s "
                               f"angle={torque['rotor_angle']:.3f}rad "
                               f"torque_axis={torque['torque_axis']:.6e} N·m "
                               f"force=({fx:.3e}, {fy:.3e}, {fz:.3e}) N")
                         if log_handle is not None:
-                            log_handle.write(f"{torque['step']},{torque['time']:.6e},{torque['rotor_angle']:.6e},"
-                                             f"{torque['torque_axis']:.6e},{fx:.6e},{fy:.6e},{fz:.6e}\n")
+                            line = (f"{torque['step']},{torque['time']:.6e},{torque['rotor_angle']:.6e},"
+                                    f"{torque['torque_axis']:.6e},{fx:.6e},{fy:.6e},{fz:.6e}")
+                            if split:
+                                line += (f",{torque['torque_axis_lower']:.6e},{torque['torque_axis_upper']:.6e},"
+                                         f"{torque['torque_axis_shaft']:.6e}")
+                            log_handle.write(line + "\n")
                             log_handle.flush()
                 if log_handle is not None:
                     log_handle.close()

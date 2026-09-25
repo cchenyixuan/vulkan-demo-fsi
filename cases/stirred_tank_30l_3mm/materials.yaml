@@ -15,4 +15,4 @@ impeller:
   kind: rotor
   rest_density: 998.0
   viscosity: 1.0e-6
-  rotor_angular_velocity: -20.94395   # rad/s, signed: -200 rpm about +y (right-hand rule)
+  rotor_angular_velocity: 20.94395   # rad/s, right-hand sign about +y (= M-Star -200 rpm, CCW from above, PBT down-pumping); sign fixed 2026-09-26
