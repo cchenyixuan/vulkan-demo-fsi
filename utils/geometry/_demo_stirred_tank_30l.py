@@ -297,7 +297,7 @@ def write_preview(path, fluid, wall, rotor, dx):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dx", type=float, default=0.003, help="particle spacing (m)")
-    parser.add_argument("--hdx", type=int, default=3, help="h/dx (kernel support radius in spacings)")
+    parser.add_argument("--hdx", type=float, default=3.0, help="h/dx (kernel support radius in spacings; non-integer allowed, e.g. 2.5)")
     parser.add_argument("--thin-layers", type=int, default=3, help="minimum layers across thin solids")
     parser.add_argument("--border", type=int, default=None, help="wall shell layers (default = hdx)")
     parser.add_argument("--out", default="cases/stirred_tank_30l")
@@ -312,7 +312,7 @@ def main() -> int:
 
     dx = args.dx
     h = args.hdx * dx
-    border = args.border if args.border is not None else args.hdx
+    border = args.border if args.border is not None else int(math.ceil(args.hdx))   # wall shell layers (int)
     thin = args.thin_layers * dx
     shell = border * dx
     top_y = LIQUID_HEIGHT + shell                # top of lid shell
