@@ -209,7 +209,7 @@ numerics:
   pst_main: 0.1
   pst_anti: 0.0005
   defrag_enabled: true
-  defrag_cadence: 1000
+  defrag_cadence: 10
   use_prefix_sum_defrag: false
 
 capacities:
