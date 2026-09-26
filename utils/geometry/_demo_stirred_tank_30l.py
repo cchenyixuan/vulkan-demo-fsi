@@ -5,13 +5,19 @@ Rautenbach et al. (2026), Comput. Chem. Eng., dataset DARUS-5523.
 All dimensions were measured from the dataset's STL files
 (00_simulation_for_mstar_video/StaticBody.stl, Moving Body_1.stl) on
 2026-09-25; see log/ for the measurement notes. Axis convention follows the
-STL: y is the tank axis (up), origin at the centre of the flat tank floor.
+STL: y is the tank axis (up). The origin is where the dished bottom meets
+the cylindrical wall's y = 0 level; the dish itself lies below y = 0
+(corrected 2026-09-26, the first version modelled a flat floor at y = 0).
 
 Geometry (metres):
-    tank        inner radius 0.144, flat floor at y = 0, liquid height 0.4265
-                (the M-Star run uses a flat lid there, no free surface)
+    tank        inner radius 0.144, liquid height 0.4265 (the M-Star run uses a
+                flat lid there, no free surface)
+    bottom      dished (torispherical): FLOOR_PROFILE below, measured from
+                StaticBody.stl; -0.0618 at r = 0.02 (crown radius ~0.27 m),
+                -0.0333 at r = 0.126, knuckle up to -0.012 at the wall r = 0.144
+    bearing     static boss r 0.0145 on the dish centre, top at y = -0.023
     baffles     3 (120 deg apart, azimuths 62/182/302 deg from +x toward +z),
-                radial 0.1254..0.1384, thickness 2.65e-3, full height
+                radial 0.1254..0.1384, thickness 2.65e-3, y 0.010 .. lid
     shaft       radius 0.004, through floor and lid
     Rushton     hub r 0.0102 y 0.0211..0.0414; disk r 0.032 y 0.0372..0.0397;
                 6 blades radial 0.024..0.048, y 0.0288..0.048, thickness 2.2e-3,
@@ -56,6 +62,20 @@ TANK_RADIUS = 0.144
 LIQUID_HEIGHT = 0.4265
 TANK_WALL_TOP = 0.5
 
+# Dished bottom (2026-09-26): inner floor height y(r), measured from
+# StaticBody.stl (max vertex height per radial band, away from the baffles).
+# Piecewise-linear in r; the centre (r < 0.02) is covered by the bearing boss.
+FLOOR_PROFILE = np.array([
+    (0.0000, -0.0620), (0.0225, -0.0618), (0.0325, -0.0606), (0.0425, -0.0592),
+    (0.0525, -0.0579), (0.0625, -0.0554), (0.0725, -0.0529), (0.0825, -0.0509),
+    (0.0925, -0.0470), (0.1025, -0.0435), (0.1125, -0.0402), (0.1210, -0.0366),
+    (0.1262, -0.0333), (0.1312, -0.0308), (0.1362, -0.0256), (0.1388, -0.0236),
+    (0.1412, -0.0169), (0.1440, -0.0120),
+])
+FLOOR_BOTTOM = float(FLOOR_PROFILE[:, 1].min())
+BEARING_BOSS = dict(radius=0.0145, y1=-0.023)
+BAFFLE_Y0 = 0.010
+
 BAFFLE_AZIMUTHS_DEG = (62.0, 182.0, 302.0)
 BAFFLE_RADIAL = (0.1254, 0.1384)
 BAFFLE_THICKNESS = 2.65e-3
@@ -76,6 +96,47 @@ PROBE_CENTERS = ((-0.127, -0.018), (0.053, -0.118))
 
 IMPELLER_RPM = 200.0                      # M-Star: -200 rpm about +y = CCW seen from above (see comment in CASE_YAML)
 TIP_SPEED = math.pi * 2 * 0.0491 * IMPELLER_RPM / 60.0
+
+
+# ----------------------------------------------------------------------------
+# Extra region: liquid volume of the dished tank (2026-09-26)
+# ----------------------------------------------------------------------------
+class DishedTankInterior(Region):
+    """Liquid volume: r < radius, floor(r) < y < top, with floor(r) the
+    piecewise-linear FLOOR_PROFILE. Approximate SDF = max of the three
+    one-sided distances, the floor term projected on the local floor normal
+    (exact on the flat and gently sloped parts, conservative in corners),
+    which is all the generator needs (half-spacing skins, shell thickness)."""
+
+    def __init__(self, radius, top, profile):
+        self.radius = float(radius)
+        self.top = float(top)
+        self.profile = np.asarray(profile, dtype=np.float64)
+        self.dimension = 3
+
+    def floor(self, r):
+        return np.interp(r, self.profile[:, 0], self.profile[:, 1])
+
+    def signed_distance(self, points):
+        pts = np.asarray(points, dtype=np.float64)
+        r = np.hypot(pts[:, 0], pts[:, 2])
+        y = pts[:, 1]
+        slope = np.gradient(self.profile[:, 1], self.profile[:, 0])
+        local_slope = np.interp(r, self.profile[:, 0], slope)
+        d_floor = (self.floor(r) - y) / np.sqrt(1.0 + local_slope ** 2)
+        d_side = r - self.radius
+        d_top = y - self.top
+        return np.maximum(np.maximum(d_side, d_top), d_floor)
+
+    def bounds(self):
+        lo = np.array([-self.radius, self.profile[:, 1].min(), -self.radius])
+        hi = np.array([self.radius, self.top, self.radius])
+        return lo, hi
+
+    def volume(self):
+        r = np.linspace(0.0, self.radius, 4001)
+        depth = self.top - self.floor(r)
+        return float(np.trapezoid(2.0 * np.pi * r * depth, r))
 
 
 # ----------------------------------------------------------------------------
@@ -136,30 +197,39 @@ def pitched_blade(azimuth_deg, r0, r1, chord, thickness, center_y, pitch_deg):
                        [0.5 * (r1 - r0), 0.5 * chord, 0.5 * thickness])
 
 
-def build_solids(thin, shaft_y0, shaft_y1, top_y):
-    """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness."""
+def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both"):
+    """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
+    ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
+    and the disk for the Rushton) are kept on the full-length shaft; used for
+    the single-impeller control runs of 2026-09-26."""
+    keep_rushton = impellers in ("both", "rushton")
+    keep_pbt = impellers in ("both", "pbt")
     t_baffle = max(BAFFLE_THICKNESS, thin)
     t_rblade = max(RUSHTON_BLADE["thickness"], thin)
     t_disk = max(RUSHTON_DISK["y1"] - RUSHTON_DISK["y0"], thin)
     t_pblade = max(PBT_BLADE["thickness"], thin)
 
     disk_mid = 0.5 * (RUSHTON_DISK["y0"] + RUSHTON_DISK["y1"])
-    rotor_parts = [
-        y_cylinder(SHAFT_RADIUS, shaft_y0, shaft_y1),
-        y_cylinder(RUSHTON_HUB["radius"], RUSHTON_HUB["y0"], RUSHTON_HUB["y1"]),
-        y_cylinder(RUSHTON_DISK["radius"], disk_mid - 0.5 * t_disk, disk_mid + 0.5 * t_disk),
-        y_cylinder(PBT_HUB["radius"], PBT_HUB["y0"], PBT_HUB["y1"]),
-    ]
+    rotor_parts = [y_cylinder(SHAFT_RADIUS, shaft_y0, shaft_y1)]
+    if keep_rushton:
+        rotor_parts += [
+            y_cylinder(RUSHTON_HUB["radius"], RUSHTON_HUB["y0"], RUSHTON_HUB["y1"]),
+            y_cylinder(RUSHTON_DISK["radius"], disk_mid - 0.5 * t_disk, disk_mid + 0.5 * t_disk),
+        ]
+    if keep_pbt:
+        rotor_parts.append(y_cylinder(PBT_HUB["radius"], PBT_HUB["y0"], PBT_HUB["y1"]))
     for k in range(6):
-        rotor_parts.append(radial_slab(RUSHTON_BLADE["azimuth0_deg"] + 60 * k,
-                                       *RUSHTON_BLADE["radial"], RUSHTON_BLADE["y0"],
-                                       RUSHTON_BLADE["y1"], t_rblade))
-        rotor_parts.append(pitched_blade(PBT_BLADE["azimuth0_deg"] + 60 * k,
-                                         *PBT_BLADE["radial"], PBT_BLADE["chord"], t_pblade,
-                                         PBT_BLADE["center_y"], PBT_BLADE["pitch_deg"]))
-    wall_parts = []
+        if keep_rushton:
+            rotor_parts.append(radial_slab(RUSHTON_BLADE["azimuth0_deg"] + 60 * k,
+                                           *RUSHTON_BLADE["radial"], RUSHTON_BLADE["y0"],
+                                           RUSHTON_BLADE["y1"], t_rblade))
+        if keep_pbt:
+            rotor_parts.append(pitched_blade(PBT_BLADE["azimuth0_deg"] + 60 * k,
+                                             *PBT_BLADE["radial"], PBT_BLADE["chord"], t_pblade,
+                                             PBT_BLADE["center_y"], PBT_BLADE["pitch_deg"]))
+    wall_parts = [y_cylinder(BEARING_BOSS["radius"], FLOOR_BOTTOM - 0.02, BEARING_BOSS["y1"])]
     for az in BAFFLE_AZIMUTHS_DEG:
-        wall_parts.append(radial_slab(az, *BAFFLE_RADIAL, 0.0, top_y, t_baffle))
+        wall_parts.append(radial_slab(az, *BAFFLE_RADIAL, BAFFLE_Y0, top_y, t_baffle))
     for cx, cz in PROBE_CENTERS:
         wall_parts.append(Box([cx - PROBE_HALF, PROBE_Y[0], cz - PROBE_HALF],
                               [cx + PROBE_HALF, top_y, cz + PROBE_HALF]))
@@ -314,6 +384,9 @@ def main() -> int:
     parser.add_argument("--c0-factor", type=float, default=10.0, help="speed of sound = factor * tip speed")
     parser.add_argument("--gravity", type=float, default=0.0,
                         help="gravity magnitude along -y (0 = off; with gravity on use --c0-factor 20 so that c0 >= 10*sqrt(g*H))")
+    parser.add_argument("--impellers", choices=("both", "rushton", "pbt"), default="both",
+                        help="keep both impellers (default) or only one of them on the full shaft "
+                             "(single-impeller control runs)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
@@ -325,13 +398,15 @@ def main() -> int:
     top_y = LIQUID_HEIGHT + shell                # top of lid shell
 
     # Lattice sites over the whole frame (anchored at the origin by tile_bounding_box).
-    lo = np.array([-(TANK_RADIUS + shell), -shell, -(TANK_RADIUS + shell)])
+    lo = np.array([-(TANK_RADIUS + shell), FLOOR_BOTTOM - shell, -(TANK_RADIUS + shell)])
     hi = np.array([TANK_RADIUS + shell, top_y, TANK_RADIUS + shell])
     sites = tile_bounding_box(lo - 0.5 * dx, hi + 0.5 * dx, dx, LATTICE_GRID, 3)
     print(f"dx={dx:.4e} h={h:.4e} (h/dx={args.hdx}) border={border} thin>={args.thin_layers} layers -> {sites.shape[0]:,} lattice sites")
 
-    interior = y_cylinder(TANK_RADIUS, 0.0, LIQUID_HEIGHT)
-    rotor_region, wall_solid = build_solids(thin, -shell, top_y, top_y)
+    interior = DishedTankInterior(TANK_RADIUS, LIQUID_HEIGHT, FLOOR_PROFILE)
+    rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers)
+    if args.impellers != "both":
+        print(f"impellers={args.impellers} (single-impeller control)")
 
     sdf_interior = interior.signed_distance(sites)
     sdf_rotor = rotor_region.signed_distance(sites)
@@ -360,9 +435,10 @@ def main() -> int:
     c0 = args.c0_factor * TIP_SPEED
     omega = +2 * math.pi * IMPELLER_RPM / 60.0          # right-hand sign about +y; see CASE_YAML comment (M-Star -200 rpm = CCW from above)
 
-    liquid_volume = math.pi * TANK_RADIUS ** 2 * LIQUID_HEIGHT
+    liquid_volume = interior.volume()
     print(f"fluid={n_fluid:,} wall={n_wall:,} rotor={n_rotor:,} total={total:,} pool={pool_size:,}")
-    print(f"fluid volume check: {n_fluid * dx ** 3 * 1e3:.2f} L of particles vs {liquid_volume * 1e3:.2f} L cylinder")
+    print(f"fluid volume check: {n_fluid * dx ** 3 * 1e3:.2f} L of particles vs {liquid_volume * 1e3:.2f} L "
+          f"dished tank (minus solids); Rushton clearance {0.5 * (RUSHTON_BLADE['y0'] + RUSHTON_BLADE['y1']) - FLOOR_BOTTOM:.4f} m")
     print(f"max_per_voxel={max_per_voxel} (bound {bound}), c0={c0:.2f} m/s, tip speed {TIP_SPEED:.3f} m/s, "
           f"dt = {0.15 * h / c0:.3e} s")
 
