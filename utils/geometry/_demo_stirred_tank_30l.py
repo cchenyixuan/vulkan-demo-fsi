@@ -254,7 +254,7 @@ schema_version: 2
 #   fluid {n_fluid:,} / wall {n_wall:,} / rotor {n_rotor:,}
 # Flat lid at y = {liquid_height} (no free surface), gravity off: with a closed
 # single-phase tank gravity only adds a hydrostatic offset, so c0 is set from
-# the impeller tip speed only (10 * {tip_speed:.3f} m/s).
+# the impeller tip speed only ({c0_factor:g} * {tip_speed:.3f} m/s).
 # Rotor: shaft + both impellers rotate rigidly about +y through the origin
 # (predict.comp ROTOR branch, 2026-09-25). The dataset's M-Star input.xml has
 # freq = -200 rpm, rotationAxis (0,1,0). M-Star's sign convention is the mixing
@@ -497,7 +497,7 @@ def main() -> int:
     write_frame_obj(out / "frame.obj", all_points.min(axis=0) - 0.6 * dx, all_points.max(axis=0) + 0.6 * dx)
     (out / "case.yaml").write_text(CASE_YAML.format(
         dx=dx, h=h, hdx=args.hdx, thin_layers=args.thin_layers, n_fluid=n_fluid, n_wall=n_wall,
-        n_rotor=n_rotor, liquid_height=LIQUID_HEIGHT, tip_speed=TIP_SPEED, radius=0.5 * dx, c0=c0,
+        n_rotor=n_rotor, liquid_height=LIQUID_HEIGHT, tip_speed=TIP_SPEED, c0_factor=args.c0_factor, radius=0.5 * dx, c0=c0,
         pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming,
         ramp_time=args.ramp_time, gravity_y=-abs(args.gravity)), encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega), encoding="utf-8")

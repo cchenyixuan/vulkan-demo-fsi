@@ -8,9 +8,16 @@ schema_version: 2
 # single-phase tank gravity only adds a hydrostatic offset, so c0 is set from
 # the impeller tip speed only (10 * 1.028 m/s).
 # Rotor: shaft + both impellers rotate rigidly about +y through the origin
-# (predict.comp ROTOR branch, 2026-09-25). M-Star's "-200 rpm about +y" is
-# a NEGATIVE angular velocity in the right-hand sense, i.e. the blades move
-# from +x toward +z; the PBT (y decreasing toward +theta) then pumps DOWN.
+# (predict.comp ROTOR branch, 2026-09-25). M-Star's -200 rpm about +y is
+# counter-clockwise seen from above (M-Star: positive RPM = clockwise looking
+# along gravity), i.e. a POSITIVE right-hand angular velocity about +y
+# (+20.944 rad/s in materials.yaml); the PBT then pumps DOWN. The sign was
+# fixed on 2026-09-26 (log/2026-09-26_rotor-direction-fix.md); this comment
+# was corrected on 2026-09-27.
+# NOTE: this committed case is the 2026-09-25 baseline: FLAT bottom at y = 0
+# and c0 = 10 U_tip. Current runs regenerate the case with the generator
+# (dished bottom since 5abaed8) and --c0-factor 20
+# (log/2026-09-25_np-campaign.md, log/2026-09-26_dished-bottom.md).
 
 time:
   total: null
