@@ -17,7 +17,13 @@ Options:
     --dump PATH          save final positions + global status to PATH (.npz)
                          (plus scalars / particle uid when present)
     --torque-every N     rotor cases: torque every N steps (--torque-log, --torque-split-*)
-    --probe-every N      scalar cases: probe values + conserved totals every N steps (--probe-log)
+    --probe-every N      scalar cases: probe values + conserved totals every N steps (--probe-log);
+                         the CSV also holds the fluid mass, the mean fluid speed and, per field,
+                         the mass-weighted coefficient of variation (cov:) and the mass fraction
+                         within +-5 % of the mean (mixed5:)
+    --scalar-snapshot-times T [T ...]
+                         scalar cases: save FLUID positions, uid and fields at the first step
+                         with t >= T (--scalar-snapshot-dir, --scalar-snapshot-fields)
 
 Note: the solver is not bit-reproducible run to run (voxel incoming lists are
 filled by atomics), so compare dumps against the run-to-run noise of an
@@ -75,8 +81,33 @@ def parse_args() -> argparse.Namespace:
                              "totals every N steps")
     parser.add_argument("--probe-log", type=str, default=None, metavar="PATH",
                         help="append the probe samples as CSV (step,time,<probe>:<field>...,"
-                             "total:<field>...)")
+                             "total:<field>...,fluid_mass,mean_speed,cov:<field>...,mixed5:<field>...)")
+    parser.add_argument("--scalar-snapshot-times", type=float, nargs="+", default=None, metavar="T",
+                        help="scalar cases: save the FLUID particles' positions, uid and fields at "
+                             "the first step with simulation time >= T (s), one .npz per time")
+    parser.add_argument("--scalar-snapshot-dir", type=str, default=None, metavar="DIR",
+                        help="output directory of --scalar-snapshot-times (snapshot_<step>.npz)")
+    parser.add_argument("--scalar-snapshot-fields", type=str, nargs="+", default=None, metavar="FIELD",
+                        help="fields stored in the snapshots (default: all)")
     return parser.parse_args()
+
+
+def mixing_metrics(snapshot: dict, mean_value: np.ndarray):
+    """Mixing state of every field over the live FLUID particles (2026-09-27):
+    the mass-weighted coefficient of variation about the conserved mean,
+        CoV = sqrt( sum_i m_i (C_i / C_mean - 1)^2 / sum_i m_i ),
+    and the mass fraction with |C_i / C_mean - 1| <= 0.05. Both are NaN for a
+    field that holds no tracer yet (mean 0)."""
+    weight = snapshot["mass"] / snapshot["mass"].sum()
+    count = mean_value.shape[0]
+    coefficient_of_variation = np.full(count, np.nan)
+    mixed_fraction = np.full(count, np.nan)
+    for field_index in range(count):
+        if mean_value[field_index] > 0.0:
+            deviation = snapshot["scalars"][:, field_index] / mean_value[field_index] - 1.0
+            coefficient_of_variation[field_index] = float(np.sqrt(np.dot(weight, deviation * deviation)))
+            mixed_fraction[field_index] = float(weight[np.abs(deviation) <= 0.05].sum())
+    return coefficient_of_variation, mixed_fraction
 
 
 def main() -> None:
@@ -103,7 +134,7 @@ def main() -> None:
         try:
             sim.bootstrap()
             start = time.perf_counter()
-            sampling = args.torque_every > 0 or args.probe_every > 0
+            sampling = args.torque_every > 0 or args.probe_every > 0 or bool(args.scalar_snapshot_times)
             if args.torque_every > 0 and case.rotor is None:
                 raise SystemExit("--torque-every needs a case with a rotor")
             if args.probe_every > 0 and (case.scalars is None or case.scalars.probes is None):
@@ -129,7 +160,27 @@ def main() -> None:
                         columns = ["step", "time"]
                         columns += [f"{p}:{f}" for p in probe_names for f in field_names]
                         columns += [f"total:{f}" for f in field_names]
+                        columns += ["fluid_mass", "mean_speed"]
+                        columns += [f"cov:{f}" for f in field_names]
+                        columns += [f"mixed5:{f}" for f in field_names]
                         probe_log.write(",".join(columns) + "\n")
+
+            # Field snapshots at given times (2026-09-27, mixing-time runs).
+            snapshot_times = sorted(args.scalar_snapshot_times or [])
+            if snapshot_times:
+                if case.scalars is None:
+                    raise SystemExit("--scalar-snapshot-times needs a case with a `scalars:` block")
+                if not args.scalar_snapshot_dir:
+                    raise SystemExit("--scalar-snapshot-times needs --scalar-snapshot-dir")
+                snapshot_dir = pathlib.Path(args.scalar_snapshot_dir)
+                snapshot_dir.mkdir(parents=True, exist_ok=True)
+                all_field_names = case.scalars.field_names
+                snapshot_field_names = list(args.scalar_snapshot_fields or all_field_names)
+                unknown = [name for name in snapshot_field_names if name not in all_field_names]
+                if unknown:
+                    raise SystemExit(f"--scalar-snapshot-fields: unknown field(s) {unknown}")
+                snapshot_field_index = [all_field_names.index(name) for name in snapshot_field_names]
+            half_step = 0.5 * case.timestep
 
             split_reported = False
             while sampling and sim.step_count < args.max_steps:
@@ -166,9 +217,28 @@ def main() -> None:
                         row = [f"{sim.step_count}", f"{sim.simulation_time:.6e}"]
                         row += [f"{values[p, k]:.6e}" for p in range(len(probe_names))
                                 for k in range(len(field_names))]
+                        fluid_mass = float(snapshot["mass"].sum())
+                        mean_speed = float(np.linalg.norm(snapshot["velocity"], axis=1).mean())
+                        coefficient_of_variation, mixed_fraction = mixing_metrics(snapshot, totals / fluid_mass)
                         row += [f"{total:.9e}" for total in totals]
+                        row += [f"{fluid_mass:.9e}", f"{mean_speed:.6e}"]
+                        row += [f"{value:.6e}" for value in coefficient_of_variation]
+                        row += [f"{value:.6e}" for value in mixed_fraction]
                         probe_log.write(",".join(row) + "\n")
                         probe_log.flush()
+                if snapshot_times and sim.simulation_time >= snapshot_times[0] - half_step:
+                    field_snapshot = sim.scalar_snapshot()
+                    snapshot_path = snapshot_dir / f"snapshot_{sim.step_count:08d}.npz"
+                    np.savez(snapshot_path, time=sim.simulation_time, step=sim.step_count,
+                             positions=field_snapshot["positions"].astype(np.float32),
+                             mass=field_snapshot["mass"].astype(np.float32),
+                             uid=field_snapshot["uid"],
+                             scalars=field_snapshot["scalars"][:, snapshot_field_index].astype(np.float32),
+                             field_names=np.array(snapshot_field_names))
+                    print(f"[v1-headless] step={sim.step_count} t={sim.simulation_time:.4f}s "
+                          f"scalar snapshot -> {snapshot_path}")
+                    while snapshot_times and sim.simulation_time >= snapshot_times[0] - half_step:
+                        snapshot_times.pop(0)
             for handle in (torque_log, probe_log):
                 if handle is not None:
                     handle.close()

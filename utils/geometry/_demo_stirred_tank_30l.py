@@ -400,6 +400,10 @@ def scalars_block(args, h) -> str:
     lines += ["  probes:", f"    radius: {h:.6f}", "    points:"]
     for name, (x, y, z) in PROBE_POINTS:
         lines.append(f"      - {{name: {name}, position: [{x}, {y}, {z}]}}")
+    if args.shift_correction:
+        # Taylor shift correction of the scalars (default off, see
+        # log/2026-09-27_scalar-transport.md 4.6); the bounds limiter keeps its default (on).
+        lines.append("  shift_correction: true")
     return "\n".join(lines) + "\n"
 
 
@@ -433,6 +437,9 @@ def main() -> int:
                         help="molecular diffusivity of the tracers (m^2/s)")
     parser.add_argument("--sgs", action="store_true",
                         help="enable the Smagorinsky sub-grid diffusivity for the tracers")
+    parser.add_argument("--shift-correction", action="store_true",
+                        help="interpolate the tracers along the particle shift (scalars.shift_correction; "
+                             "default off: the tracers move with the particles)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 

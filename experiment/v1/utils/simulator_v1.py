@@ -1566,9 +1566,10 @@ class SphSimulatorV1:
         return [m.group_id for m in self.case.materials if m.kind == KIND_FLUID]
 
     def scalar_snapshot(self) -> dict:
-        """Live FLUID particles only: positions (n, 3), mass (n,), scalars
-        (n, n_fields) as float64 (value + compensation, i.e. the compensated
-        sum), uid (n,). Used by the probes, the totals and the checks."""
+        """Live FLUID particles only: positions (n, 3), mass (n,), velocity
+        (n, 3; the stored leapfrog velocity v_{n+1/2}), scalars (n, n_fields)
+        as float64 (value + compensation, i.e. the compensated sum), uid (n,).
+        Used by the probes, the totals, the mixing metrics and the checks."""
         self._require_scalars()
         positions = self.readback_positions()
         live = self.live_slot_mask(positions)
@@ -1579,9 +1580,11 @@ class SphSimulatorV1:
         if self.case.scalars.compensated_sum:
             # Kahan: the exact running sum is value - compensation.
             values -= self.readback_scalar_compensation()[fluid, :n_fields].astype(np.float64)
+        velocity_mass = self.readback_velocity_mass()
         return {
             "positions": positions[fluid, :3].astype(np.float64),
-            "mass": self.readback_velocity_mass()[fluid, 3].astype(np.float64),
+            "mass": velocity_mass[fluid, 3].astype(np.float64),
+            "velocity": velocity_mass[fluid, :3].astype(np.float64),
             "scalars": values,
             "uid": self.readback_particle_uid()[fluid],
         }
