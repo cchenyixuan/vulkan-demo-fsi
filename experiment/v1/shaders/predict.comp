@@ -34,6 +34,15 @@
 // computes its acceleration = fluid force per unit mass, which the CPU reads
 // back for the torque). Voxel-crossing bookkeeping is identical to fluid.
 //
+// Scalar transport (2026-09-27), FLUID particles only:
+//   C_{n+1} = C_n + scalar_delta_n   (ΔC from the previous force.comp: diffusion
+//             over dt plus the shift correction that matches the shift added
+//             to x above), accumulated with Kahan compensation unless the
+//             ablation toggle USE_SCALAR_COMPENSATED_SUM is off. Then, if a
+//             tracer pulse is active and x_{n+1} lies inside its sphere, the
+//             targeted field is set to the pulse value (and its compensation
+//             cleared). Killed particles skip the update (their slot is dead).
+//
 // Data flow:
 //   acceleration[pid]  : written by previous step's force.comp  (a_n)
 //   shift[pid]         : written by previous step's force.comp  (shift_n, already M_i-corrected)
@@ -158,6 +167,48 @@ void main() {
     }
     // Case A: new_voxel_id == old_voxel_id → no atomic op; particle stays in
     // the current voxel's inside list and update_voxel sees no change.
+
+    // ========================================================================
+    // Scalar transport (2026-09-27): apply the increment force.comp prepared,
+    // then any active tracer pulse. FLUID only (rotor particles return above
+    // only for the kick/drift part, so they are excluded explicitly).
+    // ========================================================================
+    if (SCALAR_VEC4_COUNT > 0u && !is_rotor) {
+        for (uint vec4_index = 0u; vec4_index < SCALAR_VEC4_COUNT; vec4_index++) {
+            uint index = scalar_index(self_particle_id, vec4_index);
+            vec4 delta = scalar_delta[index];
+            precise vec4 value = scalar[index];
+            precise vec4 compensation = vec4(0.0);
+            if (USE_SCALAR_COMPENSATED_SUM) {
+                // Kahan (1965): value holds the running sum, compensation the
+                // part of the previous additions lost to rounding. `precise`
+                // forbids the compiler to reassociate these four lines, which
+                // would cancel the compensation algebraically.
+                compensation = scalar_compensation[index];
+                precise vec4 corrected = delta - compensation;
+                precise vec4 sum = value + corrected;
+                compensation = (sum - value) - corrected;
+                value = sum;
+            } else {
+                value = value + delta;
+            }
+            if (USE_SCALAR_INJECTION) {
+                for (uint slot_index = 0u; slot_index < MAX_INJECTION_SLOTS; slot_index++) {
+                    ScalarInjectionSlot slot = scalar_injection[slot_index];
+                    if (slot.target.x == 0u || slot.target.y != vec4_index) continue;
+                    vec3 offset = new_position - slot.center_radius_squared.xyz;
+                    if (dot(offset, offset) < slot.center_radius_squared.w) {
+                        value[slot.target.z] = slot.value.x;
+                        compensation[slot.target.z] = 0.0;
+                    }
+                }
+            }
+            scalar[index] = value;
+            if (USE_SCALAR_COMPENSATED_SUM) {
+                scalar_compensation[index] = compensation;
+            }
+        }
+    }
 
     // ========================================================================
     // Write updated state (only Cases A and B reach here).

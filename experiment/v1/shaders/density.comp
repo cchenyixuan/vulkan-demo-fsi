@@ -106,6 +106,19 @@ void main() {
     ivec3 self_voxel_coord = own_coord_of(self_voxel_id);
 
     // --- Accumulators --------------------------------------------------------
+    // Scalar SGS (2026-09-27): velocity gradient of a FLUID particle,
+    //     G = grad v_i = sum_j V_j (v_j - v_i) (x) M_i^-1 grad W_ij
+    //       = [sum_j V_j (v_j - v_i) (x) grad W_ij] M_i^-1        (M symmetric)
+    // with the UNREGULARIZED M_i^-1 (unregularized_correction_inverse, the
+    // stored (M + xi I)^-1 is 7.6 % too small on the h/dx = 3 lattice), which
+    // makes it first-order consistent. The raw sum is accumulated in the loop
+    // (it needs exactly the neighbour velocity and volume this kernel already
+    // reads) and multiplied by M_i^-1 once afterwards. Solid neighbours are
+    // included: their (wall or rotor) velocity is the no-slip boundary value.
+    // Dead code unless USE_SCALAR_SGS.
+    bool self_is_fluid = (self_params.kind == MATERIAL_FLUID);
+    mat3 velocity_gradient = mat3(0.0);
+
     float density_drift     = 0.0;
     float density_diffusion = 0.0;
 
@@ -202,6 +215,15 @@ void main() {
             vec3 raw_gradient        = evaluate_kernel_gradient_unguarded(position_difference_neighbor_to_self, distance);
             vec3 corrected_gradient  = self_correction_matrix * raw_gradient;
 
+            // --- Scalar SGS: raw velocity-gradient sum (see declaration above)
+            // outerProduct(c, r) = c r^T, so velocity_gradient[b][a] = sum of
+            // (v_j - v_i)_a (grad W)_b in GLSL's column-major indexing, i.e. the
+            // usual (d v_a / d x_b) layout once multiplied by M^-1 below.
+            if (USE_SCALAR_SGS && self_is_fluid) {
+                velocity_gradient += neighbor_volume
+                    * outerProduct(neighbor_velocity - self_velocity, raw_gradient);
+            }
+
             // --- δ-SPH density diffusion (gated by USE_DENSITY_DIFFUSION) -
             // Spec-const branch: glslc -O DCE-removes the entire body when
             // USE_DENSITY_DIFFUSION = false → vanilla WCSPH continuity.
@@ -279,4 +301,24 @@ void main() {
         ? self_params.rest_density
         : new_density;
     density_pressure_scratch[self_particle_id] = vec2(density_to_store, new_pressure);
+
+    // ========================================================================
+    // Scalar SGS (2026-09-27): Smagorinsky eddy viscosity of FLUID particles
+    //     S    = (G + G^T) / 2
+    //     |S|  = sqrt(2 S:S)
+    //     nu_t = (C_s Delta)^2 |S|        (SGS_LENGTH_SQUARED = (C_s Delta)^2)
+    // Read by force.comp later in this step (scalar diffusion only).
+    // ========================================================================
+    if (USE_SCALAR_SGS && self_is_fluid) {
+        if (USE_KCG_CORRECTION) {
+            velocity_gradient = velocity_gradient
+                              * unregularized_correction_inverse(self_correction_matrix);
+        }
+        mat3  strain_rate = 0.5 * (velocity_gradient + transpose(velocity_gradient));
+        float strain_rate_contracted = dot(strain_rate[0], strain_rate[0])
+                                     + dot(strain_rate[1], strain_rate[1])
+                                     + dot(strain_rate[2], strain_rate[2]);   // S:S
+        turbulent_viscosity[self_particle_id] =
+            SGS_LENGTH_SQUARED * sqrt(2.0 * strain_rate_contracted);
+    }
 }

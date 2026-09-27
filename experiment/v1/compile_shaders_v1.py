@@ -27,12 +27,25 @@ V1_SHADER_DIR = os.path.dirname(os.path.abspath(__file__)) + "/shaders"
 V1_SPV_DIR = V1_SHADER_DIR + "/spv"
 
 
-def _run_glslc(source: str, output: str) -> None:
+# Extra SPIR-V builds of one source with preprocessor macros (2026-09-27):
+#   force.comp -> force_scalar.comp.spv with FORCE_WITH_SCALARS=1.
+# The plain build compiles the scalar-transport code out entirely. Guarding it
+# only with spec constants left 0.23 ms (5 %) in force.comp on the 3 mm tank
+# even with SCALAR_VEC4_COUNT = 0, i.e. the driver does not remove all of it at
+# specialization; with the macro the plain build times exactly like before the
+# scalar work (log/2026-09-27_scalar-transport.md, section 7).
+SOURCE_VARIANTS = {
+    "force.comp": [("force_scalar.comp", ["-DFORCE_WITH_SCALARS=1"])],
+}
+
+
+def _run_glslc(source: str, output: str, extra_arguments=()) -> None:
     command = [
         GLSLC,
         "--target-env=vulkan1.2",
         "-O",
         "-I", V1_SHADER_DIR,
+        *extra_arguments,
         source,
         "-o", output,
     ]
@@ -64,6 +77,10 @@ def compile_v1_shaders() -> None:
         print(f"[v1] {name}")
         _run_glslc(source, output)
         n_compiled += 1
+        for variant_name, extra_arguments in SOURCE_VARIANTS.get(name, []):
+            print(f"[v1] {variant_name}  ({name} {' '.join(extra_arguments)})")
+            _run_glslc(source, os.path.join(V1_SPV_DIR, f"{variant_name}.spv"), extra_arguments)
+            n_compiled += 1
 
     # Render shaders (.vert/.frag) for SphRendererV1. Compiled with the SAME
     # include dir so #include "common.glsl" resolves to V1's buffer layout —

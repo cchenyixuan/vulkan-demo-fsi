@@ -114,6 +114,24 @@ layout(std430, set = 4, binding = 8) writeonly buffer DstDensityGradientKernelSu
 layout(std430, set = 4, binding = 9) writeonly buffer DstExtensionFieldsBuffer {
     vec4 dst_extension_fields[];
 };
+// 2026-09-27: persistent particle uid and the scalar buffers (set 0 bindings
+// 10-14). Binding 14 (turbulent_viscosity) is recomputed by density.comp before
+// force.comp reads it; it is carried only to keep host readbacks aligned.
+layout(std430, set = 4, binding = 10) writeonly buffer DstParticleUidBuffer {
+    uint dst_particle_uid[];
+};
+layout(std430, set = 4, binding = 11) writeonly buffer DstScalarBuffer {
+    vec4 dst_scalar[];
+};
+layout(std430, set = 4, binding = 12) writeonly buffer DstScalarCompensationBuffer {
+    vec4 dst_scalar_compensation[];
+};
+layout(std430, set = 4, binding = 13) writeonly buffer DstScalarDeltaBuffer {
+    vec4 dst_scalar_delta[];
+};
+layout(std430, set = 4, binding = 14) writeonly buffer DstTurbulentViscosityBuffer {
+    float dst_turbulent_viscosity[];
+};
 
 void main() {
     uint voxel_id = gl_GlobalInvocationID.x + 1u;       // 1-based
@@ -170,6 +188,15 @@ void main() {
         dst_correction_inverse[new_id * 2u + 1u] = correction_inverse[old_id * 2u + 1u];
         dst_density_gradient_kernel_sum[new_id]  = density_gradient_kernel_sum[old_id];
         dst_extension_fields[new_id]             = extension_fields[old_id];
+        dst_particle_uid[new_id]                 = particle_uid[old_id];
+        for (uint vec4_index = 0u; vec4_index < SCALAR_VEC4_COUNT; vec4_index++) {
+            dst_scalar[scalar_index(new_id, vec4_index)]              = scalar[scalar_index(old_id, vec4_index)];
+            dst_scalar_compensation[scalar_index(new_id, vec4_index)] = scalar_compensation[scalar_index(old_id, vec4_index)];
+            dst_scalar_delta[scalar_index(new_id, vec4_index)]        = scalar_delta[scalar_index(old_id, vec4_index)];
+        }
+        if (USE_SCALAR_SGS) {
+            dst_turbulent_viscosity[new_id] = turbulent_viscosity[old_id];
+        }
 
         // Patch the voxel's inside slot to reference the new particle_id.
         inside_particle_index[slot_index_global] = new_id;

@@ -10,6 +10,10 @@ survived the single-GPU cut:
   * set 3 (global_status 20-uint block, overflow log, inlet template,
     dispatch indirect, material_parameters, defrag scratch counter)
   * defrag.comp with copy-back (scratch set 4 → set 0) on a fixed cadence
+  * scalar transport (2026-09-27, optional `scalars:` case block): set 0
+    bindings 10-14 (particle uid, scalar, Kahan compensation, scalar delta,
+    turbulent viscosity), set 3 bindings 10-11 (scalar parameters, injection
+    slots); see _build_buffer_specs and log/2026-09-27_scalar-transport.md
 
 Pid layout is [1, POOL_SIZE] and voxel layout is [1, NX*NY*NZ]; slot 0 is the
 dead / unallocated sentinel everywhere (see shaders/README.md). The ghost
@@ -38,7 +42,7 @@ import numpy as np
 from vulkan import *
 from vulkan._vulkancache import ffi
 
-from utils.sph.case import Case, KIND_ROTOR
+from utils.sph.case import Case, KIND_FLUID, KIND_ROTOR
 from utils.sph.vulkan_context import VulkanContext
 
 
@@ -60,6 +64,9 @@ SHADER_NAMES_HOT = [
     "bootstrap_half_kick",
 ]
 SHADER_NAME_DEFRAG = "defrag"
+# Scalar build of force.comp (compile_shaders_v1.SOURCE_VARIANTS, 2026-09-27):
+# used for the "force" pipeline when the case has a `scalars:` block.
+SHADER_NAME_FORCE_WITH_SCALARS = "force_scalar"
 
 
 # Spec const ids (mirrors experiment/v1/shaders/common.glsl id ranges).
@@ -118,6 +125,20 @@ SPEC_ID_ROTOR_PIVOT_X                       = 59
 SPEC_ID_ROTOR_PIVOT_Y                       = 60
 SPEC_ID_ROTOR_PIVOT_Z                       = 61
 SPEC_ID_MAX_NEIGHBORS                       = 62
+# Scalar transport (2026-09-27), mirrors common.glsl ids 63-71.
+SPEC_ID_SCALAR_VEC4_COUNT                   = 63
+SPEC_ID_USE_SCALAR_SGS                      = 64
+SPEC_ID_SGS_LENGTH_SQUARED                  = 65
+SPEC_ID_INVERSE_TURBULENT_SCHMIDT           = 66
+SPEC_ID_USE_SCALAR_SHIFT_CORRECTION         = 67
+SPEC_ID_USE_SCALAR_COMPENSATED_SUM          = 68
+SPEC_ID_USE_SCALAR_INJECTION                = 69
+SPEC_ID_USE_SCALAR_BOUNDS_LIMITER           = 70
+SPEC_ID_SCALAR_FIELD_COUNT                  = 71
+# Compile-time capacities, mirror common.glsl MAX_SCALAR_VEC4 / MAX_INJECTION_SLOTS.
+MAX_SCALAR_VEC4                             = 3
+MAX_INJECTION_SLOTS                         = 4
+INJECTION_SLOT_BYTES                        = 48
 SPEC_ID_LEADING_GHOST_VOXEL_COUNT           = 80
 SPEC_ID_TRAILING_GHOST_VOXEL_COUNT          = 81
 
@@ -162,9 +183,12 @@ class SphSimulatorV1:
             sim.destroy()
     """
 
-    # Defrag set 4 mirrors set 0 except binding 2 (density_pressure_scratch
-    # is transient — overwritten by next density.comp). Same convention as V0.
-    DEFRAG_SET4_BINDINGS = (0, 1, 3, 4, 5, 6, 7, 8, 9)
+    # Defrag set 4 mirrors set 0 except the transient binding 2
+    # (density_pressure_scratch, overwritten by the next density.comp).
+    # 10-14 (particle uid, scalar, scalar compensation, scalar delta, turbulent
+    # viscosity) added 2026-09-27; 14 is carried only to keep host readbacks
+    # aligned after a defrag.
+    DEFRAG_SET4_BINDINGS = (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
 
     # ------------------------------------------------------------------
     # Construction
@@ -197,6 +221,21 @@ class SphSimulatorV1:
 
         # Section 2 + 3: allocate buffers, then upload initial state.
         self.buffers: dict[str, Buffer] = self._allocate_buffers()
+        # Host-visible staging for the tracer injection slots (not a descriptor;
+        # copied into the device-local scalar_injection buffer by the step cmd).
+        self._injection_staging: Optional[Buffer] = None
+        self._injection_staging_mapped = None
+        if self.case.scalars is not None and self.case.scalars.injections:
+            self._injection_staging = self._allocate_buffer(
+                size=MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES,
+                usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                memory_properties=(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                   | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            self._injection_staging_mapped = vkMapMemory(
+                self.ctx.device, self._injection_staging.memory, 0,
+                MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES, 0)
+            self._injection_staging_mapped[:MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES] = (
+                b"\x00" * (MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES))
         self.scratch_buffers: dict[str, Buffer] = self._allocate_scratch_buffers()
         self._upload_initial_state()
 
@@ -251,7 +290,7 @@ class SphSimulatorV1:
 
     def _load_shader_modules(self) -> dict:
         modules: dict = {}
-        names = list(SHADER_NAMES_HOT) + [SHADER_NAME_DEFRAG]
+        names = list(SHADER_NAMES_HOT) + [SHADER_NAME_DEFRAG, SHADER_NAME_FORCE_WITH_SCALARS]
         for name in names:
             spv_path = SHADER_DIR / f"{name}.comp.spv"
             if not spv_path.exists():
@@ -284,6 +323,10 @@ class SphSimulatorV1:
         cap_incoming = int(case.capacities.max_incoming)
         cap_neighbors = int(case.capacities.max_neighbors) if case.numerics.use_neighbor_list else 1
         n_materials = len(case.materials)
+        scalar_vec4 = case.scalar_vec4_count
+        scalar_bytes = 16 * scalar_vec4 * pool_capacity if scalar_vec4 > 0 else 16
+        sgs_on = case.scalars is not None and case.scalars.sgs.enabled
+        turbulent_bytes = 4 * pool_capacity if sgs_on else 16
 
         BSU = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         TRANSFER = (VK_BUFFER_USAGE_TRANSFER_DST_BIT
@@ -302,6 +345,13 @@ class SphSimulatorV1:
             _BufferSpec("correction_inverse",           0, 7, 32 * pool_capacity, BSU | TRANSFER),
             _BufferSpec("density_gradient_kernel_sum", 0, 8, 16 * pool_capacity, BSU | TRANSFER),
             _BufferSpec("extension_fields",             0, 9, 16 * pool_capacity, BSU | TRANSFER),
+            # ---- Scalar transport (2026-09-27). Placeholders (16 B) when the
+            # case has no scalars / no SGS: the kernels never touch them then.
+            _BufferSpec("particle_uid",                 0, 10,  4 * pool_capacity, BSU | TRANSFER),
+            _BufferSpec("scalar",                       0, 11, scalar_bytes,       BSU | TRANSFER),
+            _BufferSpec("scalar_compensation",          0, 12, scalar_bytes,       BSU | TRANSFER),
+            _BufferSpec("scalar_delta",                 0, 13, scalar_bytes,       BSU | TRANSFER),
+            _BufferSpec("turbulent_viscosity",          0, 14, turbulent_bytes,    BSU | TRANSFER),
 
             # ---- Set 1: voxel cells -----------------------------------------
             _BufferSpec("inside_particle_count",        1, 0,  4 * voxel_capacity,                  BSU | TRANSFER),
@@ -334,6 +384,10 @@ class SphSimulatorV1:
             # by predict.comp. Host-visible + coherent, mapped for the lifetime
             # of the simulator (see _rotor_write_state).
             _BufferSpec("rotor_state",                  3, 9,  16,                       BSU | TRANSFER, host_visible=True),
+            # Scalar parameters (2 vec4 per field vec4) and injection slots.
+            _BufferSpec("scalar_parameters",            3, 10, 32 * max(scalar_vec4, 1), BSU | TRANSFER),
+            _BufferSpec("scalar_injection",             3, 11, MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES,
+                        BSU | TRANSFER),
         ]
 
     def _allocate_buffer(self, size: int, usage: int, memory_properties: int) -> Buffer:
@@ -498,6 +552,30 @@ class SphSimulatorV1:
         if len(material_blob) == 0:
             material_blob = b"\x00" * 48
         data["material_parameters"] = bytes(material_blob)
+
+        # ---- particle_uid = upload pid (2026-09-27) -------------------------
+        data["particle_uid"] = np.arange(pool_capacity, dtype=np.uint32).tobytes()
+
+        # ---- scalars: initial value on FLUID particles, 0 elsewhere ---------
+        scalars = case.scalars
+        scalar_vec4 = case.scalar_vec4_count
+        if scalars is not None and scalar_vec4 > 0:
+            values = np.zeros((pool_capacity, 4 * scalar_vec4), dtype=np.float32)
+            cursor = own_first
+            for source in case.particle_sources:
+                n = int(source.vertices.shape[0])
+                material = case.materials[source.material_group_id]
+                if material.kind == KIND_FLUID:
+                    for field_index, field in enumerate(scalars.fields):
+                        values[cursor:cursor + n, field_index] = field.initial
+                cursor += n
+            data["scalar"] = values.tobytes()
+            parameters = np.zeros((scalar_vec4, 2, 4), dtype=np.float32)
+            for field_index, field in enumerate(scalars.fields):
+                vec4_index, component = divmod(field_index, 4)
+                parameters[vec4_index, 0, component] = field.diffusivity
+                parameters[vec4_index, 1, component] = 1.0 if field.turbulent else 0.0
+            data["scalar_parameters"] = parameters.tobytes()
 
         return data
 
@@ -778,6 +856,17 @@ class SphSimulatorV1:
             (SPEC_ID_ROTOR_PIVOT_Y,                float(case.rotor.pivot[1] if case.rotor else 0.0), 'f'),
             (SPEC_ID_ROTOR_PIVOT_Z,                float(case.rotor.pivot[2] if case.rotor else 0.0), 'f'),
             (SPEC_ID_MAX_NEIGHBORS,                int(capacities.max_neighbors),             'I'),
+            # Scalar transport (2026-09-27); all off / neutral without a `scalars:` block.
+            (SPEC_ID_SCALAR_VEC4_COUNT,            int(case.scalar_vec4_count),               'I'),
+            (SPEC_ID_USE_SCALAR_SGS,               1 if case.scalars is not None and case.scalars.sgs.enabled else 0, 'I'),
+            (SPEC_ID_SGS_LENGTH_SQUARED,           float(case.sgs_length_squared),            'f'),
+            (SPEC_ID_INVERSE_TURBULENT_SCHMIDT,    float(1.0 / case.scalars.sgs.turbulent_schmidt
+                                                         if case.scalars is not None else 1.0), 'f'),
+            (SPEC_ID_USE_SCALAR_SHIFT_CORRECTION,  1 if case.scalars is not None and case.scalars.shift_correction else 0, 'I'),
+            (SPEC_ID_USE_SCALAR_COMPENSATED_SUM,   1 if case.scalars is None or case.scalars.compensated_sum else 0, 'I'),
+            (SPEC_ID_USE_SCALAR_INJECTION,         1 if case.scalars is not None and case.scalars.injections else 0, 'I'),
+            (SPEC_ID_USE_SCALAR_BOUNDS_LIMITER,    1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
+            (SPEC_ID_SCALAR_FIELD_COUNT,           0 if case.scalars is None else len(case.scalars.fields), 'I'),
             (SPEC_ID_LEADING_GHOST_VOXEL_COUNT,    0,                                         'I'),
             (SPEC_ID_TRAILING_GHOST_VOXEL_COUNT,   0,                                         'I'),
         ]
@@ -803,7 +892,7 @@ class SphSimulatorV1:
         for name in SHADER_NAMES_HOT:
             stage = VkPipelineShaderStageCreateInfo(
                 stage=VK_SHADER_STAGE_COMPUTE_BIT,
-                module=self.shader_modules[name],
+                module=self.shader_modules[self._module_name_for_pipeline(name)],
                 pName="main",
                 pSpecializationInfo=self.spec_info_global,
             )
@@ -816,6 +905,13 @@ class SphSimulatorV1:
         pipelines.update(zip(SHADER_NAMES_HOT, result))
 
         return pipelines
+
+    def _module_name_for_pipeline(self, pipeline_name: str) -> str:
+        """force uses the scalar build of force.comp for cases with scalars
+        (2026-09-27); every other pipeline uses the module of the same name."""
+        if pipeline_name == "force" and self.case.scalar_vec4_count > 0:
+            return SHADER_NAME_FORCE_WITH_SCALARS
+        return pipeline_name
 
     def _build_defrag_pipeline(self):
         stage = VkPipelineShaderStageCreateInfo(
@@ -852,6 +948,12 @@ class SphSimulatorV1:
             0, 1, [barrier], 0, None, 0, None)
 
     def _record_density_scratch_to_primary_copy(self, cmd) -> None:
+        if self.case.scalars is not None and self.case.scalars.sgs.enabled:
+            # density.comp also wrote turbulent_viscosity (2026-09-27), which
+            # force.comp reads; the compute→transfer→compute chain below only
+            # names the transfer accesses, so add an explicit compute→compute
+            # dependency for that shader write.
+            self._record_compute_barrier(cmd)
         compute_to_transfer = VkMemoryBarrier(
             sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
@@ -962,6 +1064,9 @@ class SphSimulatorV1:
         per_p = self._per_own_particle_dispatch_count()
         per_v = self._per_voxel_dispatch_count()
 
+        if self._injection_staging is not None:
+            self._record_injection_copy(cmd)
+
         self._bind_pipeline_and_sets(cmd, "predict")
         vkCmdDispatch(cmd, per_p, 1, 1)
         self._record_compute_barrier(cmd)
@@ -998,6 +1103,24 @@ class SphSimulatorV1:
         self._bind_pipeline_and_sets(cmd, "build_neighbor_list")
         vkCmdDispatch(cmd, per_p, 1, 1)
         self._record_compute_barrier(cmd)
+
+    def _record_injection_copy(self, cmd) -> None:
+        """Copy the host-written injection slots into the device-local
+        scalar_injection buffer before predict.comp reads them (2026-09-27).
+        The host writes the staging buffer before every submission of the
+        step cmd (see _injection_write_state)."""
+        size = MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES
+        vkCmdCopyBuffer(cmd, self._injection_staging.handle,
+                        self.buffers["scalar_injection"].handle, 1,
+                        [VkBufferCopy(srcOffset=0, dstOffset=0, size=size)])
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, [VkMemoryBarrier(
+                sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+                dstAccessMask=VK_ACCESS_SHADER_READ_BIT)],
+            0, None, 0, None)
 
     def _record_defrag_cmd(self):
         """Defrag with copy-back (scratch set 4 → set 0) + alive count refresh."""
@@ -1127,12 +1250,17 @@ class SphSimulatorV1:
 
     def step(self, *, wait: bool = True) -> None:
         cmd = self.step_cmd
-        if self.case.rotor is not None:
+        if self.case.rotor is not None or self._injection_staging is not None:
             if not wait:
-                # predict.comp of the previous (unwaited) step may still be
-                # reading rotor_state; finish it before overwriting.
+                # predict.comp (or the injection copy) of the previous
+                # unwaited step may still be reading the host-written state;
+                # finish it before overwriting.
                 vkQueueWaitIdle(self.ctx.compute_queue)
-            self._rotor_write_state(self.simulation_time + self.case.timestep)
+            time_next = self.simulation_time + self.case.timestep
+            if self.case.rotor is not None:
+                self._rotor_write_state(time_next)
+            if self._injection_staging is not None:
+                self._injection_write_state(time_next)
         if wait:
             self.ctx.submit_and_wait(cmd)
         else:
@@ -1334,6 +1462,151 @@ class SphSimulatorV1:
                 result[f"rotor_particle_count_{name}"] = int(mask.sum())
         return result
 
+    # ==================================================================
+    # Scalar transport (2026-09-27)
+    # ==================================================================
+
+    def active_injections(self, time_next: float) -> list:
+        """Injections whose pulse covers t_{n+1} = time_next, i.e.
+        start <= time_next < start + duration. predict.comp applies them at
+        the new particle positions x_{n+1}."""
+        if self.case.scalars is None:
+            return []
+        return [injection for injection in self.case.scalars.injections
+                if injection.start <= time_next < injection.start + injection.duration]
+
+    def _injection_write_state(self, time_next: float) -> None:
+        """Fill the host-visible injection staging buffer for the step
+        that ends at time_next (layout = ScalarInjectionSlot in common.glsl:
+        vec4 centre + r^2, vec4 value, uvec4 active / vec4 index / component)."""
+        active = self.active_injections(time_next)
+        if len(active) > MAX_INJECTION_SLOTS:
+            raise RuntimeError(
+                f"{len(active)} injections active at t={time_next:.6f} s, "
+                f"more than MAX_INJECTION_SLOTS={MAX_INJECTION_SLOTS}")
+        blob = bytearray()
+        for slot in range(MAX_INJECTION_SLOTS):
+            if slot < len(active):
+                injection = active[slot]
+                vec4_index, component = self.case.scalars.field_location(injection.field)
+                blob += struct.pack("4f4f4I",
+                                    injection.center[0], injection.center[1], injection.center[2],
+                                    injection.radius * injection.radius,
+                                    injection.value, 0.0, 0.0, 0.0,
+                                    1, vec4_index, component, 0)
+            else:
+                blob += b"\x00" * INJECTION_SLOT_BYTES
+        self._injection_staging_mapped[:len(blob)] = bytes(blob)
+
+    def _require_scalars(self) -> None:
+        if self.case.scalar_vec4_count == 0:
+            raise RuntimeError("case has no `scalars:` block")
+
+    def readback_scalars(self) -> np.ndarray:
+        """(pool capacity, 4 * SCALAR_VEC4_COUNT) float32; column k = field k
+        (columns past the declared fields are padding)."""
+        self._require_scalars()
+        raw = self._readback_buffer(self.buffers["scalar"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4 * self.case.scalar_vec4_count)
+
+    def readback_scalar_compensation(self) -> np.ndarray:
+        self._require_scalars()
+        raw = self._readback_buffer(self.buffers["scalar_compensation"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4 * self.case.scalar_vec4_count)
+
+    def readback_scalar_delta(self) -> np.ndarray:
+        self._require_scalars()
+        raw = self._readback_buffer(self.buffers["scalar_delta"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4 * self.case.scalar_vec4_count)
+
+    def readback_turbulent_viscosity(self) -> np.ndarray:
+        if self.case.scalars is None or not self.case.scalars.sgs.enabled:
+            raise RuntimeError("case has no scalar SGS (scalars.sgs.enabled)")
+        raw = self._readback_buffer(self.buffers["turbulent_viscosity"])
+        return np.frombuffer(raw, dtype=np.float32)
+
+    def readback_particle_uid(self) -> np.ndarray:
+        raw = self._readback_buffer(self.buffers["particle_uid"])
+        return np.frombuffer(raw, dtype=np.uint32)
+
+    def readback_shift(self) -> np.ndarray:
+        raw = self._readback_buffer(self.buffers["shift"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
+
+    def write_scalars(self, values: np.ndarray) -> None:
+        """Overwrite the scalar field of every slot (initial conditions for
+        tests). `values` has shape (pool capacity, n_fields) or
+        (pool capacity, 4 * SCALAR_VEC4_COUNT); values on non-fluid slots are
+        ignored by the kernels. Also clears the Kahan compensation and the
+        pending increment, so call it before bootstrap() (the bootstrap force
+        pass then prepares the first increment from these values)."""
+        self._require_scalars()
+        width = 4 * self.case.scalar_vec4_count
+        values = np.asarray(values, dtype=np.float32)
+        pool_capacity = 1 + int(self.case.capacities.pool_size)
+        if values.ndim != 2 or values.shape[0] != pool_capacity or values.shape[1] > width:
+            raise ValueError(f"write_scalars expects shape ({pool_capacity}, <= {width}), got {values.shape}")
+        padded = np.zeros((pool_capacity, width), dtype=np.float32)
+        padded[:, :values.shape[1]] = values
+        self._staging_upload(self.buffers["scalar"], padded.tobytes())
+        self._zero_buffer(self.buffers["scalar_compensation"])
+        self._zero_buffer(self.buffers["scalar_delta"])
+
+    def fluid_group_ids(self) -> list[int]:
+        return [m.group_id for m in self.case.materials if m.kind == KIND_FLUID]
+
+    def scalar_snapshot(self) -> dict:
+        """Live FLUID particles only: positions (n, 3), mass (n,), scalars
+        (n, n_fields) as float64 (value + compensation, i.e. the compensated
+        sum), uid (n,). Used by the probes, the totals and the checks."""
+        self._require_scalars()
+        positions = self.readback_positions()
+        live = self.live_slot_mask(positions)
+        material = self.readback_material()
+        fluid = live & np.isin(material, np.asarray(self.fluid_group_ids(), dtype=np.uint32))
+        n_fields = len(self.case.scalars.fields)
+        values = self.readback_scalars()[fluid, :n_fields].astype(np.float64)
+        if self.case.scalars.compensated_sum:
+            # Kahan: the exact running sum is value - compensation.
+            values -= self.readback_scalar_compensation()[fluid, :n_fields].astype(np.float64)
+        return {
+            "positions": positions[fluid, :3].astype(np.float64),
+            "mass": self.readback_velocity_mass()[fluid, 3].astype(np.float64),
+            "scalars": values,
+            "uid": self.readback_particle_uid()[fluid],
+        }
+
+    def scalar_totals(self, snapshot: Optional[dict] = None) -> np.ndarray:
+        """Conserved amount sum_i m_i C_i of every field over live FLUID
+        particles (float64)."""
+        snapshot = snapshot if snapshot is not None else self.scalar_snapshot()
+        return (snapshot["mass"][:, None] * snapshot["scalars"]).sum(axis=0)
+
+    def probe_scalars(self, points, radius: Optional[float] = None,
+                      snapshot: Optional[dict] = None) -> np.ndarray:
+        """Shepard-interpolated field values at `points` (m, shape (P, 3)):
+            C(p) = sum_j C_j W(|p - x_j|; R) / sum_j W(|p - x_j|; R)
+        over live FLUID particles, Wendland C4 profile with support R
+        (default: the case's probe radius, else h). Returns (P, n_fields);
+        NaN for a probe with no fluid particle inside R."""
+        snapshot = snapshot if snapshot is not None else self.scalar_snapshot()
+        if radius is None:
+            probes = self.case.scalars.probes
+            radius = probes.radius if probes is not None and probes.radius else self.case.physics.h
+        positions, values = snapshot["positions"], snapshot["scalars"]
+        points = np.atleast_2d(np.asarray(points, dtype=np.float64))
+        result = np.full((points.shape[0], values.shape[1]), np.nan)
+        for p, point in enumerate(points):
+            offset = positions - point
+            distance_squared = np.einsum("ij,ij->i", offset, offset)
+            inside = distance_squared < radius * radius
+            if not inside.any():
+                continue
+            q = np.sqrt(distance_squared[inside]) / radius
+            weight = (1.0 - q) ** 6 * (35.0 / 3.0 * q * q + 6.0 * q + 1.0)
+            result[p] = weight @ values[inside] / weight.sum()
+        return result
+
     def get_render_buffers(self) -> dict:
         return {
             "position_voxel_id": self.buffers["position_voxel_id"].handle,
@@ -1367,6 +1640,13 @@ class SphSimulatorV1:
         for layout in self.descriptor_layouts:
             vkDestroyDescriptorSetLayout(device, layout, None)
         vkDestroyDescriptorSetLayout(device, self.defrag_set4_layout, None)
+
+        # Injection staging (2026-09-27)
+        if self._injection_staging is not None:
+            vkUnmapMemory(device, self._injection_staging.memory)
+            vkDestroyBuffer(device, self._injection_staging.handle, None)
+            vkFreeMemory(device, self._injection_staging.memory, None)
+            self._injection_staging = None
 
         # Buffers (unmap the persistently mapped ones first)
         for name in list(self._mapped):

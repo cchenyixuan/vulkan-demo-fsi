@@ -28,10 +28,14 @@ Main loop (uniform, every step):
     2. update_voxel   compact inside_particle_index + merge incoming events
     2b. build_neighbor_list   (USE_NEIGHBOR_LIST, opt-in, default OFF, 2026-09-25) one 27-voxel
                       scan per particle → neighbor_count / neighbor_list (set 1, 5-6)
-    3. correction     KCG matrix M⁻¹ + ∇ρ + kernel_sum
+    3. correction     KCG matrix M⁻¹ + ∇ρ + kernel_sum (+ tr M unregularized, for scalars)
     4. density        continuity (ρ_{n+1}) + Tait EOS (P_{n+1})
+                      (+ Smagorinsky ν_t of FLUID particles when USE_SCALAR_SGS)
     5. force          pressure (TIC) + viscosity (Morris) + gravity + PST shift
                           → a_{n+1}, shift_{n+1}
+                      (+ scalar increment ΔC = dt·diffusion + shift·∇C, FLUID)
+    Scalars (2026-09-27, SCALAR_VEC4_COUNT > 0): predict adds ΔC from the
+    previous force (Kahan-compensated) and applies active tracer pulses.
 ```
 
 Stage order matters. density.comp writes the new ρ/P to the transient
@@ -61,7 +65,7 @@ GPU at bootstrap.
 | `build_neighbor_list.comp` | Stage 2b (2026-09-25) — per-particle support-sphere neighbour ids, transposed layout; lets stages 3-5 skip the 27-voxel candidate scan. Default off (measured slower, see log); on via `numerics.use_neighbor_list: true`. |
 | `correction.comp` | Stage 3 — KCG correction matrix + density gradient + kernel sum. |
 | `density.comp` | Stage 4 — continuity equation + EOS. |
-| `force.comp` | Stage 5 — pressure + viscosity + gravity + PST shift (+ vorticity ω_z into `acceleration.w` for the viewer). |
+| `force.comp` | Stage 5 — pressure + viscosity + gravity + PST shift (+ vorticity ω_z into `acceleration.w` for the viewer). Built twice (2026-09-27): `force.comp.spv` without and `force_scalar.comp.spv` with the scalar-transport code (`-DFORCE_WITH_SCALARS=1`); the simulator uses the latter only for cases with a `scalars:` block. |
 | `defrag.comp` | Periodic — re-packs the pool in voxel order into scratch set 4; the simulator copies it back. |
 | `_test_common.comp` | Smoke test: empty kernel including `common.glsl`, used to detect regressions in bindings/spec constants. |
 | `render/particle.vert`, `render/particle.frag` | Point-sprite render shaders for `SphRendererV1` (color modes incl. vorticity). |
@@ -116,6 +120,7 @@ every `.comp` file. Both are header-guarded.
 | `density` | run | run (stores ρ₀) | run (stores ρ₀, as BOUNDARY) | skip | skip |
 | `force` | run | run | run | skip | skip |
 | `defrag` | per-voxel kernel; walks `inside_particle_index` only (INLET particles are not preserved — see below) | | | | |
+| scalar transport (predict / density / force, 2026-09-27) | run (FLUID self, FLUID neighbours only) | carries 0, excluded from every scalar sum (zero-flux wall) | as BOUNDARY | skip | skip |
 
 \* `correction` does not skip INLET because doing so would require pulling in
 `material[pid] + material_parameters[group]` (~52 B/particle) just for the
@@ -151,6 +156,14 @@ Reads (R) and Writes (W) per kernel. See `common.glsl` for binding numbers.
 | `incoming_particle_index` (set 1) | — | atomic W | R | — | — | — |
 | `material_parameters` (set 3) | R (kind) | R (kind) | — | — | R (kind, eos, ρ_0) | R (kind, ν, R, V) |
 | `global_status` (set 3, atomics) | — | atomic W on overflow | atomic W on overflow | atomic W on fallback | — | — |
+| `particle_uid` (binding 10) | — | — | — | — | — | — (host / defrag only) |
+| `scalar` (binding 11) | — | R/W (FLUID) | — | — | — | R (self + FLUID nbrs) |
+| `scalar_compensation` (binding 12) | — | R/W (FLUID) | — | — | — | — |
+| `scalar_delta` (binding 13) | — | R | — | — | — | W (FLUID) |
+| `turbulent_viscosity` (binding 14) | — | — | — | — | W (FLUID, SGS) | R (self + FLUID nbrs, SGS) |
+| `correction_inverse[2i+1].z` = tr M | — | — | — | W | — | R (scalars) |
+| `scalar_parameters` (set 3, 10) | — | — | — | — | — | R |
+| `scalar_injection` (set 3, 11) | — | R (injection on) | — | — | — | — |
 
 Notes:
 - Density staging is **scratch+copy**: density.comp writes
@@ -169,6 +182,13 @@ Notes:
 - `force` is the most expensive: reads neighbor M, ∇ρ, mass, density, vel for
   pair-averaged formulas; uniform V0 lets us compute pair quantities from
   self only (see `force.comp` header for what's hoisted).
+- Scalar transport (2026-09-27): every scalar buffer is a 16 B placeholder
+  and every scalar code path is compiled out when SCALAR_VEC4_COUNT = 0 (the
+  default, i.e. cases without a `scalars:` block). defrag carries bindings
+  10-14; `scalar_delta` must be carried because defrag runs between force
+  (writer) and the next predict (reader). Formulas, the Laplacian
+  normalisation and the validation are in `force.comp`'s header and
+  `log/2026-09-27_scalar-transport.md`.
 
 ---
 

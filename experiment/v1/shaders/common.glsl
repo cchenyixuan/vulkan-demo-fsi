@@ -41,7 +41,11 @@
 //   43 - 46  : algorithm ablation toggles (KCG, density diffusion, PST, prefix-sum defrag)
 //   47 - 49  : reserved for future ablation toggles
 //   50 - 53  : capacities + workgroup size + pool size
-//   54 - 79  : reserved
+//   54 - 55  : ghost pool sizes
+//   56 - 61  : rotor axis / pivot (2026-09-25)
+//   62       : neighbour-list capacity (2026-09-25)
+//   63 - 71  : scalar transport (2026-09-27)
+//   72 - 79  : reserved
 //   80 - 88  : multi-GPU ghost grid parameters
 //   89 - 127 : reserved
 //
@@ -199,6 +203,56 @@ layout(constant_id = 61) const float ROTOR_PIVOT_Z = 0.0;
 // GlobalStatusBuffer.overflow_neighbor_count and the extra neighbours dropped.
 layout(constant_id = 62) const uint MAX_NEIGHBORS = 160u;
 
+// --- Scalar transport (2026-09-27) ------------------------------------------
+// Scalar fields (tracer, substrate, oxygen, biomass, ...) carried by FLUID
+// particles. The particle motion does the advection; force.comp adds an SPH
+// Laplacian diffusion and the δ-plus shift correction; predict.comp applies
+// the increment. Fields are packed four per vec4:
+//     scalar[pid * SCALAR_VEC4_COUNT + v].c  holds field  4 v + c
+// SCALAR_VEC4_COUNT = 0 (default) switches the feature off completely: every
+// scalar code path is a zero-trip loop or a branch on a false spec constant,
+// removed when the pipeline is specialized, and the scalar buffers exist only
+// as 16 B placeholders that no kernel touches. At most MAX_SCALAR_VEC4 vec4.
+layout(constant_id = 63) const uint  SCALAR_VEC4_COUNT = 0u;
+// Smagorinsky sub-grid diffusivity for the scalars (Smagorinsky 1963):
+//     nu_t = (C_s Delta)^2 |S|,   |S| = sqrt(2 S:S),   D_t = nu_t / Sc_t
+// S is the rate-of-strain tensor of the M-corrected SPH velocity gradient,
+// computed in density.comp. nu_t enters ONLY the scalar diffusion (fields
+// whose SGS weight is 1), NOT the momentum equation.
+layout(constant_id = 64) const bool  USE_SCALAR_SGS = false;
+layout(constant_id = 65) const float SGS_LENGTH_SQUARED = 0.0;          // (C_s Delta)^2 in m^2
+layout(constant_id = 66) const float INVERSE_TURBULENT_SCHMIDT = 1.0;   // 1 / Sc_t
+// Ablation toggles for the two numerical ingredients of the scalar update:
+//   shift correction : C += shift . grad C. The δ-plus shift moves particles
+//                      relative to the fluid; without this term the shift
+//                      itself would transport scalar artificially.
+//   compensated sum  : Kahan-compensated accumulation of the per-step
+//                      increment in predict.comp. At the small WCSPH time step
+//                      a bulk increment can be below half an ulp of C and would
+//                      be rounded away every step in plain float32.
+// USE_SCALAR_SHIFT_CORRECTION is OFF by default in case.py (2026-09-27): the
+// Taylor term is neither conservative nor bounded at sharp fronts; see
+// ScalarsConfig in utils/sph/case.py and log/2026-09-27_scalar-transport.md.
+layout(constant_id = 67) const bool  USE_SCALAR_SHIFT_CORRECTION = false;
+layout(constant_id = 68) const bool  USE_SCALAR_COMPENSATED_SUM  = true;
+// Tracer pulses (ScalarInjectionBuffer) are compiled into predict.comp only
+// for cases that declare at least one injection.
+layout(constant_id = 69) const bool  USE_SCALAR_INJECTION = false;
+// Local bounds limiter, active only together with the shift correction: the
+// updated value C_i + ΔC_i is clipped to the range spanned by C_i and its
+// FLUID neighbours (discrete maximum principle). The diffusion part alone is
+// monotone; the shift correction (a first-order Taylor interpolation without
+// limiter) is not, and at a sharp front, e.g. the edge of a tracer pulse, it
+// produced values of -0.37 and 1.46 for a 0 / 1 tracer within 1 s in the 4 mm
+// tank (2026-09-27). Smooth fields are not affected (a linear field
+// interpolated within the kernel stays in range).
+layout(constant_id = 70) const bool  USE_SCALAR_BOUNDS_LIMITER = true;
+// Number of declared fields (<= 4 * SCALAR_VEC4_COUNT). force.comp multiplies
+// the scalar vec4 by scalar_component_mask() so that the unused components of
+// the last vec4 are compile-time zeros after specialization and their
+// arithmetic and registers disappear (7 % of force's time with one field).
+layout(constant_id = 71) const uint  SCALAR_FIELD_COUNT = 0u;
+
 // --- Multi-GPU ghost (V1 merged-buffer scheme) ---
 // V1 partitions along X. The voxel_id encoding (helpers.glsl) is "x-slowest"
 // so that each x-column of voxels is a contiguous voxel_id segment. Ghost
@@ -245,6 +299,13 @@ const uint MATERIAL_ROTOR    = 3u;
 const uint VOXEL_ID_DEAD         = 0u;
 const uint INSIDE_SLOT_EMPTY     = 0u;
 const uint PARTICLE_ID_NONE      = 0u;
+
+// --- Scalar transport capacities (2026-09-27) ---
+// Register arrays in force.comp are sized with MAX_SCALAR_VEC4; the loops run
+// to SCALAR_VEC4_COUNT (<= MAX_SCALAR_VEC4, checked in Python) so the unused
+// array elements disappear after specialization.
+const uint MAX_SCALAR_VEC4     = 3u;   // up to 12 scalar fields
+const uint MAX_INJECTION_SLOTS = 4u;   // simultaneously active tracer pulses
 
 // ============================================================================
 // Descriptor set 0 — Particle SoA (own + ghost merged in V1)
@@ -349,7 +410,13 @@ layout(std430, set = 0, binding = 6) buffer MaterialBuffer {
 layout(std430, set = 0, binding = 7) buffer CorrectionInverseBuffer {
     // Symmetric 3×3 M⁻¹, packed into 2 vec4 per particle:
     //   correction_inverse[pid*2]     = (m00, m11, m22, m01)
-    //   correction_inverse[pid*2 + 1] = (m02, m12, _, _)
+    //   correction_inverse[pid*2 + 1] = (m02, m12, d / tr(M), fluid flag)
+    // m.. are the entries of the REGULARIZED inverse (M + ξ I)⁻¹ used by every
+    // momentum / density term. The last two slots (2026-09-27) are used only
+    // by the scalar transport in force.comp: d / tr(M) with tr(M) the trace of
+    // the unregularized M = Σ_j V_j (x_j - x_i) ⊗ ∇W_ij (Laplacian
+    // normalisation without the ξ shift), and 1 / 0 for FLUID / other kinds
+    // (written only when SCALAR_VEC4_COUNT > 0, else 0).
     vec4 correction_inverse[];
 };
 
@@ -366,11 +433,54 @@ layout(std430, set = 0, binding = 9) buffer ExtensionFieldsBuffer {
     //   .xyz : ROTOR particles only — reference (initial) position used by
     //          predict.comp's rigid-body update (2026-09-25). Uploaded from
     //          the initial positions for every particle; other kinds ignore it.
-    //   .w   : reserved (future: species concentration)
+    //   .w   : reserved (scalars live in ScalarBuffer, binding 11)
     vec4 extension_fields[];
 };
 
-// binding 10 reserved for GlobalIdBuffer (FTLE / Lagrangian tracking)
+layout(std430, set = 0, binding = 10) buffer ParticleUidBuffer {
+    // Persistent particle identity (2026-09-27): the pid the particle had at
+    // upload (1-based). Defrag renumbers pids but carries this field, so a
+    // particle's trajectory and scalar history can be followed across defrags
+    // (lifelines, FTLE). Never read by the physics kernels.
+    uint particle_uid[];
+};
+
+layout(std430, set = 0, binding = 11) buffer ScalarBuffer {
+    // Scalar fields, SCALAR_VEC4_COUNT vec4 per particle (see scalar_index()).
+    // Specific (per unit mass) values: advection leaves a particle's value
+    // unchanged, and the conserved amount of field k is sum_i m_i C_ik.
+    // Meaningful on FLUID particles only; solids hold 0 and are excluded from
+    // every scalar sum (zero-flux walls). Written only by predict.comp (and by
+    // the host for initial conditions).
+    vec4 scalar[];
+};
+
+layout(std430, set = 0, binding = 12) buffer ScalarCompensationBuffer {
+    // Kahan compensation of the running sum in ScalarBuffer (the low-order
+    // part lost in the last float32 addition, with the sign convention of
+    // Kahan 1965). Same layout as ScalarBuffer; predict.comp only.
+    vec4 scalar_compensation[];
+};
+
+layout(std430, set = 0, binding = 13) buffer ScalarDeltaBuffer {
+    // Increment for the next predict.comp, written by force.comp:
+    //     dt * (dC/dt)_diffusion  +  shift . grad C
+    // Same layout as ScalarBuffer. Kept apart from ScalarBuffer so that force
+    // never writes a value that another invocation of the same dispatch reads.
+    // Carried through defrag (defrag runs between force and the next predict).
+    vec4 scalar_delta[];
+};
+
+layout(std430, set = 0, binding = 14) buffer TurbulentViscosityBuffer {
+    // Smagorinsky nu_t (m^2/s) of FLUID particles, written by density.comp and
+    // read by force.comp in the same step. The kernels would not need it
+    // carried through defrag (it is recomputed before force reads it), but it
+    // is carried anyway so that a host readback after a defrag stays aligned
+    // with the particles (found 2026-09-27: without it the values read after
+    // a defrag belong to other particles). Touched only when USE_SCALAR_SGS
+    // (a 16 B placeholder otherwise).
+    float turbulent_viscosity[];
+};
 
 // ============================================================================
 // Descriptor set 1 — Voxel cell structures (own + ghost merged in V1)
@@ -629,6 +739,36 @@ layout(std430, set = 3, binding = 9) buffer RotorStateBuffer {
     float rotor_sin_theta;
     float rotor_angular_velocity_now;
     float rotor_time;
+};
+
+// ----------------------------------------------------------------------------
+// Scalar transport parameters (2026-09-27).
+//   scalar_parameters[2 v]     : molecular diffusivity D_m of fields 4v..4v+3 (m^2/s)
+//   scalar_parameters[2 v + 1] : SGS weight of the same fields (1 = the field
+//                                also receives nu_t / Sc_t, 0 = it does not)
+// A field with D_m = 0 and weight 0 does not diffuse at all (e.g. biomass
+// attached to the fluid particles); the harmonic pair mean in force.comp then
+// makes its flux exactly zero.
+// ----------------------------------------------------------------------------
+layout(std430, set = 3, binding = 10) buffer ScalarParametersBuffer {
+    vec4 scalar_parameters[];
+};
+
+// ----------------------------------------------------------------------------
+// Tracer injection slots (2026-09-27). The host decides which pulses are
+// active for the coming step, writes them into a host-visible staging buffer,
+// and the step command buffer copies them here before predict.comp. predict
+// sets field (4 target.y + target.z) to value.x on every FLUID particle whose
+// new position lies inside the sphere, for as long as the slot is active.
+// ----------------------------------------------------------------------------
+struct ScalarInjectionSlot {
+    vec4  center_radius_squared;   // xyz = centre (m), w = radius^2 (m^2)
+    vec4  value;                   // x = value imposed inside the sphere
+    uvec4 target;                  // x = active (0 / 1), y = vec4 index v, z = component c
+};  // 48 B
+
+layout(std430, set = 3, binding = 11) buffer ScalarInjectionBuffer {
+    ScalarInjectionSlot scalar_injection[];   // MAX_INJECTION_SLOTS entries
 };
 
 layout(std430, set = 3, binding = 8) buffer DefragScratchCounterBuffer {

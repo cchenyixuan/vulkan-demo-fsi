@@ -14,6 +14,8 @@ Single CPU-side hub for the V0 SPH pipeline. Everything you need to go from
   - ``build_specialization_info(case)`` — packs the 41 spec constants into a
     bytes blob (kept in lockstep with ``shaders/sph/common.glsl``).
   - ``load_case(path)`` — single entry point: yaml + obj on disk → Case.
+  - Optional blocks: ``rotor:`` (2026-09-25, RotorConfig) and ``scalars:``
+    (2026-09-27, ScalarsConfig: fields, sgs, injections, probes).
 
 Stays Vulkan-free. Imports only PyYAML, NumPy, and our two pure utilities
 (``utils.sph.obj_loader`` for vertex parsing, ``utils.sph.grid`` for
@@ -477,6 +479,201 @@ class RotorConfig:
 
 
 @dataclass
+class ScalarFieldConfig:
+    """One scalar field carried by the FLUID particles (case.yaml
+    ``scalars.fields`` entry, added 2026-09-27).
+
+    ``diffusivity`` molecular diffusivity D_m (m^2/s); 0 = no molecular diffusion
+    ``turbulent``   True: the field also receives nu_t / Sc_t when
+                    ``scalars.sgs.enabled``; False: never (e.g. biomass attached
+                    to the particles, which must not be smeared between them)
+    ``initial``     value given to every FLUID particle at upload (solids carry 0)
+
+    Values are specific (per unit mass): advection leaves them unchanged and the
+    conserved amount is sum_i m_i C_i.
+    """
+    name: str
+    diffusivity: float = 0.0
+    turbulent: bool = True
+    initial: float = 0.0
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError(f"scalars.fields: every field needs a non-empty name, got {self.name!r}")
+        self.diffusivity = float(self.diffusivity)
+        self.initial = float(self.initial)
+        self.turbulent = bool(self.turbulent)
+        if self.diffusivity < 0.0:
+            raise ValueError(f"scalars.fields[{self.name}].diffusivity must be >= 0, got {self.diffusivity}")
+
+
+@dataclass
+class ScalarSgsConfig:
+    """Smagorinsky sub-grid diffusivity for the scalars (``scalars.sgs``):
+        nu_t = (smagorinsky_cs * filter_width)^2 |S|,   D_t = nu_t / turbulent_schmidt
+    ``filter_width`` defaults to the particle spacing dx. Used in the scalar
+    diffusion only, not in the momentum equation."""
+    enabled: bool = False
+    smagorinsky_cs: float = 0.1
+    filter_width: Optional[float] = None
+    turbulent_schmidt: float = 0.7
+
+    def __post_init__(self):
+        self.enabled = bool(self.enabled)
+        self.smagorinsky_cs = float(self.smagorinsky_cs)
+        self.turbulent_schmidt = float(self.turbulent_schmidt)
+        if self.smagorinsky_cs <= 0.0:
+            raise ValueError(f"scalars.sgs.smagorinsky_cs must be > 0, got {self.smagorinsky_cs}")
+        if self.turbulent_schmidt <= 0.0:
+            raise ValueError(f"scalars.sgs.turbulent_schmidt must be > 0, got {self.turbulent_schmidt}")
+        if self.filter_width is not None:
+            self.filter_width = float(self.filter_width)
+            if self.filter_width <= 0.0:
+                raise ValueError(f"scalars.sgs.filter_width must be > 0, got {self.filter_width}")
+
+
+@dataclass
+class ScalarInjectionConfig:
+    """A tracer pulse (``scalars.injections`` entry): while
+    start <= t < start + duration, every FLUID particle whose position lies
+    inside the sphere (center, radius) gets field ``field`` set to ``value``."""
+    field: str
+    center: tuple[float, float, float]
+    radius: float
+    start: float
+    duration: float
+    value: float = 1.0
+
+    def __post_init__(self):
+        center = tuple(float(component) for component in self.center)
+        if len(center) != 3:
+            raise ValueError(f"scalars.injections: center must have 3 components, got {self.center}")
+        self.center = center
+        self.radius = float(self.radius)
+        self.start = float(self.start)
+        self.duration = float(self.duration)
+        self.value = float(self.value)
+        if self.radius <= 0.0 or self.duration <= 0.0:
+            raise ValueError(f"scalars.injections[{self.field}]: radius and duration must be > 0")
+
+
+@dataclass
+class ScalarProbePoint:
+    name: str
+    position: tuple[float, float, float]
+
+    def __post_init__(self):
+        position = tuple(float(component) for component in self.position)
+        if len(position) != 3:
+            raise ValueError(f"scalars.probes: position of {self.name!r} must have 3 components")
+        self.position = position
+
+
+@dataclass
+class ScalarProbesConfig:
+    """Probe points for time series (``scalars.probes``). The value is a
+    Shepard (kernel-weighted) average over the FLUID particles within
+    ``radius`` (default h), see SphSimulatorV1.probe_scalars."""
+    points: list[ScalarProbePoint]
+    radius: Optional[float] = None
+
+    def __post_init__(self):
+        if self.radius is not None:
+            self.radius = float(self.radius)
+            if self.radius <= 0.0:
+                raise ValueError(f"scalars.probes.radius must be > 0, got {self.radius}")
+
+
+MAX_SCALAR_FIELDS = 12              # 4 * MAX_SCALAR_VEC4 in common.glsl
+MAX_INJECTION_SLOTS = 4             # MAX_INJECTION_SLOTS in common.glsl
+
+
+@dataclass
+class ScalarsConfig:
+    """Optional case.yaml block ``scalars:`` (scalar transport, 2026-09-27).
+
+    ``shift_correction`` / ``compensated_sum`` / ``bounds_limiter`` are
+    ablation toggles (common.glsl ids 67, 68, 70). ``shift_correction`` is
+    OFF by default (2026-09-27): the Taylor correction C += shift . grad C is
+    not conservative (tracer total +0.45 % in 0.5 s after a pulse in the 4 mm
+    tank, +3.5 % with the bounds limiter, which clips undershoots) and not
+    bounded without the limiter (-0.37 .. 1.46 for a 0 / 1 tracer). Without it
+    the scalar is conserved to round-off and bounded, at the price of the
+    shift moving particles relative to the fluid (measured effective
+    dispersion ~1e-4 m^2/s at dx = 4 mm). See log/2026-09-27_scalar-transport.md. Fields are packed four per vec4 in
+    declaration order: field k lives in vec4 k // 4, component k % 4."""
+    fields: list[ScalarFieldConfig]
+    sgs: ScalarSgsConfig
+    injections: list[ScalarInjectionConfig]
+    probes: Optional[ScalarProbesConfig] = None
+    shift_correction: bool = False
+    compensated_sum: bool = True
+    bounds_limiter: bool = True
+
+    def __post_init__(self):
+        if not 1 <= len(self.fields) <= MAX_SCALAR_FIELDS:
+            raise ValueError(
+                f"scalars.fields: 1..{MAX_SCALAR_FIELDS} fields supported, got {len(self.fields)}")
+        names = [field.name for field in self.fields]
+        if len(set(names)) != len(names):
+            raise ValueError(f"scalars.fields: duplicate names in {names}")
+        for injection in self.injections:
+            if injection.field not in names:
+                raise ValueError(
+                    f"scalars.injections: unknown field {injection.field!r} (fields: {names})")
+        # At most MAX_INJECTION_SLOTS pulses may be active at the same time.
+        events = sorted([(i.start, 1) for i in self.injections]
+                        + [(i.start + i.duration, -1) for i in self.injections],
+                        key=lambda event: (event[0], event[1]))
+        active = 0
+        for _, change in events:
+            active += change
+            if active > MAX_INJECTION_SLOTS:
+                raise ValueError(
+                    f"scalars.injections: more than {MAX_INJECTION_SLOTS} pulses overlap in time")
+        self.shift_correction = bool(self.shift_correction)
+        self.compensated_sum = bool(self.compensated_sum)
+        self.bounds_limiter = bool(self.bounds_limiter)
+
+    @property
+    def field_names(self) -> list[str]:
+        return [field.name for field in self.fields]
+
+    @property
+    def vec4_count(self) -> int:
+        return (len(self.fields) + 3) // 4
+
+    def field_location(self, name: str) -> tuple[int, int]:
+        """(vec4 index v, component c) of a field."""
+        field_index = self.field_names.index(name)
+        return field_index // 4, field_index % 4
+
+
+def _parse_scalars(data: dict, source: str) -> "ScalarsConfig":
+    allowed = {"fields", "sgs", "injections", "probes", "shift_correction", "compensated_sum",
+               "bounds_limiter"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(f"{source}: unknown keys in `scalars:` block: {sorted(unknown)}")
+    if not data.get("fields"):
+        raise ValueError(f"{source}: `scalars:` block needs a non-empty `fields:` list")
+    probes = None
+    if data.get("probes") is not None:
+        probe_data = dict(data["probes"])
+        points = [ScalarProbePoint(**point) for point in probe_data.pop("points", [])]
+        probes = ScalarProbesConfig(points=points, **probe_data)
+    return ScalarsConfig(
+        fields=[ScalarFieldConfig(**field) for field in data["fields"]],
+        sgs=ScalarSgsConfig(**(data.get("sgs") or {})),
+        injections=[ScalarInjectionConfig(**injection) for injection in (data.get("injections") or [])],
+        probes=probes,
+        shift_correction=data.get("shift_correction", False),
+        compensated_sum=data.get("compensated_sum", True),
+        bounds_limiter=data.get("bounds_limiter", True),
+    )
+
+
+@dataclass
 class ParticleSource:
     """One obj file's vertices + its material assignment."""
     obj_path: pathlib.Path
@@ -516,6 +713,22 @@ class Case:
     particle_sources: list[ParticleSource]
     case_dir: pathlib.Path                          # for relative path debugging
     rotor: Optional["RotorConfig"] = None           # present iff case.yaml has a `rotor:` block
+    scalars: Optional["ScalarsConfig"] = None       # present iff case.yaml has a `scalars:` block
+
+    @property
+    def scalar_vec4_count(self) -> int:
+        """SCALAR_VEC4_COUNT spec constant: 0 without a `scalars:` block."""
+        return 0 if self.scalars is None else self.scalars.vec4_count
+
+    @property
+    def sgs_length_squared(self) -> float:
+        """(C_s Delta)^2 for the Smagorinsky nu_t (0 when the SGS is off);
+        Delta defaults to the particle spacing dx."""
+        if self.scalars is None or not self.scalars.sgs.enabled:
+            return 0.0
+        sgs = self.scalars.sgs
+        width = sgs.filter_width if sgs.filter_width is not None else self.physics.particle_diameter
+        return (sgs.smagorinsky_cs * width) ** 2
 
     @property
     def rotor_angular_velocity(self) -> float:
@@ -714,6 +927,16 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (52,  lambda case: case.capacities.max_incoming,                   'I'),
     (53,  lambda case: case.capacities.pool_size,                      'I'),
     (62,  lambda case: case.capacities.max_neighbors,                  'I'),  # MAX_NEIGHBORS
+    # 63-71 scalar transport (2026-09-27); neutral values without a `scalars:` block.
+    (63,  lambda case: case.scalar_vec4_count,                         'I'),  # SCALAR_VEC4_COUNT
+    (64,  lambda case: 1 if case.scalars is not None and case.scalars.sgs.enabled else 0, 'I'),
+    (65,  lambda case: case.sgs_length_squared,                        'f'),  # (C_s Delta)^2
+    (66,  lambda case: (1.0 / case.scalars.sgs.turbulent_schmidt) if case.scalars is not None else 1.0, 'f'),
+    (67,  lambda case: 1 if case.scalars is not None and case.scalars.shift_correction else 0, 'I'),
+    (68,  lambda case: 1 if case.scalars is None or case.scalars.compensated_sum else 0, 'I'),
+    (69,  lambda case: 1 if case.scalars is not None and case.scalars.injections else 0, 'I'),
+    (70,  lambda case: 1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
+    (71,  lambda case: 0 if case.scalars is None else len(case.scalars.fields), 'I'),  # SCALAR_FIELD_COUNT
     # 56-61 rotor axis / pivot (world coords); defaults when no rotor block.
     (56,  lambda case: (case.rotor.axis[0]  if case.rotor else 0.0),   'f'),
     (57,  lambda case: (case.rotor.axis[1]  if case.rotor else 0.0),   'f'),
@@ -843,6 +1066,13 @@ def load_case(case_yaml_path) -> Case:
         raise ValueError(
             f"{case_yaml_path}: `rotor:` block present but no rotor-kind material is used")
 
+    # Optional scalar transport block (2026-09-27).
+    scalars = None
+    if case_data.get("scalars") is not None:
+        scalars = _parse_scalars(case_data["scalars"], source=str(case_yaml_path))
+        if not any(m.kind == KIND_FLUID for m in materials):
+            raise ValueError(f"{case_yaml_path}: `scalars:` block but no fluid-kind material")
+
     return Case(
         physics=physics,
         numerics=numerics,
@@ -853,6 +1083,7 @@ def load_case(case_yaml_path) -> Case:
         particle_sources=particle_sources,
         case_dir=case_dir,
         rotor=rotor,
+        scalars=scalars,
     )
 
 

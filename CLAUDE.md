@@ -127,9 +127,23 @@ run scripts.
 - **Per-kernel kind table and buffer access matrix** are in
   `experiment/v1/shaders/README.md`.
 - **Spec constants**: ids and ranges are listed in `common.glsl` and mirrored by
-  `_global_spec_entries()` in `simulator_v1.py`; both must be edited together.
-  Free ranges for new constants: 34–39, 48–49, 63–79, 89+ (47 = USE_NEIGHBOR_LIST,
-  62 = MAX_NEIGHBORS, both added 2026-09-25 on the test branch).
+  `_global_spec_entries()` in `simulator_v1.py` (and `_SPEC_CONSTANT_MAPPING` in
+  `utils/sph/case.py`); all must be edited together.
+  Free ranges for new constants: 34–39, 48–49, 72–79, 89+ (47 = USE_NEIGHBOR_LIST,
+  62 = MAX_NEIGHBORS, 63–71 = scalar transport, all added on the test branch).
+- **Scalar transport (test branch, 2026-09-27)**: optional case.yaml block
+  `scalars:` (fields with molecular diffusivity / SGS flag / initial value,
+  optional Smagorinsky `sgs`, tracer `injections`, `probes`). FLUID particles
+  carry the fields (set 0 bindings 11-13, Kahan-compensated), `force.comp`
+  computes a conservative, renormalised SPH Laplacian plus the shift
+  correction, `density.comp` the Smagorinsky ν_t (scalar diffusion only),
+  `predict.comp` applies the increment and the pulses. Set 0 binding 10 is a
+  persistent particle uid carried through defrag. Without the block every path
+  is compiled out; `force.comp` is built twice (`force_scalar.comp.spv` with
+  `-DFORCE_WITH_SCALARS=1`, see `compile_shaders_v1.SOURCE_VARIANTS`) because
+  spec constants alone left a 5 % overhead in the plain kernel. Details, formulas and validation:
+  `log/2026-09-27_scalar-transport.md`; checks
+  `experiment/v1/checks/_check_scalar_box.py`, `_check_scalar_sgs_couette.py`.
 - **Uniform-material simplifications** inherited from V0: `force.comp` uses
   self's mass / viscosity / volume for pair quantities (no multi-phase), no
   micropolar terms, no inlet spawn kernel (rotor motion added on the test branch, see above).

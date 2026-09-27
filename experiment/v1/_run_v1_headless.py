@@ -15,6 +15,9 @@ Options:
     --max-steps N        number of steps to run after bootstrap (default 1000)
     --validation         enable the Vulkan validation layer (slower)
     --dump PATH          save final positions + global status to PATH (.npz)
+                         (plus scalars / particle uid when present)
+    --torque-every N     rotor cases: torque every N steps (--torque-log, --torque-split-*)
+    --probe-every N      scalar cases: probe values + conserved totals every N steps (--probe-log)
 
 Note: the solver is not bit-reproducible run to run (voxel incoming lists are
 filled by atomics), so compare dumps against the run-to-run noise of an
@@ -67,6 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torque-shaft-radius", type=float, default=None, metavar="R",
                         help="per-impeller torque: rotor particles closer than R (m) to the axis "
                              "count as shaft (needs --torque-split-height)")
+    parser.add_argument("--probe-every", type=int, default=0, metavar="N",
+                        help="scalar cases: sample the `scalars.probes` points and the conserved "
+                             "totals every N steps")
+    parser.add_argument("--probe-log", type=str, default=None, metavar="PATH",
+                        help="append the probe samples as CSV (step,time,<probe>:<field>...,"
+                             "total:<field>...)")
     return parser.parse_args()
 
 
@@ -94,49 +103,87 @@ def main() -> None:
         try:
             sim.bootstrap()
             start = time.perf_counter()
-            if args.torque_every > 0:
-                if case.rotor is None:
-                    raise SystemExit("--torque-every needs a case with a rotor")
-                split = args.torque_split_height is not None
-                if split and args.torque_shaft_radius is None:
-                    raise SystemExit("--torque-split-height needs --torque-shaft-radius")
-                log_handle = open(args.torque_log, "a") if args.torque_log else None
-                if log_handle is not None and log_handle.tell() == 0:
-                    log_handle.write("step,time,angle,torque_axis,fx,fy,fz"
+            sampling = args.torque_every > 0 or args.probe_every > 0
+            if args.torque_every > 0 and case.rotor is None:
+                raise SystemExit("--torque-every needs a case with a rotor")
+            if args.probe_every > 0 and (case.scalars is None or case.scalars.probes is None):
+                raise SystemExit("--probe-every needs a case with a `scalars.probes` block")
+            split = args.torque_split_height is not None
+            if split and args.torque_shaft_radius is None:
+                raise SystemExit("--torque-split-height needs --torque-shaft-radius")
+
+            torque_log = None
+            if args.torque_every > 0 and args.torque_log:
+                torque_log = open(args.torque_log, "a")
+                if torque_log.tell() == 0:
+                    torque_log.write("step,time,angle,torque_axis,fx,fy,fz"
                                      + (",torque_lower,torque_upper,torque_shaft" if split else "") + "\n")
-                split_reported = False
-                while sim.step_count < args.max_steps:
-                    sim.step()
-                    if sim.step_count % args.torque_every == 0:
-                        torque = sim.readback_rotor_torque(args.torque_split_height,
-                                                           args.torque_shaft_radius)
-                        if split and not split_reported:
-                            print(f"[v1-headless] torque split: lower={torque['rotor_particle_count_lower']:,} "
-                                  f"upper={torque['rotor_particle_count_upper']:,} "
-                                  f"shaft={torque['rotor_particle_count_shaft']:,} rotor particles")
-                            split_reported = True
-                        fx, fy, fz = torque["force"]
-                        print(f"[v1-headless] step={torque['step']} t={torque['time']:.4f}s "
-                              f"angle={torque['rotor_angle']:.3f}rad "
-                              f"torque_axis={torque['torque_axis']:.6e} N·m "
-                              f"force=({fx:.3e}, {fy:.3e}, {fz:.3e}) N")
-                        if log_handle is not None:
-                            line = (f"{torque['step']},{torque['time']:.6e},{torque['rotor_angle']:.6e},"
-                                    f"{torque['torque_axis']:.6e},{fx:.6e},{fy:.6e},{fz:.6e}")
-                            if split:
-                                line += (f",{torque['torque_axis_lower']:.6e},{torque['torque_axis_upper']:.6e},"
-                                         f"{torque['torque_axis_shaft']:.6e}")
-                            log_handle.write(line + "\n")
-                            log_handle.flush()
-                if log_handle is not None:
-                    log_handle.close()
-            else:
+            probe_log = None
+            if args.probe_every > 0:
+                probe_names = [point.name for point in case.scalars.probes.points]
+                probe_points = [point.position for point in case.scalars.probes.points]
+                field_names = case.scalars.field_names
+                if args.probe_log:
+                    probe_log = open(args.probe_log, "a")
+                    if probe_log.tell() == 0:
+                        columns = ["step", "time"]
+                        columns += [f"{p}:{f}" for p in probe_names for f in field_names]
+                        columns += [f"total:{f}" for f in field_names]
+                        probe_log.write(",".join(columns) + "\n")
+
+            split_reported = False
+            while sampling and sim.step_count < args.max_steps:
+                sim.step()
+                if args.torque_every > 0 and sim.step_count % args.torque_every == 0:
+                    torque = sim.readback_rotor_torque(args.torque_split_height,
+                                                       args.torque_shaft_radius)
+                    if split and not split_reported:
+                        print(f"[v1-headless] torque split: lower={torque['rotor_particle_count_lower']:,} "
+                              f"upper={torque['rotor_particle_count_upper']:,} "
+                              f"shaft={torque['rotor_particle_count_shaft']:,} rotor particles")
+                        split_reported = True
+                    fx, fy, fz = torque["force"]
+                    print(f"[v1-headless] step={torque['step']} t={torque['time']:.4f}s "
+                          f"angle={torque['rotor_angle']:.3f}rad "
+                          f"torque_axis={torque['torque_axis']:.6e} N·m "
+                          f"force=({fx:.3e}, {fy:.3e}, {fz:.3e}) N")
+                    if torque_log is not None:
+                        line = (f"{torque['step']},{torque['time']:.6e},{torque['rotor_angle']:.6e},"
+                                f"{torque['torque_axis']:.6e},{fx:.6e},{fy:.6e},{fz:.6e}")
+                        if split:
+                            line += (f",{torque['torque_axis_lower']:.6e},{torque['torque_axis_upper']:.6e},"
+                                     f"{torque['torque_axis_shaft']:.6e}")
+                        torque_log.write(line + "\n")
+                        torque_log.flush()
+                if args.probe_every > 0 and sim.step_count % args.probe_every == 0:
+                    snapshot = sim.scalar_snapshot()
+                    values = sim.probe_scalars(probe_points, snapshot=snapshot)
+                    totals = sim.scalar_totals(snapshot)
+                    print(f"[v1-headless] step={sim.step_count} t={sim.simulation_time:.4f}s probes="
+                          + " ".join(f"{name}:{values[p, 0]:.4e}" for p, name in enumerate(probe_names))
+                          + f" total:{field_names[0]}={totals[0]:.6e}")
+                    if probe_log is not None:
+                        row = [f"{sim.step_count}", f"{sim.simulation_time:.6e}"]
+                        row += [f"{values[p, k]:.6e}" for p in range(len(probe_names))
+                                for k in range(len(field_names))]
+                        row += [f"{total:.9e}" for total in totals]
+                        probe_log.write(",".join(row) + "\n")
+                        probe_log.flush()
+            for handle in (torque_log, probe_log):
+                if handle is not None:
+                    handle.close()
+            if not sampling:
                 sim.run_until(max_steps=args.max_steps)
             elapsed = time.perf_counter() - start
             status = sim.readback_global_status()
             positions = sim.readback_positions() if args.dump else None
             material = sim.readback_material() if args.dump else None
             velocity_mass = sim.readback_velocity_mass() if args.dump else None
+            scalars = sim.readback_scalars() if args.dump and case.scalar_vec4_count > 0 else None
+            particle_uid = sim.readback_particle_uid() if args.dump else None
+            turbulent_viscosity = (sim.readback_turbulent_viscosity()
+                                   if args.dump and case.scalars is not None and case.scalars.sgs.enabled
+                                   else None)
         finally:
             sim.destroy()
 
@@ -157,8 +204,14 @@ def main() -> None:
               file=sys.stderr)
 
     if args.dump:
+        extra = {}
+        if scalars is not None:
+            extra["scalars"] = scalars
+            extra["scalar_names"] = np.array(case.scalars.field_names)
+        if turbulent_viscosity is not None:
+            extra["turbulent_viscosity"] = turbulent_viscosity
         np.savez(args.dump, positions=positions, material=material, velocity_mass=velocity_mass,
-                 status=json.dumps(status))
+                 particle_uid=particle_uid, status=json.dumps(status), **extra)
         print(f"[v1-headless] dumped positions + status to {args.dump}")
 
 

@@ -3,6 +3,16 @@
 #include "common.glsl"
 #include "helpers.glsl"
 
+// Scalar transport build switch (2026-09-27). compile_shaders_v1.py builds this
+// file twice: force.comp.spv (FORCE_WITH_SCALARS = 0, the scalar code below is
+// compiled out and the kernel is identical to the pre-scalar one) and
+// force_scalar.comp.spv (-DFORCE_WITH_SCALARS=1). SphSimulatorV1 uses the latter
+// only for cases with a `scalars:` block. Inside the scalar build the spec
+// constants (SCALAR_VEC4_COUNT, USE_SCALAR_*) still select the variants.
+#ifndef FORCE_WITH_SCALARS
+#define FORCE_WITH_SCALARS 0
+#endif
+
 // ============================================================================
 // force.comp - δ-plus WCSPH acceleration + particle shifting (stage 5).
 //
@@ -25,6 +35,47 @@
 // Outputs:
 //   acceleration[pid] = a_pressure + a_viscosity + gravity
 //   shift[pid]        = k · shift_main + (1-k) · shift_anti   where k = kernel_sum^4
+//   scalar_delta[pid] = dt · (dC/dt)_diffusion + shift · ∇C     (FLUID, scalars on)
+//
+// Scalar transport (2026-09-27), FLUID self and FLUID neighbours only
+// (solids carry no scalar; excluding them makes the walls zero-flux):
+//   (dC/dt)_i = Σ_j  2 m_j (D_i + D_j) / (ρ_i + ρ_j)
+//                    · λ_ij (C_i - C_j) (x_ij · ∇W_ij) / (r² + η²)
+//   λ_ij = (d / tr M_i + d / tr M_j) / 2,   tr M = Σ_j V_j (x_j - x_i)·∇W_ij
+//     Brookshaw / Morris form of (1/ρ) ∇·(ρ D ∇C) with the arithmetic pair
+//     mean of D (as in Morris et al. 1997 for the viscosity; the harmonic
+//     mean of Cleary & Monaghan 1999 is only needed at jumps of D, and solids
+//     are excluded explicitly here) and the pair volume 2 m_j / (ρ_i + ρ_j),
+//     raw ∇W, plus two corrections
+//     (d / tr M and the FLUID flag are precomputed by correction.comp):
+//     * λ_ij renormalises the operator. On a lattice with isotropic M
+//       (M = (tr M / d) I) it makes the Laplacian exact for every quadratic
+//       field (trace identity -Σ_j V_j x_ij·M⁻¹∇W_ij = d). Without it the raw
+//       operator over-diffuses by 15.3 % on the h/dx = 3 simple cubic lattice
+//       with the calibrated particle volume; using the stored KCG inverse
+//       instead would under-diffuse by 7.6 %, because correction.comp inverts
+//       M + ξ I with ξ = 0.1 against tr M / 3 ≈ 1.21 (both measured and
+//       computed 2026-09-27, log/2026-09-27_scalar-transport.md). tr M is the
+//       unregularized trace that correction.comp stores for this purpose.
+//     * η² = 0.01 dx² instead of EPS_H_SQUARED = 0.01 h² (h = support radius =
+//       3 dx): the latter removes 8 % of each nearest-neighbour term and ~5 %
+//       of the Laplacian; η only has to keep coincident particles finite.
+//     The pair factor 2 m_i m_j (D_i + D_j) / (ρ_i + ρ_j), λ_ij and
+//     x_ij·∇W_ij are all symmetric in (i, j), so the pair contributions to
+//     Σ_i m_i C_i cancel exactly: every scalar is conserved to round-off. For
+//     D_i = D_j and λ = 1 it reduces to Σ_j V_j 2D (C_i - C_j) x_ij·∇W_ij / r²,
+//     the standard SPH Laplacian (x_ij·∇W_ij < 0, so a local maximum decays).
+//     D = D_m + w · ν_t / Sc_t per field (D_m, w from ScalarParametersBuffer,
+//     ν_t from density.comp this step when USE_SCALAR_SGS).
+//   ∇C_i = Σ_j V_j (C_j - C_i) M_i⁻¹ ∇W_ij   with the UNREGULARIZED M_i⁻¹
+//     (unregularized_correction_inverse), first-order consistent.
+//   Bounds limiter (USE_SCALAR_BOUNDS_LIMITER, only together with the shift
+//     correction): ΔC_i is clipped so that C_i + ΔC_i stays in [min, max] of C
+//     over self and FLUID neighbours. The diffusion alone is monotone and needs
+//     no limiter; the shift correction is an unlimited Taylor interpolation.
+//     used only for the shift correction C += shift · ∇C (the δ-plus shift
+//     moves the particle away from its material path; interpolating the
+//     field to the new position keeps the shift from transporting scalar).
 //
 // V0 simplification: particles share globally uniform viscosity / radius /
 // mass / volume. All pair-averaged quantities (ν_ij, Δx, V_ij, volume_ij)
@@ -113,6 +164,52 @@ void main() {
 
     // --- Decode self voxel coord ---------------------------------------------
     ivec3 self_voxel_coord = own_coord_of(self_voxel_id);
+
+#if FORCE_WITH_SCALARS
+    // --- Scalar transport: self state (2026-09-27) ---------------------------
+    // Only FLUID particles carry scalars. The register arrays have
+    // MAX_SCALAR_VEC4 entries; every loop below runs to SCALAR_VEC4_COUNT, a
+    // spec constant, so the driver unrolls them and drops unused entries.
+    bool do_scalar = (SCALAR_VEC4_COUNT > 0u) && (self_params.kind == MATERIAL_FLUID);
+    bool do_scalar_gradient = do_scalar && USE_PST && USE_SCALAR_SHIFT_CORRECTION;
+    float self_turbulent_viscosity = 0.0;
+    if (USE_SCALAR_SGS && do_scalar) {
+        self_turbulent_viscosity = turbulent_viscosity[self_particle_id];
+    }
+    // η² of the scalar Laplacian = 0.01 dx², and the self half of λ_ij
+    // (see the header). Guarded for a particle without neighbours.
+    float scalar_laplacian_eps_squared = 0.04 * self_params.radius * self_params.radius;
+    float self_inverse_trace = do_scalar
+        ? scalar_normalisation_and_fluid_flag(self_particle_id).x : 1.0;   // d / tr M_i
+    // Unregularized KCG inverse for ∇C (shift correction only).
+    mat3 scalar_gradient_matrix = mat3(1.0);
+    if (do_scalar_gradient && USE_KCG_CORRECTION) {
+        scalar_gradient_matrix = unregularized_correction_inverse(self_correction_matrix);
+    }
+    vec4 self_scalar[MAX_SCALAR_VEC4];
+    vec4 self_diffusivity[MAX_SCALAR_VEC4];
+    vec4 scalar_rate[MAX_SCALAR_VEC4];          // (dC/dt)_diffusion
+    vec4 scalar_gradient_x[MAX_SCALAR_VEC4];    // ∇C, one vec4 per axis
+    vec4 scalar_gradient_y[MAX_SCALAR_VEC4];
+    vec4 scalar_gradient_z[MAX_SCALAR_VEC4];
+    vec4 scalar_minimum[MAX_SCALAR_VEC4];       // bounds limiter: range of C over
+    vec4 scalar_maximum[MAX_SCALAR_VEC4];       // self + FLUID neighbours
+    for (uint vec4_index = 0u; vec4_index < SCALAR_VEC4_COUNT; vec4_index++) {
+        self_scalar[vec4_index]       = do_scalar
+            ? scalar[scalar_index(self_particle_id, vec4_index)] * scalar_component_mask(vec4_index)
+            : vec4(0.0);
+        self_diffusivity[vec4_index]  = scalar_parameters[2u * vec4_index]
+                             + scalar_parameters[2u * vec4_index + 1u]
+                               * (self_turbulent_viscosity * INVERSE_TURBULENT_SCHMIDT);
+        scalar_rate[vec4_index]       = vec4(0.0);
+        scalar_gradient_x[vec4_index] = vec4(0.0);
+        scalar_gradient_y[vec4_index] = vec4(0.0);
+        scalar_gradient_z[vec4_index] = vec4(0.0);
+        scalar_minimum[vec4_index] = self_scalar[vec4_index];
+        scalar_maximum[vec4_index] = self_scalar[vec4_index];
+    }
+
+#endif
 
     // --- Accumulators --------------------------------------------------------
     vec3 a_pressure          = vec3(0.0);
@@ -278,6 +375,56 @@ void main() {
                 particle_shift_anti +=
                     pst_base_factor * anti_scalar * kernel_gradient_corrected * volume_ij_uniform;
             }
+
+#if FORCE_WITH_SCALARS
+            // ==== Scalar transport (2026-09-27) ======================
+            // FLUID self; FLUID neighbours contribute, solid ones do not (see the
+            // header for the formulas). Branch-free over the neighbour kind: all
+            // loads are issued unconditionally so that the scalar loads overlap
+            // with the flag load (a dependent branch serialised them and cost
+            // ~25 % of force's time), and a solid neighbour, whose scalar is 0
+            // and flag 0, is removed by fluid_weight.
+            if (do_scalar) {
+                vec2  neighbor_normalisation_and_flag = scalar_normalisation_and_fluid_flag(neighbor_particle_id);
+                float fluid_weight  = neighbor_normalisation_and_flag.y;          // 1 FLUID, 0 solid
+                float neighbor_mass = velocity_mass[neighbor_particle_id].w;
+                float neighbor_turbulent_viscosity =
+                    USE_SCALAR_SGS ? turbulent_viscosity[neighbor_particle_id] : 0.0;
+                // One division per pair:
+                //   2 m_j / (ρ_i + ρ_j) · λ_ij · x_ij·∇W_ij / (r² + η²),
+                //   λ_ij = (d / tr M_i + d / tr M_j) / 2   (symmetric in i, j)
+                float pair_normalisation = 0.5 * (self_inverse_trace + neighbor_normalisation_and_flag.x);
+                float laplacian_factor = fluid_weight * 2.0 * neighbor_mass * pair_normalisation
+                    * dot(position_difference_neighbor_to_self, kernel_gradient_raw)
+                    / ((self_density + neighbor_density)
+                       * (distance * distance + scalar_laplacian_eps_squared));
+                float gradient_weight = -fluid_weight * neighbor_volume_dynamic;
+                for (uint vec4_index = 0u; vec4_index < SCALAR_VEC4_COUNT; vec4_index++) {
+                    vec4 neighbor_scalar = scalar[scalar_index(neighbor_particle_id, vec4_index)]
+                                         * scalar_component_mask(vec4_index);
+                    vec4 neighbor_diffusivity = scalar_parameters[2u * vec4_index]
+                        + scalar_parameters[2u * vec4_index + 1u]
+                          * (neighbor_turbulent_viscosity * INVERSE_TURBULENT_SCHMIDT);
+                    vec4 pair_diffusivity = self_diffusivity[vec4_index] + neighbor_diffusivity;   // D_i + D_j
+                    vec4 scalar_difference = self_scalar[vec4_index] - neighbor_scalar;          // C_i - C_j
+                    scalar_rate[vec4_index] += (laplacian_factor * pair_diffusivity) * scalar_difference;
+                    if (do_scalar_gradient) {
+                        // ∇C_i += V_j (C_j - C_i) ∇W_ij; the unregularized M_i⁻¹
+                        // is applied once after the loop (linear, so equivalent).
+                        vec4 weighted = gradient_weight * scalar_difference;
+                        scalar_gradient_x[vec4_index] += weighted * kernel_gradient_raw.x;
+                        scalar_gradient_y[vec4_index] += weighted * kernel_gradient_raw.y;
+                        scalar_gradient_z[vec4_index] += weighted * kernel_gradient_raw.z;
+                        if (USE_SCALAR_BOUNDS_LIMITER) {
+                            // a solid neighbour contributes the self value, i.e. nothing
+                            vec4 bounds_candidate = mix(self_scalar[vec4_index], neighbor_scalar, fluid_weight);
+                            scalar_minimum[vec4_index] = min(scalar_minimum[vec4_index], bounds_candidate);
+                            scalar_maximum[vec4_index] = max(scalar_maximum[vec4_index], bounds_candidate);
+                        }
+                    }
+                }
+            }
+#endif
         }
     }
 
@@ -314,4 +461,36 @@ void main() {
     // ========================================================================
     acceleration[self_particle_id] = vec4(total_acceleration, vorticity_z);
     shift[self_particle_id]        = vec4(particle_shift, 0.0);
+
+#if FORCE_WITH_SCALARS
+    // ========================================================================
+    // Scalar increment for the next predict.comp (2026-09-27):
+    //     ΔC = dt · (dC/dt)_diffusion  +  shift · ∇C
+    // The shift term uses the same shift that predict adds to the position,
+    // so the scalar is interpolated to where the particle is moved.
+    // ========================================================================
+    if (do_scalar) {
+        for (uint vec4_index = 0u; vec4_index < SCALAR_VEC4_COUNT; vec4_index++) {
+            vec4 delta = TIMESTEP * scalar_rate[vec4_index];
+            if (do_scalar_gradient) {
+                // shift · ∇C = shift · (M⁻¹ g) = (M⁻¹ shift) · g for symmetric M⁻¹,
+                // g = Σ_j V_j (C_j - C_i) ∇W_ij (raw) accumulated above.
+                vec3 corrected_shift = scalar_gradient_matrix * particle_shift;
+                delta += corrected_shift.x * scalar_gradient_x[vec4_index]
+                       + corrected_shift.y * scalar_gradient_y[vec4_index]
+                       + corrected_shift.z * scalar_gradient_z[vec4_index];
+            }
+            if (USE_SCALAR_BOUNDS_LIMITER && do_scalar_gradient) {
+                // Keep C_i + ΔC_i inside [min, max] of self + FLUID neighbours.
+                // Clamp the increment itself: forming C_i + ΔC_i first would round
+                // away increments below half an ulp of C_i and defeat the Kahan sum
+                // (found 2026-09-27 with T4).
+                delta = clamp(delta,
+                              scalar_minimum[vec4_index] - self_scalar[vec4_index],
+                              scalar_maximum[vec4_index] - self_scalar[vec4_index]);
+            }
+            scalar_delta[scalar_index(self_particle_id, vec4_index)] = delta;
+        }
+    }
+#endif
 }

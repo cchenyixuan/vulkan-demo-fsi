@@ -94,6 +94,15 @@ PROBE_HALF = 0.0075
 PROBE_Y = (0.406, 0.456)
 PROBE_CENTERS = ((-0.127, -0.018), (0.053, -0.118))
 
+# Measurement and tracer-injection points of Rautenbach et al. (2026), Table 1
+# (same frame as the dataset STL: y up, origin on the axis at y = 0). The
+# measurement points sit 4.5 mm below the probe rods above. Injection volume in
+# the experiments: 5 mL, i.e. a sphere of radius (3 * 5e-6 / (4 pi))^(1/3).
+PROBE_POINTS = (("probe_1", (-0.1270, 0.4015, -0.0180)),
+                ("probe_2", ( 0.0530, 0.4015, -0.1180)))
+INJECTION_POINT = (0.0, 0.4055, 0.1164)
+INJECTION_RADIUS = (3.0 * 5.0e-6 / (4.0 * math.pi)) ** (1.0 / 3.0)   # 0.0106 m
+
 IMPELLER_RPM = 200.0                      # M-Star: -200 rpm about +y = CCW seen from above (see comment in CASE_YAML)
 TIP_SPEED = math.pi * 2 * 0.0491 * IMPELLER_RPM / 60.0
 
@@ -371,6 +380,29 @@ def write_preview(path, fluid, wall, rotor, dx):
     plt.close(fig)
 
 
+def scalars_block(args, h) -> str:
+    """`scalars:` block for the mixing-time runs (2026-09-27): one tracer field
+    per pulse (so the pulses do not contaminate each other's t95), injection at
+    the paper's point, the two measurement points as probes (Shepard radius = h)."""
+    lines = ["", "# Scalar transport (2026-09-27): tracer pulses at the injection point of",
+             "# Rautenbach et al. (2026) Table 1, probes at its two measurement points.",
+             "scalars:", "  fields:"]
+    for index in range(args.tracers):
+        lines.append(f"    - {{name: tracer_{index + 1:02d}, diffusivity: {args.tracer_diffusivity:.3e}, "
+                     f"turbulent: true, initial: 0.0}}")
+    lines += ["  sgs:", f"    enabled: {'true' if args.sgs else 'false'}", "    smagorinsky_cs: 0.1",
+              "    turbulent_schmidt: 0.7", "  injections:"]
+    for index in range(args.tracers):
+        start = args.injection_start + index * args.injection_interval
+        lines.append(f"    - {{field: tracer_{index + 1:02d}, center: [{INJECTION_POINT[0]}, {INJECTION_POINT[1]}, "
+                     f"{INJECTION_POINT[2]}], radius: {args.injection_radius:.4f}, start: {start:.4f}, "
+                     f"duration: {args.injection_duration:.4f}, value: 1.0}}")
+    lines += ["  probes:", f"    radius: {h:.6f}", "    points:"]
+    for name, (x, y, z) in PROBE_POINTS:
+        lines.append(f"      - {{name: {name}, position: [{x}, {y}, {z}]}}")
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dx", type=float, default=0.003, help="particle spacing (m)")
@@ -387,6 +419,20 @@ def main() -> int:
     parser.add_argument("--impellers", choices=("both", "rushton", "pbt"), default="both",
                         help="keep both impellers (default) or only one of them on the full shaft "
                              "(single-impeller control runs)")
+    parser.add_argument("--tracers", type=int, default=0,
+                        help="scalar transport: number of tracer fields, one pulse each (0 = no "
+                             "`scalars:` block; the paper used 10 pulses 1 s apart from t = 25 s)")
+    parser.add_argument("--injection-start", type=float, default=25.0,
+                        help="start of the first tracer pulse (s)")
+    parser.add_argument("--injection-interval", type=float, default=1.0,
+                        help="time between the starts of consecutive pulses (s)")
+    parser.add_argument("--injection-duration", type=float, default=1.0, help="pulse length (s)")
+    parser.add_argument("--injection-radius", type=float, default=INJECTION_RADIUS,
+                        help="radius of the injection sphere (m), default = 5 mL sphere")
+    parser.add_argument("--tracer-diffusivity", type=float, default=1.0e-9,
+                        help="molecular diffusivity of the tracers (m^2/s)")
+    parser.add_argument("--sgs", action="store_true",
+                        help="enable the Smagorinsky sub-grid diffusivity for the tracers")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
@@ -455,6 +501,11 @@ def main() -> int:
         pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming,
         ramp_time=args.ramp_time, gravity_y=-abs(args.gravity)), encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega), encoding="utf-8")
+    if args.tracers > 0:
+        with open(out / "case.yaml", "a", encoding="utf-8") as handle:
+            handle.write(scalars_block(args, h))
+        print(f"scalars: {args.tracers} tracer(s), pulses from t = {args.injection_start} s every "
+              f"{args.injection_interval} s, radius {args.injection_radius:.4f} m, sgs={'on' if args.sgs else 'off'}")
     print(f"wrote fluid.obj wall.obj rotor.obj frame.obj case.yaml materials.yaml -> {out}")
     if not args.no_preview:
         write_preview(out / "split_preview.png", fluid, wall, rotor, dx)

@@ -155,6 +155,24 @@ void main() {
     //
     // In 3D, apply Tikhonov to all three diagonals.
     // ========================================================================
+    // Scalar transport (2026-09-27), stored in the free slots of
+    // correction_inverse[2 pid + 1] and used only by force.comp's scalar terms:
+    //   .z = d / tr(M) of the UNREGULARIZED matrix, tr(M) = Σ_j V_j (x_j - x_i)·∇W_ij
+    //        (the Laplacian normalisation must not inherit the Tikhonov shift
+    //        below; 1 for a particle without neighbours)
+    //   .w = 1 for FLUID, 0 otherwise (lets force skip solid neighbours with
+    //        the load it already makes, instead of material[] + material_parameters[])
+    // Not used by any momentum term.
+    float correction_matrix_trace = correction_matrix[0][0] + correction_matrix[1][1]
+        + ((DIMENSION == 3u) ? correction_matrix[2][2] : 0.0);
+    float scalar_laplacian_normalisation =
+        (correction_matrix_trace > 1e-6) ? float(DIMENSION) / correction_matrix_trace : 1.0;
+    float scalar_fluid_flag = 0.0;
+    if (SCALAR_VEC4_COUNT > 0u) {
+        scalar_fluid_flag =
+            (material_parameters[material[self_particle_id]].kind == MATERIAL_FLUID) ? 1.0 : 0.0;
+    }
+
     correction_matrix[0][0] += REGULARIZATION_XI;
     correction_matrix[1][1] += REGULARIZATION_XI;
 
@@ -209,8 +227,8 @@ void main() {
     correction_inverse[self_particle_id * 2u + 1u] = vec4(
         correction_matrix_inverse[0][2],
         correction_matrix_inverse[1][2],
-        0.0,
-        0.0);
+        scalar_laplacian_normalisation,   // d / tr(M), unregularized (2026-09-27)
+        scalar_fluid_flag);               // 1 = FLUID (2026-09-27, scalars only)
 
     density_gradient_kernel_sum[self_particle_id] = vec4(density_gradient, kernel_sum);
 }
