@@ -80,6 +80,21 @@ def tau95(time, value, start, final_value=None, band=BAND, stable_samples=STABLE
     return float("nan")
 
 
+def probe_response(time, value, response_time):
+    """First-order sensor lag with time constant `response_time` (s), exact
+    exponential update per sample; returns the input when response_time <= 0.
+    The experiment's conductivity probes have a response time of about 1 s
+    (paper, section 3.1); the M-Star signals of the dataset are unfiltered."""
+    if response_time <= 0.0:
+        return value
+    filtered = np.empty_like(value)
+    filtered[0] = value[0]
+    for index in range(1, len(value)):
+        weight = 1.0 - math.exp(-(time[index] - time[index - 1]) / response_time)
+        filtered[index] = filtered[index - 1] + weight * (value[index] - filtered[index - 1])
+    return filtered
+
+
 def longest(values):
     """The dataset's per-pulse tau95: the larger of the defined probe values."""
     defined = [value for value in values if np.isfinite(value)]
@@ -164,6 +179,8 @@ def analyze_run(arguments):
         exact_final = total[-1] / fluid_mass[-1]
         per_probe = [tau95(time, log[f"{probe}:{field}"], start) for probe in PROBE_NAMES]
         per_probe_exact = [tau95(time, log[f"{probe}:{field}"], start, exact_final) for probe in PROBE_NAMES]
+        per_probe_filtered = [tau95(time, probe_response(time, log[f"{probe}:{field}"], arguments.probe_response_time), start)
+                              for probe in PROBE_NAMES]
         mixed = log.get(f"mixed5:{field}")
         global_tau = float("nan")
         if mixed is not None:
@@ -179,7 +196,8 @@ def analyze_run(arguments):
         rows.append({"field": field, "start": start, "tau95_probe_1": per_probe[0], "tau95_probe_2": per_probe[1],
                      "tau95": longest(per_probe), "tau95_exact_probe_1": per_probe_exact[0],
                      "tau95_exact_probe_2": per_probe_exact[1], "tau95_exact": longest(per_probe_exact),
-                     "global_tau95": global_tau, "final_cov": float(log[f"cov:{field}"][-1]) if f"cov:{field}" in log else float("nan"),
+                     "global_tau95": global_tau, "tau95_filtered": longest(per_probe_filtered),
+                     "tau95_filtered_probe_1": per_probe_filtered[0], "tau95_filtered_probe_2": per_probe_filtered[1], "final_cov": float(log[f"cov:{field}"][-1]) if f"cov:{field}" in log else float("nan"),
                      "record_after_start": float(time[-1] - start), "total_drift_after_pulse": drift,
                      "last_over_exact_probe_1": float(log[f"probe_1:{field}"][-1] / exact_final) if exact_final > 0 else float("nan"),
                      "last_over_exact_probe_2": float(log[f"probe_2:{field}"][-1] / exact_final) if exact_final > 0 else float("nan")})
@@ -195,10 +213,18 @@ def analyze_run(arguments):
     stats = summary([row["tau95"] for row in rows])
     stats_exact = summary([row["tau95_exact"] for row in rows])
     stats_global = summary([row["global_tau95"] for row in rows])
+    stats_filtered = summary([row["tau95_filtered"] for row in rows])
+    stats_probe = {probe: summary([row[f"tau95_{probe}"] for row in rows]) for probe in PROBE_NAMES}
     print(f"  tau95 (dataset rule, longest probe): mean {stats['mean']:.2f} s, std {stats['std']:.2f} s, "
           f"n = {stats['count']}, range {stats['min']:.2f} .. {stats['max']:.2f} s")
     print(f"  tau95 (exact C_inf):                 mean {stats_exact['mean']:.2f} s, std {stats_exact['std']:.2f} s, n = {stats_exact['count']}")
     print(f"  global tau95 (95 % of mass within 5 %): mean {stats_global['mean']:.2f} s, n = {stats_global['count']}")
+    for probe in PROBE_NAMES:
+        print(f"  tau95 {probe} alone: mean {stats_probe[probe]['mean']:.2f} s, std {stats_probe[probe]['std']:.2f} s, "
+              f"n = {stats_probe[probe]['count']}")
+    if arguments.probe_response_time > 0.0:
+        print(f"  tau95 with a {arguments.probe_response_time:g} s first-order probe response (longest): mean "
+              f"{stats_filtered['mean']:.2f} s, std {stats_filtered['std']:.2f} s, n = {stats_filtered['count']}")
     for name, mean, std, count, minimum, maximum in REFERENCE_TAU95:
         print(f"  reference {name:26s} {mean:6.2f} +- {std:4.2f} s (n = {count}, {minimum:.1f} .. {maximum:.1f} s)")
 
@@ -227,6 +253,8 @@ def analyze_run(arguments):
 
     result = {"label": label, "probe_log": str(arguments.probe_log), "case": str(arguments.case), "pulses": rows,
               "tau95": stats, "tau95_exact": stats_exact, "global_tau95": stats_global, "mean_speed": speed,
+              "tau95_per_probe": stats_probe, "tau95_filtered": stats_filtered,
+              "probe_response_time": arguments.probe_response_time,
               "power": power, "reference": [dict(zip(("label", "mean", "std", "count", "min", "max"), entry))
                                             for entry in REFERENCE_TAU95]}
     (out_dir / f"{label}_mixing.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
@@ -384,6 +412,9 @@ def main():
     parser.add_argument("--slice-field", default="tracer_01")
     parser.add_argument("--out-dir", default="output/mixing")
     parser.add_argument("--label", default=None)
+    parser.add_argument("--probe-response-time", type=float, default=0.0,
+                        help="also report tau95 of probe signals passed through a first-order lag with this "
+                             "time constant (s); the experiment's probes respond in about 1 s")
     parser.add_argument("--mstar", nargs=2, metavar=("PROBE_1", "PROBE_2"),
                         help="analyse one M-Star trial of the dataset instead of our run")
     arguments = parser.parse_args()
