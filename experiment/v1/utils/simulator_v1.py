@@ -1411,7 +1411,17 @@ class SphSimulatorV1:
         particle i is therefore f_i = m_i (a_i - g); the rigid body's force is
         F = sum_i f_i and its torque about the rotor axis is
             tau = axis . sum_i (x_i - pivot) x f_i.
-        Rotor-rotor pair forces are antisymmetric and cancel in both sums.
+        The acceleration includes the pairs with OTHER rotor particles, and
+        those rotor-rotor pair forces do NOT cancel (corrected 2026-09-27;
+        the earlier docstring claimed they do): the pair force uses the SELF
+        particle's KCG matrix only, and TIC switches every rotor particle with
+        P <= 0 (not near a free surface) to the antisymmetric form P_j - P_i.
+        In the 30 L tank about half of the rotor particles take that branch;
+        the rotor-rotor share is then 35-44 % of the torque, offset by an
+        opposite TIC share in the rotor-fluid pairs, and the total is 4.2-4.9 %
+        above an action = reaction evaluation (pair-mean matrix, P_i + P_j) of
+        the same state. See experiment/v1/checks/_check_rotor_torque_split.py
+        and log/2026-09-27_rotor-torque-pair-forces.md.
         Returns force (3,), torque (3,), torque_axis (scalar), the rotor
         particle count, the rotor angle, time and step.
 
