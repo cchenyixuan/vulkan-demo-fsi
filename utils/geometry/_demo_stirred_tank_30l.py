@@ -53,7 +53,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from utils.geometry import LATTICE_GRID, tile_bounding_box          # noqa: E402
-from utils.geometry.region import Region, Box, Cylinder, Union      # noqa: E402
+from utils.geometry.region import Region, Box, Cylinder, Union, Intersection      # noqa: E402
 
 # ----------------------------------------------------------------------------
 # Measured dimensions (m)
@@ -89,6 +89,16 @@ RUSHTON_BLADE = dict(radial=(0.024, 0.048), y0=0.0288, y1=0.048, thickness=2.2e-
 PBT_HUB = dict(radius=0.0109, y0=0.180, y1=0.2093)
 PBT_BLADE = dict(radial=(0.0122, 0.0491), chord=0.0273, thickness=2.5e-3,
                  center_y=0.19465, pitch_deg=45.0, azimuth0_deg=24.3)
+
+# Blade tips measured on the dataset's 'Moving Body_1.stl' (2026-09-28): both blades end in a
+# straight cut. Rushton: cut at 48.0 mm from the axis, corners at 48.0 mm. PBT: cut at about
+# 48.2 mm along the blade centre line, its corners (the blade is 19 mm wide seen from above)
+# at the largest radius 49.1 mm. PBT_BLADE["radial"][1] = 49.1 mm is that largest radius, so
+# the box-shaped model blade is 0.9 mm too long and its corners reach 50.0 mm (50.7 mm when
+# thickened to 9 mm). --clip-tips uses the true length and cuts the blades at the true radius.
+RUSHTON_TIP_RADIUS = 0.0480
+PBT_TIP_RADIUS = 0.0491
+PBT_TRUE_LENGTH = 0.0482
 
 PROBE_HALF = 0.0075
 PROBE_Y = (0.406, 0.456)
@@ -206,7 +216,7 @@ def pitched_blade(azimuth_deg, r0, r1, chord, thickness, center_y, pitch_deg):
                        [0.5 * (r1 - r0), 0.5 * chord, 0.5 * thickness])
 
 
-def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both"):
+def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False):
     """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
     ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
     and the disk for the Rushton) are kept on the full-length shaft; used for
@@ -229,13 +239,20 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both"):
         rotor_parts.append(y_cylinder(PBT_HUB["radius"], PBT_HUB["y0"], PBT_HUB["y1"]))
     for k in range(6):
         if keep_rushton:
-            rotor_parts.append(radial_slab(RUSHTON_BLADE["azimuth0_deg"] + 60 * k,
-                                           *RUSHTON_BLADE["radial"], RUSHTON_BLADE["y0"],
-                                           RUSHTON_BLADE["y1"], t_rblade))
+            blade = radial_slab(RUSHTON_BLADE["azimuth0_deg"] + 60 * k,
+                                *RUSHTON_BLADE["radial"], RUSHTON_BLADE["y0"],
+                                RUSHTON_BLADE["y1"], t_rblade)
+            if clip_tips:
+                blade = Intersection(blade, y_cylinder(RUSHTON_TIP_RADIUS, shaft_y0, shaft_y1))
+            rotor_parts.append(blade)
         if keep_pbt:
-            rotor_parts.append(pitched_blade(PBT_BLADE["azimuth0_deg"] + 60 * k,
-                                             *PBT_BLADE["radial"], PBT_BLADE["chord"], t_pblade,
-                                             PBT_BLADE["center_y"], PBT_BLADE["pitch_deg"]))
+            outer = PBT_TRUE_LENGTH if clip_tips else PBT_BLADE["radial"][1]
+            blade = pitched_blade(PBT_BLADE["azimuth0_deg"] + 60 * k,
+                                  PBT_BLADE["radial"][0], outer, PBT_BLADE["chord"], t_pblade,
+                                  PBT_BLADE["center_y"], PBT_BLADE["pitch_deg"])
+            if clip_tips:
+                blade = Intersection(blade, y_cylinder(PBT_TIP_RADIUS, shaft_y0, shaft_y1))
+            rotor_parts.append(blade)
     wall_parts = [y_cylinder(BEARING_BOSS["radius"], FLOOR_BOTTOM - 0.02, BEARING_BOSS["y1"])]
     for az in BAFFLE_AZIMUTHS_DEG:
         wall_parts.append(radial_slab(az, *BAFFLE_RADIAL, BAFFLE_Y0, top_y, t_baffle))
@@ -412,6 +429,9 @@ def main() -> int:
     parser.add_argument("--dx", type=float, default=0.003, help="particle spacing (m)")
     parser.add_argument("--hdx", type=float, default=3.0, help="h/dx (kernel support radius in spacings; non-integer allowed, e.g. 2.5)")
     parser.add_argument("--thin-layers", type=int, default=3, help="minimum layers across thin solids")
+    parser.add_argument("--clip-tips", action="store_true",
+                        help="blades with the true PBT length (48.2 mm) and cut at the true tip radius "
+                             "(Rushton 48.0 mm, PBT 49.1 mm) instead of the plain boxes")
     parser.add_argument("--skin", type=float, default=0.5,
                         help="rotor / baffle / probe sites are claimed up to this many spacings outside "
                              "the solid surface (default 0.5; 0 = site centre inside the solid)")
@@ -460,7 +480,8 @@ def main() -> int:
     print(f"dx={dx:.4e} h={h:.4e} (h/dx={args.hdx}) border={border} thin>={args.thin_layers} layers -> {sites.shape[0]:,} lattice sites")
 
     interior = DishedTankInterior(TANK_RADIUS, LIQUID_HEIGHT, FLOOR_PROFILE)
-    rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers)
+    rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers,
+                                            clip_tips=args.clip_tips)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 

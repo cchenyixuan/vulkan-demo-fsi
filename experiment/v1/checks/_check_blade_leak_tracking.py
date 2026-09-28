@@ -16,7 +16,11 @@ blade edge) or returns to the side it came from is not counted. Frames are --den
 steps apart (default 10 steps, about 0.7 ms, a displacement of at most 0.25 dx).
 
   run      <solver env>  _check_blade_leak_tracking.py run CASE.yaml --dense-start S --dense-steps N
-               [--dense-every 10] --out FRAMES.npz
+               [--dense-every 10] --out FRAMES.npz [--torque-log CSV] [--dump FINAL.npz]
+           --torque-log: torque with the per-impeller split every 1000 steps from the start of
+           the run (same columns as _run_v1_headless.py); --dump: final positions, material,
+           velocity and status, as _run_v1_headless.py --dump. With both, one run gives the
+           power number, the mean speed and the leak count of its last dense window.
   analyze  <python>      _check_blade_leak_tracking.py analyze FRAMES.npz --dx 0.003 --slab 1.0
 
 The result is given as particles per second and as a mass flow, compared with the
@@ -54,9 +58,21 @@ def run(arguments):
         try:
             simulator.bootstrap()
             end = arguments.dense_start + arguments.dense_steps
+            torque_log = None
+            if arguments.torque_log:
+                torque_log = open(arguments.torque_log, "w")
+                torque_log.write("step,time,angle,torque_axis,fx,fy,fz,torque_lower,torque_upper,torque_shaft\n")
             while simulator.step_count < end:
                 simulator.step()
                 step = simulator.step_count
+                if torque_log is not None and step % 1000 == 0:
+                    torque = simulator.readback_rotor_torque(0.1, 0.007)
+                    fx, fy, fz = torque["force"]
+                    torque_log.write(f"{step},{simulator.simulation_time:.6e},{torque['rotor_angle']:.6e},"
+                                     f"{torque['torque_axis']:.6e},{fx:.6e},{fy:.6e},{fz:.6e},"
+                                     f"{torque['torque_axis_lower']:.6e},{torque['torque_axis_upper']:.6e},"
+                                     f"{torque['torque_axis_shaft']:.6e}\n")
+                    torque_log.flush()
                 if step >= arguments.dense_start and (step - arguments.dense_start) % arguments.dense_every == 0:
                     positions = simulator.readback_positions()
                     live = simulator.live_slot_mask(positions)
@@ -72,10 +88,17 @@ def run(arguments):
                     times.append(simulator.simulation_time); angles.append(simulator.rotor_angle); steps.append(step)
             status = simulator.readback_global_status()
             mass = float(simulator.readback_velocity_mass()[1, 3])
+            if torque_log is not None:
+                torque_log.close()
+            if arguments.dump:
+                import json
+                np.savez(arguments.dump, positions=simulator.readback_positions(),
+                         material=simulator.readback_material(), velocity_mass=simulator.readback_velocity_mass(),
+                         particle_uid=simulator.readback_particle_uid(), status=json.dumps(status))
         finally:
             simulator.destroy()
-    np.savez(arguments.out, times=np.array(times), angles=np.array(angles), steps=np.array(steps),
-             particle_mass=mass, **frames)
+    np.savez_compressed(arguments.out, times=np.array(times), angles=np.array(angles), steps=np.array(steps),
+                        particle_mass=mass, **frames)
     print(f"[tracking] {len(times)} frames, t = {times[0]:.4f} .. {times[-1]:.4f} s, alive {status['alive_particle_count']:,}, "
           f"overflow {status['overflow_inside_count']}/{status['overflow_incoming_count']} -> {arguments.out}")
 
@@ -144,6 +167,8 @@ def main():
     run_parser.add_argument("--dense-steps", type=int, default=3000)
     run_parser.add_argument("--dense-every", type=int, default=10)
     run_parser.add_argument("--out", required=True)
+    run_parser.add_argument("--torque-log", default=None)
+    run_parser.add_argument("--dump", default=None)
     analyze_parser = subparsers.add_parser("analyze")
     analyze_parser.add_argument("frames")
     analyze_parser.add_argument("--dx", type=float, default=0.003)
