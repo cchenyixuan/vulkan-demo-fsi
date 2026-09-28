@@ -2,7 +2,12 @@
 
 Usage (repo root):
     python experiment/v1/checks/_analyze_power_number.py OUT.png LABEL=torque.csv [LABEL=torque.csv ...]
-        [--avg-from 20] [--avg-to 30]
+        [--avg-from 20] [--avg-to 30] [--mass-factor 1.2187]
+
+--mass-factor (2026-09-29): the torque in the CSV is m a with the particle mass
+rho0 V_p, V_p the calibrated particle volume (1.2187 dx^3 for h/dx = 3, 1.438
+for 2.5, 1.083 for 4). Given the factor, the script also prints Np / factor, the
+power number of a fluid of density rho (log/2026-09-29_torque-readback-mass-factor.md).
 
 Np = tau * omega / (rho * N^3 * D^5) with rho = 998 kg/m^3, N = 200/60 rev/s,
 D = 0.096 m (Rushton diameter; the torque includes both impellers and the
@@ -24,6 +29,7 @@ D_PBT = 0.0982                       # PBT tip diameter (2 x 0.0491 m)
 parser = argparse.ArgumentParser()
 parser.add_argument("out_png"); parser.add_argument("runs", nargs="+")
 parser.add_argument("--avg-from", type=float, default=20.0); parser.add_argument("--avg-to", type=float, default=30.0)
+parser.add_argument("--mass-factor", type=float, default=None)
 args = parser.parse_args()
 fig, ax = plt.subplots(figsize=(9, 5))
 print(f"{'run':28s} {'t_end':>6s} {'Np mean':>8s} {'Np std':>7s} {'samples':>7s}   window [{args.avg_from}, {args.avg_to}] s")
@@ -38,6 +44,9 @@ for spec in args.runs:
     m = (t >= args.avg_from) & (t <= args.avg_to)
     if m.sum() >= 2:
         print(f"{label:28s} {t[-1]:6.1f} {np_t[m].mean():8.3f} {np_t[m].std():7.3f} {m.sum():7d}")
+        if args.mass_factor:
+            print(f"{'':28s}   divided by the mass factor {args.mass_factor:g}: Np {np_t[m].mean() / args.mass_factor:.3f}"
+                  f" (torque {np.abs(tau[m]).mean() / args.mass_factor * 1e3:.1f} mN m)")
         if "torque_lower" in d.dtype.names:
             parts = {name: np.abs(d[f"torque_{name}"]) * abs(OMEGA) / SCALE for name in ("lower", "upper", "shaft")}
             print(f"{'':28s}   Rushton {parts['lower'][m].mean():.3f} +- {parts['lower'][m].std():.3f}"

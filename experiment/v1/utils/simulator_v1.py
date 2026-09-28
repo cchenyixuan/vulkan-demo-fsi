@@ -1425,6 +1425,20 @@ class SphSimulatorV1:
         Returns force (3,), torque (3,), torque_axis (scalar), the rotor
         particle count, the rotor angle, time and step.
 
+        MASS FACTOR (found 2026-09-29): the particle mass is rho0 times the
+        CALIBRATED particle volume V_p of utils/sph/case.py, which is larger
+        than the lattice cell dx^d (3D: 1.438 dx^3 for h/dx = 2.5, 1.2187 for
+        3, 1.083 for 4; 2D h/dx = 5: 1.1293 dx^2), because the kernel sums
+        exclude the self term. The accelerations are normalised by the KCG
+        matrix and do not depend on V_p, but m a does: every force and torque
+        returned here is V_p / dx^d times the force on a fluid of density
+        rho0. Verified with the steady Taylor-Couette torque (read back /
+        analytic = 1.035, expected 0.910 * 1.1293 = 1.028) and with the
+        angular-momentum flux through a cylinder around each impeller. The
+        result carries the factor as "mass_factor"; divide by it (the values
+        themselves are left unscaled so that old logs stay comparable).
+        log/2026-09-29_torque-readback-mass-factor.md.
+
         Per-impeller split (2026-09-26): when split_height and shaft_radius
         are given, rotor particles are classified by their distance r from
         the rotor axis and their height h along it (both measured from the
@@ -1451,7 +1465,11 @@ class SphSimulatorV1:
         arm = x - pivot
         torque_per_particle = np.cross(arm, force_per_particle)
         torque = torque_per_particle.sum(axis=0)
+        spacing = 2.0 * float(self.case.physics.particle_radius)
+        rest_density = float(np.median(m)) / float(self.case.materials[int(groups[0])].volume)
+        mass_factor = float(np.median(m)) / (rest_density * spacing ** int(self.case.physics.dimension))
         result = {
+            "mass_factor": mass_factor,
             "force": force_per_particle.sum(axis=0),
             "torque": torque,
             "torque_axis": float(np.dot(torque, axis)),
