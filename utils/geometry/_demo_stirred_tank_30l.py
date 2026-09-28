@@ -500,6 +500,12 @@ def main() -> int:
     parser.add_argument("--max-incoming", type=int, default=32)
     parser.add_argument("--ramp-time", type=float, default=0.05, help="rotor spin-up time (s)")
     parser.add_argument("--c0-factor", type=float, default=10.0, help="speed of sound = factor * tip speed")
+    parser.add_argument("--background-pressure", type=float, default=0.0,
+                        help="constant added to the Tait pressure, Pa (physics.background_pressure); keeps the "
+                             "pressure behind the blades positive. About rho * U_tip^2 = 1000 Pa. 0 = off")
+    parser.add_argument("--hydrostatic", action="store_true",
+                        help="with --gravity: the fluid starts with the hydrostatic density, zero pressure at the lid "
+                             "(physics.hydrostatic_reference)")
     parser.add_argument("--gravity", type=float, default=0.0,
                         help="gravity magnitude along -y (0 = off; with gravity on use --c0-factor 20 so that c0 >= 10*sqrt(g*H))")
     parser.add_argument("--impellers", choices=("both", "rushton", "pbt"), default="both",
@@ -611,11 +617,21 @@ def main() -> int:
     write_obj(out / "rotor.obj", rotor)
     all_points = np.vstack([fluid, wall, rotor])
     write_frame_obj(out / "frame.obj", all_points.min(axis=0) - 0.6 * dx, all_points.max(axis=0) + 0.6 * dx)
-    (out / "case.yaml").write_text(CASE_YAML.format(
+    case_text = CASE_YAML.format(
         dx=dx, h=h, hdx=args.hdx, thin_layers=args.thin_layers, n_fluid=n_fluid, n_wall=n_wall,
         n_rotor=n_rotor, liquid_height=LIQUID_HEIGHT, tip_speed=TIP_SPEED, c0_factor=args.c0_factor, radius=0.5 * dx, c0=c0,
         pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming,
-        ramp_time=args.ramp_time, gravity_y=-abs(args.gravity), xi=args.xi), encoding="utf-8")
+        ramp_time=args.ramp_time, gravity_y=-abs(args.gravity), xi=args.xi)
+    if args.background_pressure != 0.0:
+        # written only when used, so that the files of all other cases stay as they were
+        assert case_text.count("  gravity: [") == 1
+        case_text = case_text.replace("  gravity: [", f"  background_pressure: {args.background_pressure:g}\n  gravity: [")
+    if args.hydrostatic:
+        if args.gravity == 0.0:
+            parser.error("--hydrostatic needs --gravity")
+        assert case_text.count("  gravity: [") == 1
+        case_text = case_text.replace("  gravity: [", f"  hydrostatic_reference: [0.0, {LIQUID_HEIGHT}, 0.0]\n  gravity: [")
+    (out / "case.yaml").write_text(case_text, encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity), encoding="utf-8")
     if args.tracers > 0:
         with open(out / "case.yaml", "a", encoding="utf-8") as handle:

@@ -431,6 +431,9 @@ result = vkCreateComputePipelines(self.ctx.device, VK_NULL_HANDLE,
   之后发散：活粒子从 557,622 掉到 154,180，overflow_inside、overflow_incoming、correction_fallback 都达到百万以上。
 - 原因不明，力矩日志里看不到前兆。候选：顶盖附近仍有拉伸态；重力使底部压缩，体素占用逼近 max_per_voxel = 64；incoming 上限 32。
 - 目前重力一律关闭。闭口单相槽里重力只增加静水压，但关掉重力也就没有了能压住负压的背景压力。
+- **2026-09-29 补充**：3 mm 碟形底槽开重力，0.26 s 内就有约 10% 的流体穿过槽底和侧壁，活粒子从 1,360,100 掉到 1,278,169。
+  加静水压初始密度也没有用：0.02 s 内静水压消失，流体以接近自由落体的速度下落，槽底壁面粒子的压力中位数为 0。
+  判断是固体压力模型托不住静水压（5.1 节第 1 条）。详见 `log/2026-09-29_background-pressure-and-gravity.md`。
 
 ### 2.6 defrag 后的残留槽位让力矩变成 NaN
 
@@ -1080,6 +1083,9 @@ float laplacian_factor = fluid_weight * 2.0 * neighbor_mass * ...;
    详见 `log/2026-09-29_torque-readback-mass-factor.md`。请他确认粒子质量的取法是否有意，以及受力应当怎么算。
 4. **重力和背景压力。** 开重力的算例在 23.5 s 发散（2.5 节），目前重力一律关闭，涡核处可以出现负压。
    是否加背景压力 p_b 或做静压初始化？TIC 在负压下的切换是否需要调整？
+   **2026-09-29 补充**：已加背景压力选项（`physics.background_pressure`，spec 常量 34，默认 0）和静水压初始密度选项
+   （`physics.hydrostatic_reference`，默认关闭）。基准算例里 Rushton 区有 31%–51% 的流体处于负压，
+   p_b = 1000 Pa 时降到 0.2%–0.5%。p_b 算例（3 mm，30 s）已提交。开重力的算例因流体穿过槽壁无法运行（2.5 节）。
 5. **薄运动构件的分辨率。** Rushton 叶片只有约 2 个核半径高，叶片被加厚到 3 dx，分桨功率不收敛（2.10 节）。
    他在 δ⁺-SPH 里处理薄运动构件有没有经验，比如更小的 h/dx、局部加密、或别的边界处理？
 6. **小问题，确认即可**：

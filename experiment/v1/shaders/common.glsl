@@ -92,6 +92,17 @@ layout(constant_id = 17) const float GRAVITY_X = 0.0;
 layout(constant_id = 18) const float GRAVITY_Y = 0.0;
 layout(constant_id = 19) const float GRAVITY_Z = 0.0;
 
+// --- Background pressure (2026-09-29) ---
+// Constant p_b added to the Tait pressure of every particle (fluid and solid):
+//   P = eos_constant ((rho / rho0)^gamma - 1) + p_b.
+// A constant has no gradient, so the flow of a CLOSED single-phase domain is
+// unchanged in the continuum; numerically p_b keeps the pressure positive
+// where it would fall below zero (behind the blades, in vortex cores), so
+// force.comp stays on the symmetric, pairwise momentum-conserving form
+// (P_i + P_j) instead of the TIC form (P_j - P_i). Must be 0 with a free
+// surface. case.yaml: physics.background_pressure (default 0).
+layout(constant_id = 34) const float BACKGROUND_PRESSURE = 0.0;
+
 // --- Voxel layout ---
 layout(constant_id = 20) const uint VOXEL_ORDER = 0u;             // 0 = linear z-major; 1 = Morton (future)
 

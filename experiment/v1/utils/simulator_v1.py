@@ -98,6 +98,7 @@ SPEC_ID_DIMENSION                           = 30
 SPEC_ID_NEIGHBOR_Z_RANGE                    = 31
 SPEC_ID_KERNEL_COEFFICIENT                  = 32
 SPEC_ID_KERNEL_GRADIENT_COEFFICIENT         = 33
+SPEC_ID_BACKGROUND_PRESSURE                 = 34
 SPEC_ID_EPS_H_SQUARED                       = 40
 SPEC_ID_PST_MAIN_SHIFT_COEFFICIENT          = 41
 SPEC_ID_PST_ANTI_SHIFT_COEFFICIENT          = 42
@@ -517,6 +518,13 @@ class SphSimulatorV1:
             n = int(source.vertices.shape[0])
             material = case.materials[source.material_group_id]
             density_pressure[cursor:cursor + n, 0] = material.rest_density
+            reference = case.physics.hydrostatic_reference
+            if reference is not None and material.kind == KIND_FLUID:
+                # hydrostatic initial density (2026-09-29): p = rho0 g . (x - reference)
+                offset = np.asarray(source.vertices, dtype=np.float64)[:, :3] - np.asarray(reference)
+                hydrostatic = material.rest_density * (offset @ np.asarray(case.physics.gravity, dtype=np.float64))
+                ratio = np.maximum(1.0 + hydrostatic / float(material.eos_constant), 0.5)
+                density_pressure[cursor:cursor + n, 0] = material.rest_density * ratio ** (1.0 / float(case.physics.power))
             cursor += n
         data["density_pressure"] = density_pressure.tobytes()
 
@@ -833,6 +841,7 @@ class SphSimulatorV1:
             (SPEC_ID_NEIGHBOR_Z_RANGE,             int(case.neighbor_z_range),                'I'),
             (SPEC_ID_KERNEL_COEFFICIENT,           float(case.kernel_coefficient),            'f'),
             (SPEC_ID_KERNEL_GRADIENT_COEFFICIENT,  float(case.kernel_gradient_coefficient),   'f'),
+            (SPEC_ID_BACKGROUND_PRESSURE,          float(physics.background_pressure),        'f'),
             (SPEC_ID_EPS_H_SQUARED,                float(case.eps_h_squared),                 'f'),
             (SPEC_ID_PST_MAIN_SHIFT_COEFFICIENT,   float(numerics.pst_main),                  'f'),
             (SPEC_ID_PST_ANTI_SHIFT_COEFFICIENT,   float(numerics.pst_anti),                  'f'),
@@ -1367,6 +1376,11 @@ class SphSimulatorV1:
     def readback_velocity_mass(self) -> np.ndarray:
         raw = self._readback_buffer(self.buffers["velocity_mass"])
         return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
+
+    def readback_density_pressure(self) -> np.ndarray:
+        """(pool, 2): density, pressure (the pressure includes the background pressure)."""
+        raw = self._readback_buffer(self.buffers["density_pressure"])
+        return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2)
 
     def readback_acceleration(self) -> np.ndarray:
         raw = self._readback_buffer(self.buffers["acceleration"])

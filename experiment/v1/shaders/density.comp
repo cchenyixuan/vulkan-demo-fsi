@@ -18,7 +18,8 @@
 //   x_ij   = r_i - r_j
 //
 // Forward integration: ρ_{n+1} = ρ_n + dt · (drift + diffusion)
-// EOS:                 P_{n+1} = eos_constant · ((ρ_{n+1}/ρ₀)^γ - 1)
+// EOS:                 P_{n+1} = eos_constant · ((ρ_{n+1}/ρ₀)^γ - 1) + p_b
+//                      (p_b = BACKGROUND_PRESSURE, 0 by default)
 //
 // Writes to density_pressure_scratch (binding 2). The simulator's step cmd
 // then issues a vkCmdCopyBuffer scratch → primary inside the same submission,
@@ -275,10 +276,11 @@ void main() {
     float new_density = self_density + TIMESTEP * (density_drift + density_diffusion);
 
     // ========================================================================
-    // Tait EOS: P = eos_constant · ((ρ/ρ₀)^γ - 1)
+    // Tait EOS: P = eos_constant · ((ρ/ρ₀)^γ - 1) + p_b
     // ========================================================================
     float density_ratio = new_density / self_params.rest_density;
-    float new_pressure  = self_params.eos_constant * (pow(density_ratio, POWER_PARAMETER) - 1.0);
+    float new_pressure  = self_params.eos_constant * (pow(density_ratio, POWER_PARAMETER) - 1.0)
+                        + BACKGROUND_PRESSURE;
 
     // ========================================================================
     // Write to scratch (simulator copies scratch → primary right after this

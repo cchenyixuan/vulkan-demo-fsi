@@ -21,6 +21,10 @@ steps apart (default 10 steps, about 0.7 ms, a displacement of at most 0.25 dx).
            the run (same columns as _run_v1_headless.py); --dump: final positions, material,
            velocity and status, as _run_v1_headless.py --dump. With both, one run gives the
            power number, the mean speed and the leak count of its last dense window.
+           --status-log: every 1000 steps the alive count, the overflow counters and the pressure
+           of the fluid (whole tank and the Rushton zone r < 72 mm, y = 18.7 .. 58.5 mm): mean,
+           1 % / 50 % / 99 % quantiles and the fraction with P < 0 (2026-09-29, background
+           pressure and gravity runs). --dump then also holds density_pressure.
   analyze  <python>      _check_blade_leak_tracking.py analyze FRAMES.npz --dx 0.003 --slab 1.0
 
 The result is given as particles per second and as a mass flow, compared with the
@@ -62,9 +66,38 @@ def run(arguments):
             if arguments.torque_log:
                 torque_log = open(arguments.torque_log, "w")
                 torque_log.write("step,time,angle,torque_axis,fx,fy,fz,torque_lower,torque_upper,torque_shaft\n")
+            status_log = None
+            if arguments.status_log:
+                status_log = open(arguments.status_log, "w")
+                status_log.write("step,time,alive,overflow_inside,overflow_incoming,correction_fallback,"
+                                 "p_mean,p_q01,p_q50,p_q99,p_negative_fraction,"
+                                 "rushton_p_mean,rushton_p_q01,rushton_p_q50,rushton_p_q99,rushton_p_negative_fraction,"
+                                 "density_mean,density_min,density_max\n")
             while simulator.step_count < end:
                 simulator.step()
                 step = simulator.step_count
+                if status_log is not None and step % 1000 == 0:
+                    status = simulator.readback_global_status()
+                    positions = simulator.readback_positions()
+                    fluid = simulator.live_slot_mask(positions) & (simulator.readback_material() == 0)
+                    density_pressure = simulator.readback_density_pressure()
+                    pressure = density_pressure[fluid, 1].astype(np.float64)
+                    density = density_pressure[fluid, 0].astype(np.float64)
+                    x = positions[fluid, :3]
+                    zone = (np.hypot(x[:, 0], x[:, 2]) < 0.072) & (x[:, 1] > 0.0187) & (x[:, 1] < 0.0585)
+                    fields = [step, f"{simulator.simulation_time:.6e}", status["alive_particle_count"],
+                              status["overflow_inside_count"], status["overflow_incoming_count"],
+                              status["correction_fallback_count"]]
+                    for values in (pressure, pressure[zone]):
+                        if values.size == 0:
+                            fields += ["nan"] * 5
+                            continue
+                        q01, q50, q99 = np.percentile(values, [1, 50, 99])
+                        fields += [f"{values.mean():.4e}", f"{q01:.4e}", f"{q50:.4e}", f"{q99:.4e}",
+                                   f"{(values < 0).mean():.4f}"]
+                    fields += [f"{density.mean():.6e}", f"{density.min():.6e}", f"{density.max():.6e}"]
+                    status_log.write(",".join(str(value) for value in fields) + "\n")
+                    status_log.flush()
                 if torque_log is not None and step % 1000 == 0:
                     torque = simulator.readback_rotor_torque(0.1, 0.007)
                     fx, fy, fz = torque["force"]
@@ -90,11 +123,14 @@ def run(arguments):
             mass = float(simulator.readback_velocity_mass()[1, 3])
             if torque_log is not None:
                 torque_log.close()
+            if status_log is not None:
+                status_log.close()
             if arguments.dump:
                 import json
                 np.savez(arguments.dump, positions=simulator.readback_positions(),
                          material=simulator.readback_material(), velocity_mass=simulator.readback_velocity_mass(),
-                         particle_uid=simulator.readback_particle_uid(), status=json.dumps(status))
+                         particle_uid=simulator.readback_particle_uid(), status=json.dumps(status),
+                         density_pressure=simulator.readback_density_pressure())
         finally:
             simulator.destroy()
     np.savez_compressed(arguments.out, times=np.array(times), angles=np.array(angles), steps=np.array(steps),
@@ -169,6 +205,7 @@ def main():
     run_parser.add_argument("--out", required=True)
     run_parser.add_argument("--torque-log", default=None)
     run_parser.add_argument("--dump", default=None)
+    run_parser.add_argument("--status-log", default=None)
     analyze_parser = subparsers.add_parser("analyze")
     analyze_parser.add_argument("frames")
     analyze_parser.add_argument("--dx", type=float, default=0.003)

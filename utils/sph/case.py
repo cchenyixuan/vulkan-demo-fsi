@@ -229,8 +229,23 @@ class PhysicsConfig:
     #   "hex":  2D hexagonal close packing / 3D face-centered cubic.
     # Defaults to "grid"; switch to "hex" if your preprocessor emits hex/FCC.
     lattice: str = "grid"
+    # Constant p_b added to the Tait pressure (Pa), 2026-09-29. Only for closed
+    # domains without a free surface; keeps the pressure positive so that the
+    # pressure force stays on the symmetric form. 0 = off.
+    background_pressure: float = 0.0
+    # Hydrostatic initial density (2026-09-29). A point [x, y, z] on the level
+    # where the hydrostatic pressure is zero (the lid of a closed tank, the
+    # free surface otherwise). FLUID particles then start with the density of
+    #   p(x) = rho0 g . (x - reference),   rho = rho0 (1 + p / B)^(1/gamma)
+    # instead of rho0, so that gravity is balanced from the first step.
+    # None = off (every particle starts at rho0).
+    hydrostatic_reference: Optional[tuple] = None
 
     def __post_init__(self):
+        if self.hydrostatic_reference is not None:
+            self.hydrostatic_reference = tuple(float(component) for component in self.hydrostatic_reference)
+            if len(self.hydrostatic_reference) != 3:
+                raise ValueError("physics.hydrostatic_reference must have 3 components")
         # YAML parses [0, -9.81, 0] as a list; coerce to tuple of floats.
         self.gravity = tuple(float(component) for component in self.gravity)
         if len(self.gravity) != 3:
@@ -912,6 +927,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (31,  lambda case: case.neighbor_z_range,                          'I'),
     (32,  lambda case: case.kernel_coefficient,                        'f'),
     (33,  lambda case: case.kernel_gradient_coefficient,               'f'),
+    (34,  lambda case: case.physics.background_pressure,               'f'),  # BACKGROUND_PRESSURE
     (40,  lambda case: case.eps_h_squared,                             'f'),
     (41,  lambda case: case.numerics.pst_main,                         'f'),
     (42,  lambda case: case.numerics.pst_anti,                         'f'),
