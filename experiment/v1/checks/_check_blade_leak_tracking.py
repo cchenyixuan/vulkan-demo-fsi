@@ -1,0 +1,157 @@
+"""_check_blade_leak_tracking.py — count the fluid particles that pass THROUGH the impeller
+blades by following individual particles (uid) through closely spaced frames (2026-09-28).
+
+The pair test of _check_thin_solid_penetration.py over-counts on single-layer blades
+(particles resting in the notches of the staircase jitter across the mid-plane). Here a
+passage is an unambiguous event in the frame rotating with the rotor:
+
+    the particle is on one side of the blade (n <= -w), then stays inside the slab
+    |n| < w while it is within the blade's in-plane extent shrunk by one spacing, and
+    leaves the slab on the OTHER side (n >= +w).
+
+n is the coordinate normal to the blade mid-plane, w the slab half width (--slab, in
+spacings; 1 for a single-layer blade, 2.5 for the 3-layer blade with skin whose faces are
+2 dx from the mid-plane). A particle that leaves the slab through its rim (around the
+blade edge) or returns to the side it came from is not counted. Frames are --dense-every
+steps apart (default 10 steps, about 0.7 ms, a displacement of at most 0.25 dx).
+
+  run      <solver env>  _check_blade_leak_tracking.py run CASE.yaml --dense-start S --dense-steps N
+               [--dense-every 10] --out FRAMES.npz
+  analyze  <python>      _check_blade_leak_tracking.py analyze FRAMES.npz --dx 0.003 --slab 1.0
+
+The result is given as particles per second and as a mass flow, compared with the
+impellers' pumping capacity rho N_Q N D^3 with N_Q = 0.75 (2.2 kg/s at 200 rpm, D = 0.096 m).
+"""
+import argparse
+import math
+import pathlib
+import sys
+
+import numpy as np
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+for entry in (ROOT, ROOT / "utils" / "geometry", pathlib.Path(__file__).resolve().parent):
+    if str(entry) not in sys.path:
+        sys.path.insert(0, str(entry))
+
+SUBSET_RADIUS = 0.065
+SUBSET_HEIGHTS = ((0.010, 0.065), (0.165, 0.225))
+PUMPING_MASS_FLOW = 998.0 * 0.75 * (200.0 / 60.0) * 0.096 ** 3
+
+
+def run(arguments):
+    from utils.sph.case import load_case
+    from utils.sph.vulkan_context import VulkanContext
+    from experiment.v1 import compile_shaders_v1
+    from experiment.v1.utils.simulator_v1 import SphSimulatorV1
+
+    compile_shaders_v1.compile_v1_shaders()
+    case = load_case(arguments.case)
+    frames = {}
+    times, angles, steps = [], [], []
+    with VulkanContext.create(application_name="blade_leak_tracking", enable_validation=False) as context:
+        simulator = SphSimulatorV1(context, case)
+        try:
+            simulator.bootstrap()
+            end = arguments.dense_start + arguments.dense_steps
+            while simulator.step_count < end:
+                simulator.step()
+                step = simulator.step_count
+                if step >= arguments.dense_start and (step - arguments.dense_start) % arguments.dense_every == 0:
+                    positions = simulator.readback_positions()
+                    live = simulator.live_slot_mask(positions)
+                    fluid = live & (simulator.readback_material() == 0)
+                    radius = np.hypot(positions[:, 0], positions[:, 2])
+                    height = positions[:, 1]
+                    near = fluid & (radius < SUBSET_RADIUS) & (
+                        ((height > SUBSET_HEIGHTS[0][0]) & (height < SUBSET_HEIGHTS[0][1]))
+                        | ((height > SUBSET_HEIGHTS[1][0]) & (height < SUBSET_HEIGHTS[1][1])))
+                    index = len(times)
+                    frames[f"uid_{index}"] = simulator.readback_particle_uid()[near]
+                    frames[f"pos_{index}"] = positions[near, :3].copy()
+                    times.append(simulator.simulation_time); angles.append(simulator.rotor_angle); steps.append(step)
+            status = simulator.readback_global_status()
+            mass = float(simulator.readback_velocity_mass()[1, 3])
+        finally:
+            simulator.destroy()
+    np.savez(arguments.out, times=np.array(times), angles=np.array(angles), steps=np.array(steps),
+             particle_mass=mass, **frames)
+    print(f"[tracking] {len(times)} frames, t = {times[0]:.4f} .. {times[-1]:.4f} s, alive {status['alive_particle_count']:,}, "
+          f"overflow {status['overflow_inside_count']}/{status['overflow_incoming_count']} -> {arguments.out}")
+
+
+def analyze(arguments):
+    from _check_thin_solid_penetration import rotate_back, sheets
+    archive = np.load(arguments.frames)
+    dx, slab = arguments.dx, arguments.slab * arguments.dx
+    times, angles = archive["times"], archive["angles"]
+    count = len(times)
+    sheet_list, _, _ = sheets(dx)
+    all_uid = np.unique(np.concatenate([archive[f"uid_{k}"] for k in range(count)]))
+    duration = times[-1] - times[0]
+    print(f"{arguments.frames}: {count} frames over {duration:.4f} s (t = {times[0]:.3f} .. {times[-1]:.3f} s), "
+          f"{len(all_uid):,} particles tracked, slab half width {arguments.slab:g} dx")
+    totals = {}
+    for name, moving, centre, axis_a, axis_b, normal, half_a, half_b in sheet_list:
+        if not moving:
+            continue
+        # state per frame: 0 absent / elsewhere, -1 / +1 on a side, 2 inside the slab (interior extent)
+        state = np.zeros((count, len(all_uid)), dtype=np.int8)
+        for k in range(count):
+            local = rotate_back(archive[f"pos_{k}"].astype(np.float64), float(angles[k])) - centre
+            a, b, n = local @ axis_a, local @ axis_b, local @ normal
+            column = np.searchsorted(all_uid, archive[f"uid_{k}"])
+            in_extent = (np.abs(a) < half_a + dx) & (np.abs(b) < half_b + dx)          # unshrunk extent
+            interior = (np.abs(a) < half_a) & (np.abs(b) < half_b)                       # shrunk by dx (sheets())
+            value = np.zeros(len(n), dtype=np.int8)
+            side = in_extent & (np.abs(n) >= slab) & (np.abs(n) < 5 * dx)
+            value[side & (n < 0)] = -1
+            value[side & (n > 0)] = 1
+            value[interior & (np.abs(n) < slab)] = 2
+            state[k, column] = value
+        candidates = np.nonzero((state == 2).any(axis=0))[0]
+        forward = backward = 0
+        for column in candidates:
+            series = state[:, column]
+            inside = series == 2
+            edges = np.diff(np.concatenate([[0], inside.astype(np.int8), [0]]))
+            for start, end in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]):
+                if start == 0 or end >= count:
+                    continue
+                before, after = series[start - 1], series[end]
+                if before * after == -1:                      # -1 -> +1 or +1 -> -1
+                    if after == 1:
+                        forward += 1
+                    else:
+                        backward += 1
+        group = name.rsplit(" ", 1)[0]
+        entry = totals.setdefault(group, [0, 0, 0])
+        entry[0] += forward; entry[1] += backward; entry[2] += len(candidates)
+    mass = float(archive["particle_mass"])
+    for group, (forward, backward, candidates) in totals.items():
+        passages = forward + backward
+        print(f"   {group}s (6): passages {passages} (+n {forward}, -n {backward}) among {candidates} particles that entered a slab; "
+              f"{passages / duration:.0f} particles/s = {passages / duration * mass * 1e3:.1f} g/s = "
+              f"{passages / duration * mass / PUMPING_MASS_FLOW * 100:.2f} % of the pumping capacity {PUMPING_MASS_FLOW:.2f} kg/s")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    subparsers = parser.add_subparsers(dest="phase", required=True)
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument("case")
+    run_parser.add_argument("--dense-start", type=int, required=True)
+    run_parser.add_argument("--dense-steps", type=int, default=3000)
+    run_parser.add_argument("--dense-every", type=int, default=10)
+    run_parser.add_argument("--out", required=True)
+    analyze_parser = subparsers.add_parser("analyze")
+    analyze_parser.add_argument("frames")
+    analyze_parser.add_argument("--dx", type=float, default=0.003)
+    analyze_parser.add_argument("--slab", type=float, default=1.0, help="slab half width in spacings")
+    arguments = parser.parse_args()
+    run(arguments) if arguments.phase == "run" else analyze(arguments)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
