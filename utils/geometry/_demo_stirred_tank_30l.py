@@ -216,7 +216,56 @@ def pitched_blade(azimuth_deg, r0, r1, chord, thickness, center_y, pitch_deg):
                        [0.5 * (r1 - r0), 0.5 * chord, 0.5 * thickness])
 
 
-def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False):
+def blade_frames(impellers="both"):
+    """The twelve blades as plane rectangles with their TRUE outline:
+    (name, centre, in-plane axis a (radial), in-plane axis b, normal, half extent a, half extent b).
+    The PBT uses its true length (PBT_TRUE_LENGTH, straight cut), so its corners lie at the
+    true tip radius without any clipping."""
+    frames = []
+    for k in range(6):
+        if impellers in ("both", "rushton"):
+            e_r, e_t, e_y = radial_frame(RUSHTON_BLADE["azimuth0_deg"] + 60 * k)
+            r0, r1 = RUSHTON_BLADE["radial"]
+            y0, y1 = RUSHTON_BLADE["y0"], RUSHTON_BLADE["y1"]
+            frames.append((f"rushton_{k + 1}", e_r * 0.5 * (r0 + r1) + e_y * 0.5 * (y0 + y1),
+                           e_r, e_y, e_t, 0.5 * (r1 - r0), 0.5 * (y1 - y0)))
+        if impellers in ("both", "pbt"):
+            e_r, e_t, e_y = radial_frame(PBT_BLADE["azimuth0_deg"] + 60 * k)
+            pitch = math.radians(PBT_BLADE["pitch_deg"])
+            e_chord = math.cos(pitch) * e_t - math.sin(pitch) * e_y
+            e_norm = math.sin(pitch) * e_t + math.cos(pitch) * e_y
+            r0, r1 = PBT_BLADE["radial"][0], PBT_TRUE_LENGTH
+            frames.append((f"pbt_{k + 1}", e_r * 0.5 * (r0 + r1) + e_y * PBT_BLADE["center_y"],
+                           e_r, e_chord, e_norm, 0.5 * (r1 - r0), 0.5 * PBT_BLADE["chord"]))
+    return frames
+
+
+def conformal_blades(dx, layers, impellers="both"):
+    """Blade particles on a plane grid in each blade's own frame (2026-09-28).
+
+    Taking the blades from the global lattice gives a staircase wherever a blade is not
+    parallel to the lattice; a single-layer blade leaks at every step of that staircase and
+    nowhere else (log/2026-09-28_single-layer-blades.md). Here each blade is `layers` flat
+    layers of particles, spacing <= dx in the two in-plane directions (the number of cells is
+    rounded up, so the outline is exact and the sheet slightly denser than the lattice), the
+    outermost centres half a cell inside the true outline.
+    Returns (points, boxes): the particle positions and one OrientedBox per blade with the
+    true outline and thickness layers * dx; lattice sites inside a box are dropped."""
+    points, boxes = [], []
+    for _, centre, axis_a, axis_b, normal, half_a, half_b in blade_frames(impellers):
+        cells_a = max(1, int(math.ceil(2.0 * half_a / dx - 1e-9)))
+        cells_b = max(1, int(math.ceil(2.0 * half_b / dx - 1e-9)))
+        a = -half_a + (np.arange(cells_a) + 0.5) * (2.0 * half_a / cells_a)
+        b = -half_b + (np.arange(cells_b) + 0.5) * (2.0 * half_b / cells_b)
+        n = (np.arange(layers) - 0.5 * (layers - 1)) * dx
+        grid_a, grid_b, grid_n = np.meshgrid(a, b, n, indexing="ij")
+        points.append(centre + grid_a.reshape(-1, 1) * axis_a + grid_b.reshape(-1, 1) * axis_b
+                      + grid_n.reshape(-1, 1) * normal)
+        boxes.append(OrientedBox(centre, np.stack([axis_a, axis_b, normal]), [half_a, half_b, 0.5 * layers * dx]))
+    return np.vstack(points), boxes
+
+
+def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False, with_blades=True):
     """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
     ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
     and the disk for the Rushton) are kept on the full-length shaft; used for
@@ -237,7 +286,7 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=Fa
         ]
     if keep_pbt:
         rotor_parts.append(y_cylinder(PBT_HUB["radius"], PBT_HUB["y0"], PBT_HUB["y1"]))
-    for k in range(6):
+    for k in range(6 if with_blades else 0):
         if keep_rushton:
             blade = radial_slab(RUSHTON_BLADE["azimuth0_deg"] + 60 * k,
                                 *RUSHTON_BLADE["radial"], RUSHTON_BLADE["y0"],
@@ -432,6 +481,10 @@ def main() -> int:
     parser.add_argument("--clip-tips", action="store_true",
                         help="blades with the true PBT length (48.2 mm) and cut at the true tip radius "
                              "(Rushton 48.0 mm, PBT 49.1 mm) instead of the plain boxes")
+    parser.add_argument("--conformal-blades", action="store_true",
+                        help="blade particles on plane grids in the blades' own frames (--thin-layers flat "
+                             "layers, true outline) instead of lattice sites; avoids the staircase at which "
+                             "single-layer blades leak")
     parser.add_argument("--skin", type=float, default=0.5,
                         help="rotor / baffle / probe sites are claimed up to this many spacings outside "
                              "the solid surface (default 0.5; 0 = site centre inside the solid)")
@@ -481,7 +534,7 @@ def main() -> int:
 
     interior = DishedTankInterior(TANK_RADIUS, LIQUID_HEIGHT, FLOOR_PROFILE)
     rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers,
-                                            clip_tips=args.clip_tips)
+                                            clip_tips=args.clip_tips, with_blades=not args.conformal_blades)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 
@@ -498,16 +551,36 @@ def main() -> int:
     # --skin 0 claims a site only when its centre lies inside the solid.
     skin = args.skin * dx
     is_rotor = sdf_rotor <= skin
-    is_wall_solid = (sdf_wall_solid <= skin) & ~is_rotor
-    is_fluid = (sdf_interior <= -0.5 * dx) & ~is_rotor & ~is_wall_solid
+    blade_points = np.zeros((0, 3))
+    if args.conformal_blades:
+        # Blades: plane sheets of particles in the blade frames; the lattice sites inside the
+        # sheets' boxes (true outline, thickness thin_layers * dx) are dropped, whatever they
+        # would have been, and so are the lattice rotor sites (hub, disk) that would sit closer
+        # than 0.6 dx to a blade particle.
+        blade_points, blade_boxes = conformal_blades(dx, args.thin_layers, args.impellers)
+        in_blade = Union(*blade_boxes).signed_distance(sites) <= 0.0
+        near = np.nonzero(is_rotor & ~in_blade)[0]
+        if near.size:
+            difference = sites[near][:, None, :] - blade_points[None, :, :]
+            too_close = (np.einsum("ijk,ijk->ij", difference, difference) < (0.6 * dx) ** 2).any(axis=1)
+            is_rotor[near[too_close]] = False
+            in_blade[near[too_close]] = True
+        is_rotor &= ~in_blade
+    else:
+        in_blade = np.zeros(sites.shape[0], dtype=bool)
+    is_wall_solid = (sdf_wall_solid <= skin) & ~is_rotor & ~in_blade
+    is_fluid = (sdf_interior <= -0.5 * dx) & ~is_rotor & ~is_wall_solid & ~in_blade
     # Everything else inside the frame that is not liquid = tank shell (walls, floor, lid).
-    is_shell = ~is_fluid & ~is_rotor & ~is_wall_solid & (sdf_interior > -0.5 * dx)
+    is_shell = ~is_fluid & ~is_rotor & ~is_wall_solid & ~in_blade & (sdf_interior > -0.5 * dx)
     # Keep only shell sites within `border` layers of the liquid surface (drop far corners).
     is_shell &= sdf_interior <= shell + 0.5 * dx
 
     fluid = sites[is_fluid]
     wall = sites[is_wall_solid | is_shell]
-    rotor = sites[is_rotor]
+    rotor = np.vstack([sites[is_rotor], blade_points])
+    if args.conformal_blades:
+        print(f"conformal blades: {blade_points.shape[0]:,} blade particles in {args.thin_layers} layer(s), "
+              f"{int(in_blade.sum()):,} lattice sites dropped")
     n_fluid, n_wall, n_rotor = fluid.shape[0], wall.shape[0], rotor.shape[0]
     total = n_fluid + n_wall + n_rotor
     pool_size = int(math.ceil(total * 1.15 / 128) * 128)
