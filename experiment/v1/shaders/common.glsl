@@ -83,7 +83,7 @@ layout(constant_id = 13) const uint GRID_DIMENSION_Z = 1u;        // 1 in 2D
 const uint TOTAL_VOXEL_COUNT = GRID_DIMENSION_X * GRID_DIMENSION_Y * GRID_DIMENSION_Z;
 
 // --- Correction (KCG) regularization ---
-layout(constant_id = 14) const float REGULARIZATION_XI                    = 0.1;
+layout(constant_id = 14) const float REGULARIZATION_XI                    = 0.01;
 layout(constant_id = 15) const float REGULARIZATION_DETERMINANT_THRESHOLD = 1e-4;
 layout(constant_id = 16) const float REGULARIZATION_MAX_FROBENIUS_NORM    = 10.0;
 

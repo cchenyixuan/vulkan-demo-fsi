@@ -9,7 +9,7 @@ operators used by the V1 kernels on fields whose exact result is known:
   delta-diffusion /   sum_j V_j 2 (f_j - f_i) x_ji.gradW~_ij / (r^2 + eta^2),  f = |x|^2           (exact 2 d)
   scalar Brookshaw
 
-for the gradient variants gradW~ = (M + xi I)^-1 gradW (what correction.comp stores, xi = 0.1),
+for the gradient variants gradW~ = (M + xi I)^-1 gradW (what correction.comp stores; xi = 0.01 since 2026-09-28, 0.1 before),
 M^-1 gradW (unregularized) and gradW (raw), and eta^2 = 0.01 h^2 (EPS_H_SQUARED, h = support
 radius), 0.01 dx^2 and 0. M = sum_j V_j (x_j - x_i) (x) gradW_ij. Results are printed as the
 ratio to the exact value. The scalar transport of 2026-09-27 uses the trace normalisation
@@ -91,7 +91,7 @@ def evaluate(dimension: int, h_over_dx: float, xi: float) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--xi", type=float, default=0.1)
+    parser.add_argument("--xi", type=float, default=0.01)
     args = parser.parse_args()
     evaluate(3, 3.0, args.xi)       # 30 L tank cases (h/dx = 3)
     evaluate(2, 5.0, args.xi)       # 2D cavity / Taylor-Couette cases (h/dx = 5)

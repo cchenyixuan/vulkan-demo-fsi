@@ -67,8 +67,8 @@
 //     the standard SPH Laplacian (x_ij·∇W_ij < 0, so a local maximum decays).
 //     D = D_m + w · ν_t / Sc_t per field (D_m, w from ScalarParametersBuffer,
 //     ν_t from density.comp this step when USE_SCALAR_SGS).
-//   ∇C_i = Σ_j V_j (C_j - C_i) M_i⁻¹ ∇W_ij   with the UNREGULARIZED M_i⁻¹
-//     (unregularized_correction_inverse), first-order consistent.
+//   ∇C_i = Σ_j V_j (C_j - C_i) M_i⁻¹ ∇W_ij   with the stored KCG inverse
+//     (first-order consistent to 0.8 % with ξ = 0.01, see density.comp).
 //   Bounds limiter (USE_SCALAR_BOUNDS_LIMITER, only together with the shift
 //     correction): ΔC_i is clipped so that C_i + ΔC_i stays in [min, max] of C
 //     over self and FLUID neighbours. The diffusion alone is monotone and needs
@@ -181,10 +181,10 @@ void main() {
     float scalar_laplacian_eps_squared = 0.04 * self_params.radius * self_params.radius;
     float self_inverse_trace = do_scalar
         ? scalar_normalisation_and_fluid_flag(self_particle_id).x : 1.0;   // d / tr M_i
-    // Unregularized KCG inverse for ∇C (shift correction only).
+    // KCG inverse for ∇C (shift correction only).
     mat3 scalar_gradient_matrix = mat3(1.0);
     if (do_scalar_gradient && USE_KCG_CORRECTION) {
-        scalar_gradient_matrix = unregularized_correction_inverse(self_correction_matrix);
+        scalar_gradient_matrix = self_correction_matrix;
     }
     vec4 self_scalar[MAX_SCALAR_VEC4];
     vec4 self_diffusivity[MAX_SCALAR_VEC4];
@@ -409,8 +409,8 @@ void main() {
                     vec4 scalar_difference = self_scalar[vec4_index] - neighbor_scalar;          // C_i - C_j
                     scalar_rate[vec4_index] += (laplacian_factor * pair_diffusivity) * scalar_difference;
                     if (do_scalar_gradient) {
-                        // ∇C_i += V_j (C_j - C_i) ∇W_ij; the unregularized M_i⁻¹
-                        // is applied once after the loop (linear, so equivalent).
+                        // ∇C_i += V_j (C_j - C_i) ∇W_ij; M_i⁻¹ is applied once
+                        // after the loop (linear, so equivalent).
                         vec4 weighted = gradient_weight * scalar_difference;
                         scalar_gradient_x[vec4_index] += weighted * kernel_gradient_raw.x;
                         scalar_gradient_y[vec4_index] += weighted * kernel_gradient_raw.y;

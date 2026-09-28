@@ -40,7 +40,7 @@ numerics:
   delta_coefficient: 0.1
   use_kcg_correction: true
   regularization:
-    xi: 0.1
+    xi: 0.01      # 0.1 until 2026-09-28: it made (M + xi I)^-1 about 8 % too small (log/2026-09-28_kcg-xi-0p01.md)
     det_threshold: 1.0e-4
     frobenius_max: 10.0
   use_pst: true

@@ -202,26 +202,6 @@ vec2 scalar_normalisation_and_fluid_flag(uint particle_id) {
     return correction_inverse[particle_id * 2u + 1u].zw;
 }
 
-// Undo the Tikhonov regularisation of correction.comp for one particle:
-// stored = (M + ξ I)⁻¹  →  M = stored⁻¹ - ξ I  →  M⁻¹. In 2D the z row and
-// column were set to identity (not shifted), so only xx and yy are corrected.
-// Used by the scalar gradient only (2026-09-27): with ξ = 0.1 and tr(M)/3 ≈
-// 1.21 on the h/dx = 3 lattice the regularised inverse is 7.6 % too small.
-// Returns the regularised inverse unchanged when M itself is near-singular
-// (correction.comp's identity fallback / Frobenius cap cases).
-mat3 unregularized_correction_inverse(mat3 regularized_inverse) {
-    mat3 matrix = inverse(regularized_inverse);
-    matrix[0][0] -= REGULARIZATION_XI;
-    matrix[1][1] -= REGULARIZATION_XI;
-    if (DIMENSION == 3u) {
-        matrix[2][2] -= REGULARIZATION_XI;
-    }
-    if (abs(determinant(matrix)) <= REGULARIZATION_DETERMINANT_THRESHOLD) {
-        return regularized_inverse;
-    }
-    return inverse(matrix);
-}
-
 // 1 for the components of scalar vec4 `vec4_index` that hold a declared field,
 // 0 for padding (fields 4 v + c >= SCALAR_FIELD_COUNT). Constant after
 // specialization once the loop over vec4_index is unrolled.

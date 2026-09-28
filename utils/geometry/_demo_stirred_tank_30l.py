@@ -288,7 +288,7 @@ numerics:
   delta_coefficient: 0.1
   use_kcg_correction: true
   regularization:
-    xi: 0.1
+    xi: 0.01      # 0.1 until 2026-09-28: it made (M + xi I)^-1 about 8 % too small (log/2026-09-28_kcg-xi-0p01.md)
     det_threshold: 1.0e-4
     frobenius_max: 10.0
   use_pst: true
@@ -412,6 +412,9 @@ def main() -> int:
     parser.add_argument("--dx", type=float, default=0.003, help="particle spacing (m)")
     parser.add_argument("--hdx", type=float, default=3.0, help="h/dx (kernel support radius in spacings; non-integer allowed, e.g. 2.5)")
     parser.add_argument("--thin-layers", type=int, default=3, help="minimum layers across thin solids")
+    parser.add_argument("--skin", type=float, default=0.5,
+                        help="rotor / baffle / probe sites are claimed up to this many spacings outside "
+                             "the solid surface (default 0.5; 0 = site centre inside the solid)")
     parser.add_argument("--border", type=int, default=None, help="wall shell layers (default = hdx)")
     parser.add_argument("--out", default="cases/stirred_tank_30l")
     parser.add_argument("--max-per-voxel", type=int, default=None)
@@ -465,10 +468,16 @@ def main() -> int:
     sdf_rotor = rotor_region.signed_distance(sites)
     sdf_wall_solid = wall_solid.signed_distance(sites)
 
-    # Solids claim their interior plus a half-spacing skin so no fluid site sits
-    # closer than ~0.5 dx to a solid surface.
-    is_rotor = sdf_rotor <= 0.5 * dx
-    is_wall_solid = (sdf_wall_solid <= 0.5 * dx) & ~is_rotor
+    # Solids claim their interior plus a skin of `--skin` spacings (default 0.5).
+    # The skin moves the effective solid surface outward by that amount, i.e. every
+    # solid dimension grows by 2 * skin * dx (2026-09-28: measured on the 3 mm case,
+    # blades 12.5 mm instead of the nominal 9 mm, Rushton tip particles at 49.2 mm
+    # instead of 48.0). It is not needed to keep fluid and solid sites apart: they
+    # share one lattice, so their centres are at least dx apart for any skin.
+    # --skin 0 claims a site only when its centre lies inside the solid.
+    skin = args.skin * dx
+    is_rotor = sdf_rotor <= skin
+    is_wall_solid = (sdf_wall_solid <= skin) & ~is_rotor
     is_fluid = (sdf_interior <= -0.5 * dx) & ~is_rotor & ~is_wall_solid
     # Everything else inside the frame that is not liquid = tank shell (walls, floor, lid).
     is_shell = ~is_fluid & ~is_rotor & ~is_wall_solid & (sdf_interior > -0.5 * dx)

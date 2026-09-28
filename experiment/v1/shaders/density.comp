@@ -109,9 +109,11 @@ void main() {
     // Scalar SGS (2026-09-27): velocity gradient of a FLUID particle,
     //     G = grad v_i = sum_j V_j (v_j - v_i) (x) M_i^-1 grad W_ij
     //       = [sum_j V_j (v_j - v_i) (x) grad W_ij] M_i^-1        (M symmetric)
-    // with the UNREGULARIZED M_i^-1 (unregularized_correction_inverse, the
-    // stored (M + xi I)^-1 is 7.6 % too small on the h/dx = 3 lattice), which
-    // makes it first-order consistent. The raw sum is accumulated in the loop
+    // with the stored KCG inverse (M + xi I)^-1. With xi = 0.01 it is 0.8 %
+    // smaller than M^-1 on the h/dx = 3 lattice, so the gradient is first-order
+    // consistent to that accuracy (until 2026-09-28 xi was 0.1, the stored
+    // inverse 7.6 % too small, and a helper undid the regularisation here).
+    // The raw sum is accumulated in the loop
     // (it needs exactly the neighbour velocity and volume this kernel already
     // reads) and multiplied by M_i^-1 once afterwards. Solid neighbours are
     // included: their (wall or rotor) velocity is the no-slip boundary value.
@@ -311,8 +313,7 @@ void main() {
     // ========================================================================
     if (USE_SCALAR_SGS && self_is_fluid) {
         if (USE_KCG_CORRECTION) {
-            velocity_gradient = velocity_gradient
-                              * unregularized_correction_inverse(self_correction_matrix);
+            velocity_gradient = velocity_gradient * self_correction_matrix;
         }
         mat3  strain_rate = 0.5 * (velocity_gradient + transpose(velocity_gradient));
         float strain_rate_contracted = dot(strain_rate[0], strain_rate[0])
