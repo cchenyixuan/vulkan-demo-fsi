@@ -354,7 +354,7 @@ numerics:
   delta_coefficient: 0.1
   use_kcg_correction: true
   regularization:
-    xi: 0.01      # 0.1 until 2026-09-28: it made (M + xi I)^-1 about 8 % too small (log/2026-09-28_kcg-xi-0p01.md)
+    xi: {xi:g}      # default 0.01; 0.1 until 2026-09-28: it made (M + xi I)^-1 about 8 % too small (log/2026-09-28_kcg-xi-0p01.md)
     det_threshold: 1.0e-4
     frobenius_max: 10.0
   use_pst: true
@@ -392,17 +392,17 @@ schema_version: 1
 tank_water:
   kind: fluid
   rest_density: 998.0
-  viscosity: 1.0e-6
+  viscosity: {viscosity:.6e}
 
 tank_wall:
   kind: boundary
   rest_density: 998.0
-  viscosity: 1.0e-6
+  viscosity: {viscosity:.6e}
 
 impeller:
   kind: rotor
   rest_density: 998.0
-  viscosity: 1.0e-6
+  viscosity: {viscosity:.6e}
   rotor_angular_velocity: {omega:.5f}   # rad/s, right-hand sign about +y (= M-Star -200 rpm, CCW from above, PBT down-pumping)
 """
 
@@ -481,6 +481,12 @@ def main() -> int:
     parser.add_argument("--clip-tips", action="store_true",
                         help="blades with the true PBT length (48.2 mm) and cut at the true tip radius "
                              "(Rushton 48.0 mm, PBT 49.1 mm) instead of the plain boxes")
+    parser.add_argument("--xi", type=float, default=0.01, help="KCG regularisation numerics.regularization.xi")
+    parser.add_argument("--viscosity", type=float, default=1.0e-6,
+                        help="kinematic viscosity written for all three materials (m^2/s). The Morris viscous "
+                             "term is 0.841 of the exact operator on the h/dx = 3 lattice with xi = 0.01 "
+                             "(_check_operator_consistency.py), so 1.0e-6 / 0.8408 = 1.18934e-6 gives an "
+                             "effective viscosity of 1.0e-6")
     parser.add_argument("--conformal-blades", action="store_true",
                         help="blade particles on plane grids in the blades' own frames (--thin-layers flat "
                              "layers, true outline) instead of lattice sites; avoids the staircase at which "
@@ -609,8 +615,8 @@ def main() -> int:
         dx=dx, h=h, hdx=args.hdx, thin_layers=args.thin_layers, n_fluid=n_fluid, n_wall=n_wall,
         n_rotor=n_rotor, liquid_height=LIQUID_HEIGHT, tip_speed=TIP_SPEED, c0_factor=args.c0_factor, radius=0.5 * dx, c0=c0,
         pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming,
-        ramp_time=args.ramp_time, gravity_y=-abs(args.gravity)), encoding="utf-8")
-    (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega), encoding="utf-8")
+        ramp_time=args.ramp_time, gravity_y=-abs(args.gravity), xi=args.xi), encoding="utf-8")
+    (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity), encoding="utf-8")
     if args.tracers > 0:
         with open(out / "case.yaml", "a", encoding="utf-8") as handle:
             handle.write(scalars_block(args, h))
