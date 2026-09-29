@@ -34,6 +34,12 @@ steps apart (default 10 steps, about 0.7 ms, a displacement of at most 0.25 dx).
              internal       fluid_torque + rotor_reaction + wall_reaction
                             = torque the fluid receives from fluid-fluid pairs (0 if they conserve)
              angular_momentum, kinetic_energy                  of the fluid
+           --slice-dir DIR --slice-interval 0.1 [--slice-half-width 1.0] [--slice-heights ...]
+           (2026-09-29): every --slice-interval seconds of simulated time the fluid particles of
+           a vertical slab through the rotor axis (|z| < half width, in spacings) and of horizontal
+           slabs at --slice-heights are written to DIR/slice_NNNN.npz: position, velocity and the
+           vorticity component omega_z that force.comp computes (acceleration.w), time and rotor
+           angle. Images: _plot_vorticity_slices.py.
   analyze  <python>      _check_blade_leak_tracking.py analyze FRAMES.npz --dx 0.003 --slab 1.0
 
 The result is given as particles per second and as a mass flow, compared with the
@@ -111,6 +117,13 @@ def run(arguments):
                 torque_log = open(arguments.torque_log, "w")
                 torque_log.write("step,time,angle,torque_axis,fx,fy,fz,torque_lower,torque_upper,torque_shaft,"
                                  "wall_torque,baffle_torque,wall_fx,wall_fy,wall_fz\n")
+            slice_directory = None
+            slice_index = 0
+            if arguments.slice_dir:
+                slice_directory = pathlib.Path(arguments.slice_dir)
+                slice_directory.mkdir(parents=True, exist_ok=True)
+                spacing = 2.0 * float(case.physics.particle_radius)
+                slice_half_width = arguments.slice_half_width * spacing
             budget_log = None
             if arguments.budget:
                 if not case.numerics.solid_reaction_force:
@@ -127,6 +140,24 @@ def run(arguments):
             while simulator.step_count < end:
                 simulator.step()
                 step = simulator.step_count
+                if slice_directory is not None and simulator.simulation_time >= slice_index * arguments.slice_interval:
+                    positions = simulator.readback_positions()
+                    fluid = simulator.live_slot_mask(positions) & (simulator.readback_material() == 0)
+                    vertical = fluid & (np.abs(positions[:, 2]) < slice_half_width)
+                    horizontal = np.zeros_like(fluid)
+                    for height in arguments.slice_heights:
+                        horizontal |= fluid & (np.abs(positions[:, 1] - height) < slice_half_width)
+                    selected = vertical | horizontal
+                    acceleration = simulator.readback_acceleration()
+                    np.savez_compressed(
+                        slice_directory / f"slice_{slice_index:04d}.npz",
+                        position=positions[selected, :3].astype(np.float32),
+                        velocity=simulator.readback_velocity_mass()[selected, :3].astype(np.float32),
+                        vorticity_z=acceleration[selected, 3].astype(np.float32),
+                        time=simulator.simulation_time, step=step, rotor_angle=simulator.rotor_angle,
+                        spacing=spacing, half_width=slice_half_width,
+                        heights=np.asarray(arguments.slice_heights, dtype=np.float64))
+                    slice_index += 1
                 if budget_log is not None and step % 1000 == 0:
                     budget = angular_momentum_budget(simulator)
                     budget_log.write(f"{step},{simulator.simulation_time:.6e},"
@@ -278,6 +309,11 @@ def main():
     run_parser.add_argument("--dump", default=None)
     run_parser.add_argument("--status-log", default=None)
     run_parser.add_argument("--budget", default=None)
+    run_parser.add_argument("--slice-dir", default=None)
+    run_parser.add_argument("--slice-interval", type=float, default=0.1, help="seconds of simulated time")
+    run_parser.add_argument("--slice-half-width", type=float, default=1.0, help="half thickness of the slabs, in spacings")
+    run_parser.add_argument("--slice-heights", type=float, nargs="*", default=[0.0384, 0.120, 0.19465, 0.300],
+                            help="heights y of the horizontal slabs (m)")
     analyze_parser = subparsers.add_parser("analyze")
     analyze_parser.add_argument("frames")
     analyze_parser.add_argument("--dx", type=float, default=0.003)

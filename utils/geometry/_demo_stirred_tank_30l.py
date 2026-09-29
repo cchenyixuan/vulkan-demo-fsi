@@ -346,7 +346,7 @@ physics:
   calibrate_volume: true
   speed_of_sound: {c0:.3f}
   power: 7
-  cfl: 0.15
+  cfl: {cfl:g}
   gravity: [0.0, {gravity_y:.3f}, 0.0]
 
 numerics:
@@ -500,6 +500,9 @@ def main() -> int:
     parser.add_argument("--max-incoming", type=int, default=32)
     parser.add_argument("--ramp-time", type=float, default=0.05, help="rotor spin-up time (s)")
     parser.add_argument("--c0-factor", type=float, default=10.0, help="speed of sound = factor * tip speed")
+    parser.add_argument("--cfl", type=float, default=0.15,
+                        help="physics.cfl: dt = cfl * h / c0 with h the kernel support radius (0.15 with "
+                             "h = 3 dx is 0.30 in terms of half the support radius)")
     parser.add_argument("--background-pressure", type=float, default=0.0,
                         help="constant added to the Tait pressure, Pa (physics.background_pressure); keeps the "
                              "pressure behind the blades positive. About rho * U_tip^2 = 1000 Pa. 0 = off")
@@ -622,7 +625,7 @@ def main() -> int:
     print(f"fluid volume check: {n_fluid * dx ** 3 * 1e3:.2f} L of particles vs {liquid_volume * 1e3:.2f} L "
           f"dished tank (minus solids); Rushton clearance {0.5 * (RUSHTON_BLADE['y0'] + RUSHTON_BLADE['y1']) - FLOOR_BOTTOM:.4f} m")
     print(f"max_per_voxel={max_per_voxel} (bound {bound}), c0={c0:.2f} m/s, tip speed {TIP_SPEED:.3f} m/s, "
-          f"dt = {0.15 * h / c0:.3e} s")
+          f"dt = {args.cfl * h / c0:.3e} s")
 
     out = _REPO_ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -635,7 +638,7 @@ def main() -> int:
         dx=dx, h=h, hdx=args.hdx, thin_layers=args.thin_layers, n_fluid=n_fluid, n_wall=n_wall,
         n_rotor=n_rotor, liquid_height=LIQUID_HEIGHT, tip_speed=TIP_SPEED, c0_factor=args.c0_factor, radius=0.5 * dx, c0=c0,
         pool_size=pool_size, max_per_voxel=max_per_voxel, max_incoming=args.max_incoming,
-        ramp_time=args.ramp_time, gravity_y=-abs(args.gravity), xi=args.xi)
+        ramp_time=args.ramp_time, gravity_y=-abs(args.gravity), xi=args.xi, cfl=args.cfl)
     if args.background_pressure != 0.0:
         # written only when used, so that the files of all other cases stay as they were
         assert case_text.count("  gravity: [") == 1
