@@ -116,7 +116,7 @@ def run(arguments):
             if arguments.torque_log:
                 torque_log = open(arguments.torque_log, "w")
                 torque_log.write("step,time,angle,torque_axis,fx,fy,fz,torque_lower,torque_upper,torque_shaft,"
-                                 "wall_torque,baffle_torque,wall_fx,wall_fy,wall_fz\n")
+                                 "wall_torque,baffle_torque,wall_fx,wall_fy,wall_fz,torque_bell\n")
             slice_directory = None
             slice_index = 0
             if arguments.slice_dir:
@@ -202,9 +202,13 @@ def run(arguments):
                         baffle = (wall_radius < 0.1395) & (wall_radius > 0.10) & (wall_positions[:, 1] > 0.0)
                         total = wall_forces.sum(axis=0)
                         torque_log.write(f"{wall_torque.sum():.6e},{wall_torque[baffle].sum():.6e},"
-                                         f"{total[0]:.6e},{total[1]:.6e},{total[2]:.6e}\n")
+                                         f"{total[0]:.6e},{total[1]:.6e},{total[2]:.6e},")
                     else:
-                        torque_log.write("nan,nan,nan,nan,nan\n")
+                        torque_log.write("nan,nan,nan,nan,nan,")
+                    # torque on the rotating bell below the Rushton hub (rotor particles below
+                    # y = 20.5 mm outside the shaft radius); it is part of torque_lower
+                    bell = simulator.readback_rotor_torque(0.0205, 0.007)
+                    torque_log.write(f"{bell['torque_axis_lower']:.6e}\n")
                     torque_log.flush()
                 if step >= arguments.dense_start and (step - arguments.dense_start) % arguments.dense_every == 0:
                     positions = simulator.readback_positions()

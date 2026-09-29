@@ -95,6 +95,17 @@ LEGACY_BAFFLES = dict(y0=0.010, azimuths_deg=(62.0, 182.0, 302.0), radial=(0.125
 
 SHAFT_RADIUS = 0.004
 
+# Rotating bell at the lower end of the shaft, measured 2026-09-29 on sections of the dataset's
+# 'Moving Body_1.stl': a body of revolution that covers the static bearing. Outer profile (y, r):
+# sleeve of radius 8 mm from y = 25 down to 14 mm, cone to r = 21 mm at y = -26 mm, cylinder of
+# radius 21 mm down to y = -57 mm, chamfered rim, lower end at y = -58.3 mm (3.7 mm above the
+# floor). It is hollow (the static bearing sits inside, clearance below 1 mm); here it is a solid
+# of revolution, the static bearing boss inside it is dropped. Until 2026-09-29 the rotor had only
+# the shaft of radius 4 mm here: generator flag --no-rotor-bell.
+ROTOR_BELL_PROFILE = np.array([
+    (-0.0583, 0.0206), (-0.0570, 0.0210), (-0.0260, 0.0210), (0.0140, 0.0080), (0.0250, 0.0080),
+])
+
 RUSHTON_HUB = dict(radius=0.0102, y0=0.0211, y1=0.0414)
 RUSHTON_DISK = dict(radius=0.032, y0=0.0372, y1=0.0397)
 RUSHTON_BLADE = dict(radial=(0.024, 0.048), y0=0.0288, y1=0.048, thickness=2.2e-3, azimuth0_deg=23.1)
@@ -133,6 +144,29 @@ TIP_SPEED = math.pi * 2 * 0.0491 * IMPELLER_RPM / 60.0
 # ----------------------------------------------------------------------------
 # Extra region: liquid volume of the dished tank (2026-09-26)
 # ----------------------------------------------------------------------------
+class RevolvedProfile(Region):
+    """Solid of revolution about the y axis: r < radius(y) for y inside the profile's range,
+    radius(y) piecewise linear through the points (y, r). Approximate signed distance (max of
+    the one-sided distances, the radial one projected on the local surface normal)."""
+
+    def __init__(self, profile):
+        self.profile = np.asarray(profile, dtype=np.float64)
+        self.dimension = 3
+
+    def signed_distance(self, points):
+        pts = np.asarray(points, dtype=np.float64)
+        r = np.hypot(pts[:, 0], pts[:, 2])
+        y = pts[:, 1]
+        radius = np.interp(y, self.profile[:, 0], self.profile[:, 1])
+        slope = np.interp(y, self.profile[:, 0], np.gradient(self.profile[:, 1], self.profile[:, 0]))
+        d_side = (r - radius) / np.sqrt(1.0 + slope ** 2)
+        return np.maximum(np.maximum(d_side, self.profile[0, 0] - y), y - self.profile[-1, 0])
+
+    def bounds(self):
+        radius = self.profile[:, 1].max()
+        return (np.array([-radius, self.profile[0, 0], -radius]), np.array([radius, self.profile[-1, 0], radius]))
+
+
 class DishedTankInterior(Region):
     """Liquid volume: r < radius, floor(r) < y < top, with floor(r) the
     piecewise-linear FLOOR_PROFILE. Approximate SDF = max of the three
@@ -304,7 +338,7 @@ def conformal_baffles(dx, layers, top):
 
 
 def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False, with_blades=True,
-                 legacy_baffles=False, with_baffle_plates=True):
+                 legacy_baffles=False, with_baffle_plates=True, with_bell=True):
     """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
     ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
     and the disk for the Rushton) are kept on the full-length shaft; used for
@@ -318,6 +352,8 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=Fa
 
     disk_mid = 0.5 * (RUSHTON_DISK["y0"] + RUSHTON_DISK["y1"])
     rotor_parts = [y_cylinder(SHAFT_RADIUS, shaft_y0, shaft_y1)]
+    if with_bell:
+        rotor_parts.append(RevolvedProfile(ROTOR_BELL_PROFILE))
     if keep_rushton:
         rotor_parts += [
             y_cylinder(RUSHTON_HUB["radius"], RUSHTON_HUB["y0"], RUSHTON_HUB["y1"]),
@@ -533,6 +569,8 @@ def main() -> int:
                              "term is 0.841 of the exact operator on the h/dx = 3 lattice with xi = 0.01 "
                              "(_check_operator_consistency.py), so 1.0e-6 / 0.8408 = 1.18934e-6 gives an "
                              "effective viscosity of 1.0e-6")
+    parser.add_argument("--no-rotor-bell", action="store_true",
+                        help="rotor without the rotating bell at the lower end of the shaft (as until 2026-09-29)")
     parser.add_argument("--conformal-baffles", action="store_true",
                         help="baffle plates on plane grids in the baffles' own frames (--thin-layers flat "
                              "layers), like --conformal-blades; not with --legacy-baffles")
@@ -617,7 +655,8 @@ def main() -> int:
     rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers,
                                             clip_tips=args.clip_tips, with_blades=not args.conformal_blades,
                                             legacy_baffles=args.legacy_baffles,
-                                            with_baffle_plates=not args.conformal_baffles)
+                                            with_baffle_plates=not args.conformal_baffles,
+                                            with_bell=not args.no_rotor_bell)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 
