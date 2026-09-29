@@ -301,6 +301,7 @@ class RegularizationConfig:
                 f"regularization.frobenius_max must be > 0, got {self.frobenius_max}")
 
 
+PAIR_CORRECTION_MODES = {"own": 0, "mean": 1, "reverse": 2}
 SOLID_PRESSURE_MODES = {"increment": 0, "mirror": 1, "mirror_tic": 2, "accumulate": 3, "extrapolate": 4}
 PST_NEAR_SOLID_MODES = {"full": 0, "tangential": 1}
 
@@ -368,8 +369,14 @@ class NumericsConfig:
     #   "extrapolate": the pressure of the fluid neighbours continued to the solid
     #                  particle (Adami et al. 2012)
     solid_pressure: str = "increment"
-    # FLUID-FLUID pairs use the mean of the two KCG matrices in the pressure and
-    # viscous forces, so that the pair forces are equal and opposite (2026-09-30).
+    # KCG matrices used by the pressure and viscous forces of FLUID-FLUID pairs
+    # (2026-09-30, see common.glsl):
+    #   "own"    : the matrix of the particle itself (the original code)
+    #   "mean"   : the mean of the two matrices, pair forces equal and opposite
+    #   "reverse": reverse kernel gradient correction P_i B_j + P_j B_i
+    #              (Zhang, Adams, Hu 2025), pair forces equal and opposite
+    pair_correction: str = "own"
+    # older spelling of pair_correction: mean
     symmetric_pair_correction: bool = False
     # psi_ij of the density diffusion with the renormalised density gradients
     # (vanishes for a linear density field; needed with gravity).
@@ -391,6 +398,14 @@ class NumericsConfig:
                              f"got {self.solid_pressure!r}")
         if self.solid_pressure in ("mirror", "mirror_tic"):
             self.solid_reaction_force = True
+        if self.pair_correction not in PAIR_CORRECTION_MODES:
+            raise ValueError(f"numerics.pair_correction must be one of {list(PAIR_CORRECTION_MODES)}, "
+                             f"got {self.pair_correction!r}")
+        if self.symmetric_pair_correction:
+            if self.pair_correction not in ("own", "mean"):
+                raise ValueError("numerics.symmetric_pair_correction: true contradicts "
+                                 f"pair_correction: {self.pair_correction}")
+            self.pair_correction = "mean"
         if self.pst_near_solid not in PST_NEAR_SOLID_MODES:
             raise ValueError(f"numerics.pst_near_solid must be one of {list(PST_NEAR_SOLID_MODES)}, "
                              f"got {self.pst_near_solid!r}")
@@ -981,7 +996,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (45,  lambda case: 1 if case.numerics.use_pst               else 0, 'I'),  # USE_PST
     (46,  lambda case: 1 if case.numerics.use_prefix_sum_defrag else 0, 'I'),  # USE_PREFIX_SUM_DEFRAG
     (47,  lambda case: 1 if case.numerics.use_neighbor_list     else 0, 'I'),  # USE_NEIGHBOR_LIST
-    (48,  lambda case: 1 if case.numerics.symmetric_pair_correction else 0, 'I'),  # USE_SYMMETRIC_PAIR_CORRECTION
+    (48,  lambda case: PAIR_CORRECTION_MODES[case.numerics.pair_correction], 'I'),  # PAIR_CORRECTION_MODE
     (50,  lambda case: case.capacities.max_per_voxel,                  'I'),
     (51,  lambda case: case.capacities.workgroup,                      'I'),
     (52,  lambda case: case.capacities.max_incoming,                   'I'),

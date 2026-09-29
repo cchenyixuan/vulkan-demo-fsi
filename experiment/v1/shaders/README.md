@@ -285,7 +285,7 @@ compile `_test_common.comp` by hand as a regression check after
 37       : SOLID_PRESSURE_OFFSET (2026-09-29)
 38       : USE_DENSITY_DIFFUSION_GRADIENT_TERM (2026-09-29)
 39       : PST_NEAR_SOLID_MODE (2026-09-29)
-48       : USE_SYMMETRIC_PAIR_CORRECTION (2026-09-30; fluid-fluid pairs use the mean of the two KCG matrices)
+48       : PAIR_CORRECTION_MODE (2026-09-30; fluid-fluid pairs: 0 own KCG matrix, 1 mean of the two, 2 reverse)
 40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, toggles, ...)
 50 - 53  : capacities + workgroup size + POOL_SIZE
 54 - 55  : ghost pool sizes (multi-GPU remnant, pinned 0)

@@ -244,21 +244,29 @@ layout(constant_id = 46) const bool USE_PREFIX_SUM_DEFRAG = false;
 // (see log/2026-09-25_neighbor-list.md); kept as an opt-in experiment.
 layout(constant_id = 47) const bool USE_NEIGHBOR_LIST = false;
 
-// --- Symmetric pair correction (2026-09-30) ---
-// numerics.symmetric_pair_correction. force.comp corrects the kernel gradient of
+// --- Pair correction of the fluid-fluid forces (2026-09-30) ---
+// numerics.pair_correction. force.comp corrects the kernel gradient of
 // the pair (i, j) with the matrix of particle i: grad W~_ij = M_i^-1 grad W_ij.
 // The force of j on i and the force of i on j then differ by
 //     m V (P_i + P_j) / rho (M_i^-1 - M_j^-1) grad W_ij,
 // a net force on the pair that grows with the absolute pressure and with the
 // disorder of the particles (angular momentum budget of the tank, 2026-09-29:
 // with gravity the fluid-fluid pairs remove 37 to 87 % of the rotor's input).
-// With this switch a FLUID-FLUID pair uses the mean of the two matrices,
-//     grad W~_ij = 1/2 (M_i^-1 + M_j^-1) grad W_ij,
-// for the pressure and the viscous force, and the pair volume 2 m / (rho_i + rho_j)
-// in the viscous force: the two forces are equal and opposite. Fluid-solid pairs,
-// the density equation, the vorticity, the shift and the scalars keep M_i^-1.
-// The gradient of particle i is then no longer exactly first-order consistent.
-layout(constant_id = 48) const bool USE_SYMMETRIC_PAIR_CORRECTION = false;
+// Modes, for FLUID-FLUID pairs only (B = M^-1):
+//   0 "own"    : B_i for everything (the original code).
+//   1 "mean"   : grad W~_ij = 1/2 (B_i + B_j) grad W_ij for the pressure and the
+//                viscous force, pair volume 2 m / (rho_i + rho_j) in the viscous
+//                force. Pressure: (P_i + P_j) 1/2 (B_i + B_j) grad W_ij.
+//   2 "reverse": reverse kernel gradient correction (Zhang, Adams, Hu 2025,
+//                CMAME 433:117484): pressure (P_i B_j + P_j B_i) grad W_ij
+//                    = P_i (B_i + B_j) grad W_ij + (P_j - P_i) B_i grad W_ij,
+//                the second part is the first-order consistent gradient of
+//                particle i. Pairs in the TIC form (P_j - P_i) keep B_i, which
+//                is this second part alone. Viscous force as in mode 1.
+// In modes 1 and 2 the pressure forces of a pair in the (P_i + P_j) form are
+// equal and opposite, and so are the viscous forces. Fluid-solid pairs, the
+// density equation, the vorticity, the shift and the scalars keep B_i.
+layout(constant_id = 48) const uint PAIR_CORRECTION_MODE = 0u;
 // ----- end ablation toggles ------------------------------------------------
 
 // --- Capacity / dispatch ---

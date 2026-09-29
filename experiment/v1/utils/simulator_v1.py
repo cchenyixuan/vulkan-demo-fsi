@@ -42,7 +42,8 @@ import numpy as np
 from vulkan import *
 from vulkan._vulkancache import ffi
 
-from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, PST_NEAR_SOLID_MODES,
+from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, PAIR_CORRECTION_MODES,
+                            PST_NEAR_SOLID_MODES,
                             SOLID_PRESSURE_MODES)
 from utils.sph.vulkan_context import VulkanContext
 
@@ -113,7 +114,7 @@ SPEC_ID_USE_DENSITY_DIFFUSION               = 44
 SPEC_ID_USE_PST                             = 45
 SPEC_ID_USE_PREFIX_SUM_DEFRAG               = 46
 SPEC_ID_USE_NEIGHBOR_LIST                   = 47
-SPEC_ID_USE_SYMMETRIC_PAIR_CORRECTION       = 48
+SPEC_ID_PAIR_CORRECTION_MODE                = 48
 SPEC_ID_MAX_PARTICLES_PER_VOXEL             = 50
 SPEC_ID_WORKGROUP_SIZE                      = 51
 SPEC_ID_MAX_INCOMING_PER_VOXEL              = 52
@@ -862,7 +863,7 @@ class SphSimulatorV1:
             (SPEC_ID_USE_PST,                      1 if numerics.use_pst else 0,              'I'),
             (SPEC_ID_USE_PREFIX_SUM_DEFRAG,        1 if numerics.use_prefix_sum_defrag else 0, 'I'),
             (SPEC_ID_USE_NEIGHBOR_LIST,            1 if numerics.use_neighbor_list else 0,    'I'),
-            (SPEC_ID_USE_SYMMETRIC_PAIR_CORRECTION, 1 if numerics.symmetric_pair_correction else 0, 'I'),
+            (SPEC_ID_PAIR_CORRECTION_MODE,         PAIR_CORRECTION_MODES[numerics.pair_correction], 'I'),
             (SPEC_ID_MAX_PARTICLES_PER_VOXEL,      int(capacities.max_per_voxel),             'I'),
             (SPEC_ID_WORKGROUP_SIZE,               int(capacities.workgroup),                 'I'),
             (SPEC_ID_MAX_INCOMING_PER_VOXEL,       int(capacities.max_incoming),              'I'),

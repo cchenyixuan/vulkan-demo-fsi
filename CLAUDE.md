@@ -130,7 +130,7 @@ run scripts.
   `_global_spec_entries()` in `simulator_v1.py` (and `_SPEC_CONSTANT_MAPPING` in
   `utils/sph/case.py`); all must be edited together.
   Free ranges for new constants: 49, 72–79, 89+ (34 = BACKGROUND_PRESSURE,
-  35 = SOLID_PRESSURE_MODE, 36 = USE_SOLID_REACTION_FORCE, 37 = SOLID_PRESSURE_OFFSET, 38 = USE_DENSITY_DIFFUSION_GRADIENT_TERM, 39 = PST_NEAR_SOLID_MODE, 48 = USE_SYMMETRIC_PAIR_CORRECTION, added 2026-09-29; 47 = USE_NEIGHBOR_LIST,
+  35 = SOLID_PRESSURE_MODE, 36 = USE_SOLID_REACTION_FORCE, 37 = SOLID_PRESSURE_OFFSET, 38 = USE_DENSITY_DIFFUSION_GRADIENT_TERM, 39 = PST_NEAR_SOLID_MODE, 48 = PAIR_CORRECTION_MODE, added 2026-09-29; 47 = USE_NEIGHBOR_LIST,
   62 = MAX_NEIGHBORS, 63–71 = scalar transport, all added on the test branch).
 - **Scalar transport (test branch, 2026-09-27)**: optional case.yaml block
   `scalars:` (fields with molecular diffusivity / SGS flag / initial value,
