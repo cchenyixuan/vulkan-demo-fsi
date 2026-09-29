@@ -2,62 +2,80 @@
 // thin_plates.glsl  (2026-09-30)
 //
 // Thin plates wetted on both sides (impeller blades, the Rushton disk, the
-// baffles), treated with the normal flux (boundary integral) method. Included
-// only by the builds compiled with -DWITH_THIN_PLATES=1 (correction, density,
-// force, defrag); the default builds do not contain any of this.
+// baffles). Included only by the builds compiled with -DWITH_THIN_PLATES=1
+// (density_plates, force_plates, force_scalar_plates); the default builds do
+// not contain any of this.
 //
-// Literature: Gao and Fu 2024 (CMAME 429:117179, 3D, the method followed here),
-// Bao et al. 2024 (CMAME 431:117255), Peng et al. 2021 (JFS 102:103254),
-// Li et al. 2022 (JCP 464:111328), Chiron et al. 2019 (CPC 234:93).
-// docs/thin_wall_normal_flux_study_2026-09-30.md, log/2026-09-30_thin-plates.md.
+// What is wrong with a plate made of one layer of ordinary solid particles
+//   1. A solid particle has ONE pressure, the fluid on both sides reads the
+//      same value. With a shared pressure a pressure difference across the
+//      plate has no state of rest (the balance of the two fluid layers next to
+//      the plate has the only solution P_front = P_back).
+//   2. The support radius is 3 dx, the plate is 1 dx thick: fluid particles on
+//      opposite sides are neighbours of each other.
 //
-// Representation
-//   A plate is a plane rectangle or annulus with a thickness t, described
-//   analytically (ThinPlateBuffer). Its particles lie on the mid-plane and
-//   serve as quadrature points only: they are no volume neighbours of anybody.
-//   A quadrature point k has the two face points
-//       x_s = x_k + s (t / 2) n,      s = +1, -1
-//   and the particle i receives from the face s the surface terms with the
-//   normal n_out = -s n (pointing from the fluid into the plate), if it SEES
-//   the face: the segment from x_i to x_s crosses no plate.
-//   A plate particle is marked by a negative density,
-//       density_pressure[k] = ( -(plate index + 1),  measure of the point ),
-//   measure = area (3D) or length (2D) the point stands for, so that every
-//   neighbour loop recognises it with the load it already makes.
+// Treatment (side-aware mirror; the splitting into sides and the cut of the
+// pairs across the plate are those of the normal flux method, Gao and Fu 2024,
+// CMAME 429:117179, the wall state is the pairwise mirror of Adami et al. 2012
+// with the acoustic term of De Leffe et al. / Chiron et al. 2019)
+//   A plate is a plane rectangle or annulus, described analytically
+//   (ThinPlateBuffer). For a fluid particle i, every neighbour j BEHIND a plate
+//   - a particle of the plate itself, or any particle whose connecting segment
+//   with i crosses the mid-plane of the plate inside its outline - is a dummy
+//   particle of the wall:
+//       velocity   v_j := velocity of the plate at x_j (0, or omega x r)
+//       pressure   particle i over the plate:
+//                  P_j := P_i + G_i . d_t + rho_i [(g - a_w) . n] (n . d)
+//                         + beta rho_i c0 (v_i - v_j) . n_out
+//                  particle i beside the plate (its projection outside the outline):
+//                  P_j := P_i + G_i . d
+//                  d = x_j - x_i, d_t its part along the plate
+//       no density diffusion, no scalar flux, the matrix of particle i.
+//   G_i is the pressure gradient of the fluid on the side of particle i (from
+//   the density gradient of the neighbours that are not behind a plate,
+//   correction.comp): along the wall the pressure of the fluid continues into
+//   the dummies (as it does in the wall particles of Adami et al. 2012, whose
+//   pressure is a mean over the fluid next to them); normal to the wall the
+//   gradient is the one a fluid at the wall has, dp/dn = rho (g - a_w) . n.
+//   a_w is the acceleration of the plate at x_j (rotor: centripetal plus the
+//   angular acceleration of the ramp), n_out the normal of the plate pointing
+//   away from the side of particle i. beta = numerics.thin_plate_dashpot,
+//   default 0: with beta = 1 a fluid that approaches a plate at 5 % of the tip
+//   speed at the distance of one spacing already gives rho U^2.
+//   Everything else is untouched: the correction matrix, the kernel sum and
+//   the particle shift see all particles as they are, so the support of every
+//   particle is complete also next to a plate edge.
 //
-// Pairs across a plate
-//   A pair (i, j) whose segment crosses a plate inside its outline does not
-//   interact: pressure, viscosity, continuity, diffusion, scalars, correction
-//   matrix. The PARTICLE SHIFT and the KERNEL SUM ignore the cut: they see
-//   every neighbour, and a plate point as one particle of a layer of the
-//   spacing dx. The shift only regularises the arrangement of the particles;
-//   computed on the cut neighbourhood it has no state of rest next to a plate
-//   edge (the neighbourhood ends at the surfaces through the edge, where there
-//   is fluid) and pumps particles around the edge (free edge test,
-//   2026-09-30: 222 particles through the plate in 0.54 s).
+//   The surface integral form of the literature was implemented first and is
+//   in the history (commit 441deb4, log/2026-09-30_thin-plates-normal-flux.md):
+//   cutting the pairs without filling the region behind the plate leaves the
+//   support incomplete at the surfaces through the plate edges; under an
+//   absolute pressure of 1 kPa the symmetric form then stirs the fluid at rest
+//   to 0.3 m/s and the difference form is linearly unstable.
 //
-// Surface terms (B_i = inverse of the correction matrix of particle i, which
-// itself contains the surface term, w_k = measure * V_p / dx^d):
-//   matrix      N_i  += w_k W_is  n_out (x) (x_s - x_i)
-//   continuity  d rho_i / dt += rho_i w_k W_is (v_i - v_k) . B_i n_out
-//   pressure    a_i  -= w_k W_is / rho_i  (P_i + P_ik)  B_i n_out      (or P_ik - P_i)
-//   wall pressure    P_ik = P_i + rho_i (g - a_k) . (x_s - x_i)
-//                           + beta rho_i c0 (v_i - v_k) . n_out
-//   viscosity   a_i  += 2 nu w_k W_is (v_i - v_k) (x_i - x_s) . B_i n_out / (r^2 + eta^2)
-//   shift       not a surface term, see above; its part pointing into a plate
-//               is removed closer than half a spacing to the face
-//   load on the plate (read back): pressure integration without B_i,
-//       F_k = sum_i (m_i / rho_i) measure [ (P_i + P_ik) n_out W_is - viscous term ]
+// A plate particle is marked in the PRESSURE slot,
+//     density_pressure[k] = ( rho0,  -(plate index + 1) * THIN_PLATE_MARKER ),
+// so that every neighbour loop recognises it with the load it already makes;
+// its density stays rho0 (it is a particle of the volume V_p like any other).
+//
+// Load on the plates (read back): the reaction. force.comp stores for every
+// fluid particle the force it received from the wall dummies of thin plates
+// (ThinPlateReactionBuffer); the load on the plates is minus their sum, the
+// torque about the rotor axis minus the sum of x_i x f_i. A pressure
+// integration over the plate particles (Shepard mean per face times the area)
+// was used first; it was 10 - 30 % below what the fluid received (rotating
+// paddle test, log/2026-09-30_thin-plates-mirror.md).
 // ============================================================================
 
 #ifndef SPH_THIN_PLATES_GLSL_INCLUDED
 #define SPH_THIN_PLATES_GLSL_INCLUDED
 
-const uint MAX_NEAR_THIN_PLATES       = 4u;
-const uint THIN_PLATE_SHAPE_RECTANGLE = 0u;
-const uint THIN_PLATE_SHAPE_ANNULUS   = 1u;
-const uint THIN_PLATE_FRAME_STATIC    = 0u;
-const uint THIN_PLATE_FRAME_ROTOR     = 1u;
+const uint  MAX_NEAR_THIN_PLATES       = 4u;
+const uint  THIN_PLATE_SHAPE_RECTANGLE = 0u;
+const uint  THIN_PLATE_SHAPE_ANNULUS   = 1u;
+const uint  THIN_PLATE_FRAME_STATIC    = 0u;
+const uint  THIN_PLATE_FRAME_ROTOR     = 1u;
+const float THIN_PLATE_MARKER          = 1.0e9;   // Pa; must match simulator_v1.py
 
 // A plate close to the particle this invocation works on, in world
 // coordinates at the current rotor angle.
@@ -69,8 +87,9 @@ struct NearThinPlate {
     float extent_a;          // rectangle: half length along axis_a; annulus: outer radius
     float extent_b;          // rectangle: half length along axis_b; annulus: inner radius
     float half_thickness;
-    float point_measure;     // area (3D) or length (2D) of one quadrature point
+    float point_measure;     // area (3D) or length (2D) of one plate particle
     float self_distance;     // normal . (x_self - centre)
+    bool  self_over_plate;   // the projection of x_self lies inside the outline
     uint  shape;
     uint  frame;
     uint  index;
@@ -100,8 +119,8 @@ float thin_plate_outline_gap_squared(uint shape, float extent_a, float extent_b,
     return dot(gap, gap);
 }
 
-// Fill near_thin_plate[] with the plates whose slab comes closer than the
-// support radius to `position`.
+// Fill near_thin_plate[] with the plates that come closer than the support
+// radius to `position`.
 void gather_near_thin_plates(vec3 position) {
     near_thin_plate_count = 0u;
     vec3 rotor_axis  = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
@@ -125,12 +144,9 @@ void gather_near_thin_plates(vec3 position) {
             float distance_normal = dot(relative, plate.normal_extent_b.xyz);
             float coordinate_a    = dot(relative, plate.axis_a_half_thickness.xyz);
             float coordinate_b    = dot(relative, plate.axis_b_measure.xyz);
-            float half_thickness  = plate.axis_a_half_thickness.w;
-            float gap_normal      = max(abs(distance_normal) - half_thickness, 0.0);
-            float gap_squared     = gap_normal * gap_normal
-                + thin_plate_outline_gap_squared(plate.flags.x, plate.centre_extent_a.w,
-                                                 plate.normal_extent_b.w, coordinate_a, coordinate_b);
-            if (gap_squared >= smoothing_length_squared()) continue;
+            float outline_gap_squared = thin_plate_outline_gap_squared(
+                plate.flags.x, plate.centre_extent_a.w, plate.normal_extent_b.w, coordinate_a, coordinate_b);
+            if (distance_normal * distance_normal + outline_gap_squared >= smoothing_length_squared()) continue;
             if (near_thin_plate_count >= MAX_NEAR_THIN_PLATES) return;
 
             NearThinPlate entry;
@@ -140,19 +156,20 @@ void gather_near_thin_plates(vec3 position) {
             entry.axis_b = plate.axis_b_measure.xyz;
             if (rotor_frame) {
                 entry.centre = rotor_pivot + rotate_about_axis(entry.centre - rotor_pivot, rotor_axis,
-                                                              rotor_cos_theta, rotor_sin_theta);
+                                                               rotor_cos_theta, rotor_sin_theta);
                 entry.normal = rotate_about_axis(entry.normal, rotor_axis, rotor_cos_theta, rotor_sin_theta);
                 entry.axis_a = rotate_about_axis(entry.axis_a, rotor_axis, rotor_cos_theta, rotor_sin_theta);
                 entry.axis_b = rotate_about_axis(entry.axis_b, rotor_axis, rotor_cos_theta, rotor_sin_theta);
             }
-            entry.extent_a       = plate.centre_extent_a.w;
-            entry.extent_b       = plate.normal_extent_b.w;
-            entry.half_thickness = half_thickness;
-            entry.point_measure  = plate.axis_b_measure.w;
-            entry.self_distance  = distance_normal;
-            entry.shape          = plate.flags.x;
-            entry.frame          = plate.flags.y;
-            entry.index          = plate_index;
+            entry.extent_a        = plate.centre_extent_a.w;
+            entry.extent_b        = plate.normal_extent_b.w;
+            entry.half_thickness  = plate.axis_a_half_thickness.w;
+            entry.point_measure   = plate.axis_b_measure.w;
+            entry.self_distance   = distance_normal;
+            entry.self_over_plate = (outline_gap_squared == 0.0);
+            entry.shape           = plate.flags.x;
+            entry.frame           = plate.flags.y;
+            entry.index           = plate_index;
             near_thin_plate[near_thin_plate_count] = entry;
             near_thin_plate_count++;
         }
@@ -174,135 +191,86 @@ bool thin_plate_slot_blocks_segment(uint slot, vec3 from_position, vec3 to_posit
                                        dot(crossing, near_thin_plate[slot].axis_b));
 }
 
-// Is the pair separated by one of the near plates?
-bool thin_plate_blocks_segment(vec3 from_position, vec3 to_position) {
+// First near plate that separates the pair; MAX_NEAR_THIN_PLATES if none.
+uint thin_plate_blocking_slot(vec3 from_position, vec3 to_position) {
     for (uint slot = 0u; slot < near_thin_plate_count; slot++) {
-        if (thin_plate_slot_blocks_segment(slot, from_position, to_position)) return true;
+        if (thin_plate_slot_blocks_segment(slot, from_position, to_position)) return slot;
     }
-    return false;
+    return MAX_NEAR_THIN_PLATES;
 }
 
-// A plate particle stores -(plate index + 1) as its density.
-bool is_thin_plate_point(float stored_density) {
-    return stored_density < 0.0;
+// A plate particle stores -(plate index + 1) * THIN_PLATE_MARKER as its pressure.
+bool is_thin_plate_particle(float stored_pressure) {
+    return stored_pressure < -0.5 * THIN_PLATE_MARKER;
 }
 
-// Slot of the plate a quadrature point belongs to; MAX_NEAR_THIN_PLATES if the
+// Slot of the plate a plate particle belongs to; MAX_NEAR_THIN_PLATES if that
 // plate is not in the near list.
-uint thin_plate_slot_of_point(float stored_density) {
-    uint plate_index = uint(-stored_density - 0.5);
+uint thin_plate_slot_of_particle(float stored_pressure) {
+    uint plate_index = uint(-stored_pressure / THIN_PLATE_MARKER - 0.5);
     for (uint slot = 0u; slot < near_thin_plate_count; slot++) {
         if (near_thin_plate[slot].index == plate_index) return slot;
     }
     return MAX_NEAR_THIN_PLATES;
 }
 
-// Faces of the quadrature point `point_position` (on the mid-plane of the near
-// plate `slot`) that the particle at `viewer` sees. face 0 is the face on the
-// viewer's own side, if it is seen at all.
-uint thin_plate_visible_faces(uint slot, vec3 point_position, vec3 viewer,
-                              out vec3 face_position[2], out vec3 face_normal_out[2],
-                              out bool face_is_own_side[2]) {
-    vec3  normal          = near_thin_plate[slot].normal;
-    vec3  centre          = near_thin_plate[slot].centre;
-    float half_thickness  = near_thin_plate[slot].half_thickness;
-    float viewer_distance = dot(normal, viewer - centre);
-    float own_side        = (viewer_distance >= 0.0) ? 1.0 : -1.0;
-    uint  face_count      = 0u;
-    for (uint candidate = 0u; candidate < 2u; candidate++) {
-        float side     = (candidate == 0u) ? own_side : -own_side;
-        vec3  position = point_position + side * half_thickness * normal;
-        vec3  offset   = position - viewer;
-        float distance_squared = dot(offset, offset);
-        if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
-
-        bool visible = true;
-        if (viewer_distance * side <= 0.0) {
-            // the viewer is on the other side of the mid-plane (or on it): the
-            // face is seen only past the edge of the plate
-            float face_distance = side * half_thickness;
-            float denominator   = viewer_distance - face_distance;
-            float fraction      = (abs(denominator) > 1e-12) ? viewer_distance / denominator : 0.0;
-            vec3  crossing      = viewer + fraction * offset - centre;
-            visible = !thin_plate_outline_contains(near_thin_plate[slot].shape,
-                                                   near_thin_plate[slot].extent_a,
-                                                   near_thin_plate[slot].extent_b,
-                                                   dot(crossing, near_thin_plate[slot].axis_a),
-                                                   dot(crossing, near_thin_plate[slot].axis_b));
-        }
-        for (uint other = 0u; visible && other < near_thin_plate_count; other++) {
-            if (other == slot) continue;
-            if (thin_plate_slot_blocks_segment(other, viewer, position)) visible = false;
-        }
-        if (!visible) continue;
-        face_position[face_count]    = position;
-        face_normal_out[face_count]  = -side * normal;
-        face_is_own_side[face_count] = (viewer_distance * side > 0.0);
-        face_count++;
+// For the particle at `position` (the one the near list was gathered for) and
+// its neighbour: the plate the neighbour is a wall dummy of, or
+// MAX_NEAR_THIN_PLATES if it is an ordinary neighbour.
+uint thin_plate_wall_slot(vec3 position, vec3 neighbor_position, float neighbor_stored_pressure) {
+    if (is_thin_plate_particle(neighbor_stored_pressure)) {
+        return thin_plate_slot_of_particle(neighbor_stored_pressure);
     }
-    return face_count;
+    return thin_plate_blocking_slot(position, neighbor_position);
 }
 
-// Weight of a quadrature point in the sums of a particle with the calibrated
-// volume V_p: measure * V_p / dx^d. The correction matrix carries the inverse
-// factor dx^d / V_p, so that B_i n W w is the surface term of the true area.
-float thin_plate_point_weight(uint slot, float particle_volume, float particle_radius) {
-    float spacing = 2.0 * particle_radius;
-    float cell    = (DIMENSION == 3u) ? spacing * spacing * spacing : spacing * spacing;
-    return near_thin_plate[slot].point_measure * particle_volume / cell;
-}
-
-// Acceleration of a point of the plate (centripetal for a rotor plate).
-vec3 thin_plate_point_acceleration(uint slot, vec3 position) {
+// Velocity and acceleration of the plate `slot` at a point (rigid rotation for
+// a rotor plate: centripetal part plus the angular acceleration of the ramp).
+vec3 thin_plate_velocity(uint slot, vec3 position) {
     if (near_thin_plate[slot].frame != THIN_PLATE_FRAME_ROTOR) return vec3(0.0);
-    return solid_particle_acceleration(MATERIAL_ROTOR, position);
+    vec3 rotor_axis = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
+    vec3 arm        = position - vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
+    return rotor_angular_velocity_now * cross(rotor_axis, arm);
 }
 
-// Pressure on the face as the fluid particle sees it.
-float thin_plate_wall_pressure(uint slot, float fluid_pressure, float fluid_density,
-                               vec3 fluid_position, vec3 fluid_velocity,
-                               vec3 face_position, vec3 face_normal_out, vec3 point_velocity,
-                               bool face_is_own_side, float rest_density, float particle_radius) {
-    vec3 relative_body_force = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z)
-                             - thin_plate_point_acceleration(slot, face_position);
-    // penalty: the particle stands over the plate, closer than a quarter spacing
-    // to the face on its own side (or between that face and the mid-plane)
-    float approach = 0.0;
-    if (face_is_own_side) {
-        vec3 relative = fluid_position - near_thin_plate[slot].centre;
-        if (thin_plate_outline_contains(near_thin_plate[slot].shape,
-                                        near_thin_plate[slot].extent_a, near_thin_plate[slot].extent_b,
-                                        dot(relative, near_thin_plate[slot].axis_a),
-                                        dot(relative, near_thin_plate[slot].axis_b))) {
-            float gap       = dot(fluid_position - face_position, -face_normal_out);
-            float gap_limit = 0.5 * particle_radius;
-            approach = clamp(1.0 - gap / gap_limit, 0.0, 4.0);
-        }
-    }
-    return fluid_pressure
-         + fluid_density * dot(relative_body_force, face_position - fluid_position)
-         + THIN_PLATE_DASHPOT * fluid_density * SPEED_OF_SOUND
-           * dot(fluid_velocity - point_velocity, face_normal_out)
-         + THIN_PLATE_PENALTY * rest_density * SPEED_OF_SOUND * SPEED_OF_SOUND * approach * approach;
+vec3 thin_plate_acceleration(uint slot, vec3 position) {
+    if (near_thin_plate[slot].frame != THIN_PLATE_FRAME_ROTOR) return vec3(0.0);
+    vec3 rotor_axis = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
+    vec3 arm        = position - vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
+    return solid_particle_acceleration(MATERIAL_ROTOR, position)
+         + rotor_angular_acceleration_now * cross(rotor_axis, arm);
 }
 
-// Shift of a particle next to a plate: remove the part that points into the
-// plate, for every near plate the particle stands over at less than half a
-// spacing from the face.
-vec3 thin_plate_limit_shift(vec3 shift, vec3 position, float particle_radius) {
-    for (uint slot = 0u; slot < near_thin_plate_count; slot++) {
-        vec3  relative = position - near_thin_plate[slot].centre;
-        float distance_normal = dot(relative, near_thin_plate[slot].normal);
-        if (abs(distance_normal) - near_thin_plate[slot].half_thickness >= particle_radius) continue;
-        if (!thin_plate_outline_contains(near_thin_plate[slot].shape,
-                                         near_thin_plate[slot].extent_a, near_thin_plate[slot].extent_b,
-                                         dot(relative, near_thin_plate[slot].axis_a),
-                                         dot(relative, near_thin_plate[slot].axis_b))) continue;
-        vec3  away = ((distance_normal >= 0.0) ? 1.0 : -1.0) * near_thin_plate[slot].normal;
-        float toward_plate = -dot(shift, away);
-        if (toward_plate > 0.0) shift += toward_plate * away;
+// Pressure of a wall dummy at `dummy_position` as the fluid particle sees it.
+// `fluid_distance` is the signed distance of the fluid particle from the
+// mid-plane, `over_plate` whether it stands over the plate,
+// `fluid_pressure_gradient` the pressure gradient of the fluid on its side.
+float thin_plate_mirror_pressure(uint slot, float fluid_pressure, float fluid_density,
+                                 vec3 fluid_position, vec3 fluid_velocity,
+                                 float fluid_distance, bool over_plate, vec3 dummy_position,
+                                 vec3 fluid_pressure_gradient) {
+    vec3 offset = dummy_position - fluid_position;
+    if (!over_plate) {
+        // beside the plate: the field of this side continued into the shadow
+        return fluid_pressure + dot(fluid_pressure_gradient, offset);
     }
-    return shift;
+    // Over the plate. Along the wall: the gradient of the fluid. Normal to it:
+    // dp/dn = rho (g - a_w) . n. (With the full vector (g - a_w) the dummies of
+    // a rotor plate would carry the gradient rho omega^2 r of a fluid turning
+    // rigidly with the plate, which is not the state of the fluid a blade
+    // throws outward.)
+    vec3  plate_normal  = near_thin_plate[slot].normal;
+    float offset_normal = dot(plate_normal, offset);
+    vec3  relative_body_force = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z)
+                              - thin_plate_acceleration(slot, dummy_position);
+    float mirror = fluid_pressure
+                 + dot(fluid_pressure_gradient, offset - offset_normal * plate_normal)
+                 + fluid_density * dot(relative_body_force, plate_normal) * offset_normal;
+    // acoustic term (off by default): the fluid approaches the plate
+    vec3 normal_out = ((fluid_distance >= 0.0) ? -1.0 : 1.0) * plate_normal;
+    mirror += THIN_PLATE_DASHPOT * fluid_density * SPEED_OF_SOUND
+            * dot(fluid_velocity - thin_plate_velocity(slot, dummy_position), normal_out);
+    return mirror;
 }
 
 #endif  // SPH_THIN_PLATES_GLSL_INCLUDED

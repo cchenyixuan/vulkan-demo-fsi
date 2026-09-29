@@ -89,9 +89,8 @@ void main() {
     float self_density  = density_pressure[self_particle_id].x;   // ρ_n
 
 #if WITH_THIN_PLATES
-    // Thin plates (2026-09-30): a plate particle keeps its marker
-    // (-(plate index + 1), measure of the point).
-    if (is_thin_plate_point(self_density)) {
+    // Thin plates (2026-09-30): a plate particle keeps rho0 and its marker.
+    if (is_thin_plate_particle(density_pressure[self_particle_id].y)) {
         density_pressure_scratch[self_particle_id] = density_pressure[self_particle_id];
         return;
     }
@@ -220,36 +219,26 @@ void main() {
             float neighbor_mass     = velocity_mass[neighbor_particle_id].w;
             vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
             float neighbor_density  = neighbor_density_pressure.x;
-#if WITH_THIN_PLATES
-            if (is_thin_plate_point(neighbor_density)) {
-                // quadrature point of a plate: surface term of the continuity equation,
-                //     d rho_i / dt += rho_i w_k W_is (v_i - v_k) . B_i n_out.
-                // It takes no part in the density diffusion. (A solid self never
-                // gets here: solid-solid pairs are skipped above.)
-                uint slot = thin_plate_slot_of_point(neighbor_density);
-                if (slot == MAX_NEAR_THIN_PLATES || !self_is_fluid) continue;
-                vec3 face_position[2];
-                vec3 face_normal_out[2];
-                bool face_is_own_side[2];
-                uint face_count = thin_plate_visible_faces(slot, neighbor_position, self_position,
-                                                           face_position, face_normal_out, face_is_own_side);
-                float point_weight = thin_plate_point_weight(slot, self_params.volume, self_params.radius);
-                for (uint face = 0u; face < face_count; face++) {
-                    float face_kernel = evaluate_kernel(length(face_position[face] - self_position));
-                    vec3  corrected_normal = self_correction_matrix * face_normal_out[face];
-                    density_drift += self_density * point_weight * face_kernel
-                                   * dot(self_velocity - neighbor_velocity, corrected_normal);
-                    if (USE_SCALAR_SGS) {
-                        velocity_gradient += point_weight * face_kernel
-                            * outerProduct(neighbor_velocity - self_velocity, face_normal_out[face]);
-                    }
-                }
-                continue;
-            }
-            if (near_thin_plate_count > 0u
-                    && thin_plate_blocks_segment(self_position, neighbor_position)) continue;
-#endif
             float neighbor_volume   = neighbor_mass / neighbor_density;
+#if WITH_THIN_PLATES
+            // A neighbour behind a plate (a plate particle, or any particle whose
+            // segment to this one crosses the plate) is a dummy particle of the wall:
+            // it moves with the plate and takes no part in the density diffusion.
+            bool neighbor_is_wall_dummy = false;
+            if (near_thin_plate_count > 0u) {
+                uint wall_slot = thin_plate_wall_slot(self_position, neighbor_position,
+                                                      neighbor_density_pressure.y);
+                if (self_is_solid) {
+                    // the fluid behind a plate does not reach an ordinary solid particle
+                    if (wall_slot != MAX_NEAR_THIN_PLATES) continue;
+                } else if (wall_slot != MAX_NEAR_THIN_PLATES) {
+                    neighbor_is_wall_dummy = true;
+                    neighbor_velocity = thin_plate_velocity(wall_slot, neighbor_position);
+                } else if (is_thin_plate_particle(neighbor_density_pressure.y)) {
+                    continue;
+                }
+            }
+#endif
             if (SOLID_PRESSURE_MODE == 4u && self_is_solid) {
                 // only fluid neighbours reach this point for a solid self
                 float kernel_value = evaluate_kernel(distance);
@@ -286,7 +275,11 @@ void main() {
             // --- δ-SPH density diffusion (gated by USE_DENSITY_DIFFUSION) -
             // Spec-const branch: glslc -O DCE-removes the entire body when
             // USE_DENSITY_DIFFUSION = false → vanilla WCSPH continuity.
+#if WITH_THIN_PLATES
+            if (USE_DENSITY_DIFFUSION && !neighbor_is_wall_dummy) {
+#else
             if (USE_DENSITY_DIFFUSION) {
+#endif
                 // --- ψ_ij ---------------------------------------------------
                 // V0 simplification: ψ_ij = (ρ_j - ρ_i) only (linear form).
                 // Full Antuono δ-plus formulation also includes an antisymmetric

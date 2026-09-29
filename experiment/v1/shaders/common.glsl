@@ -270,42 +270,26 @@ layout(constant_id = 48) const uint PAIR_CORRECTION_MODE = 0u;
 // ----- end ablation toggles ------------------------------------------------
 
 // --- Thin plates wetted on both sides (2026-09-30) ---
-// Normal flux (boundary integral) treatment of the blades, the Rushton disk and
-// the baffles, see thin_plates.glsl. The code exists only in the builds
-// compiled with -DWITH_THIN_PLATES=1 (correction_plates, density_plates,
-// force_plates, force_scalar_plates, defrag_plates; compile_shaders_v1.py); the
-// simulator uses them for cases with a `thin_plates:` block. The default
-// builds are byte-identical to those before this change.
+// Side-aware mirror treatment of the blades, the Rushton disk and the baffles,
+// see thin_plates.glsl. The code exists only in the builds compiled with
+// -DWITH_THIN_PLATES=1 (density_plates, force_plates, force_scalar_plates;
+// compile_shaders_v1.py); the simulator uses them for cases with a
+// `thin_plates:` block. The default builds are byte-identical to those before
+// this change. ids 73 and 76 were used by the surface integral form (commit
+// 441deb4) and are free again. Builds: correction_plates, density_plates,
+// force_plates, force_scalar_plates.
 #ifndef WITH_THIN_PLATES
 #define WITH_THIN_PLATES 0
 #endif
 #if WITH_THIN_PLATES
 layout(constant_id = 49) const uint  THIN_PLATE_COUNT       = 0u;
 layout(constant_id = 72) const uint  THIN_PLATE_GROUP_COUNT = 0u;
-// numerics.thin_plate_pressure_form:
-//   0 "tic"       : a particle near a plate follows its TIC switch like any
-//                   other particle (the form of the literature).
-//   1 "difference": a particle with a plate inside its support uses the
-//                   difference form (P_j - P_i), (P_ik - P_i) for ALL its pairs.
-//                   Cutting the pairs across a plate truncates the support at
-//                   the surfaces through the plate edges where there is no
-//                   wall; in the symmetric form this leaves a force
-//                   2 P_i / rho_i * (integral of W n over those surfaces),
-//                   proportional to the ABSOLUTE pressure. The difference form
-//                   is the symmetric form minus exactly this residual.
-layout(constant_id = 73) const uint  THIN_PLATE_PRESSURE_FORM = 1u;
-// numerics.thin_plate_dashpot: beta of the wall pressure
-//   P_ik = P_i + rho_i (g - a_k) . (x_s - x_i) + beta rho_i c0 (v_i - v_k) . n_out
-layout(constant_id = 74) const float THIN_PLATE_DASHPOT = 1.0;
-// numerics.thin_plate_viscosity: wall friction term of the plates (false: free slip)
+// numerics.thin_plate_dashpot: beta of the mirrored wall pressure
+//   P_j = P_i + rho_i (g - a_w) . (x_j - x_i) + beta rho_i c0 (v_i - v_w) . n_out
+layout(constant_id = 74) const float THIN_PLATE_DASHPOT = 0.0;
+// numerics.thin_plate_viscosity: viscous force between a fluid particle and
+// the wall dummies of a plate (false: free slip)
 layout(constant_id = 75) const bool  USE_THIN_PLATE_VISCOSITY = true;
-// numerics.thin_plate_penalty: a particle closer than a quarter spacing to a
-// face (or inside the plate) sees the wall pressure raised by
-//   kappa rho0 c0^2 (1 - gap / (dx / 4))^2,   gap = distance from the face.
-// A safety net: in the difference form nothing but the pressure the particle
-// builds up by approaching keeps it off the face, and the density diffusion
-// takes that pressure away from a single particle within a few steps.
-layout(constant_id = 76) const float THIN_PLATE_PENALTY = 0.1;
 #endif
 
 // --- Capacity / dispatch ---
@@ -546,13 +530,6 @@ layout(std430, set = 0, binding = 6) buffer MaterialBuffer {
 };
 
 layout(std430, set = 0, binding = 7) buffer CorrectionInverseBuffer {
-    // WITH_THIN_PLATES builds (2026-09-30): 3 vec4 per particle, the matrix is
-    // not symmetric next to a plate edge (the surface term n (x) (x_s - x_i)):
-    //   correction_inverse[pid*3]     = (m00, m11, m22, m[0][1])
-    //   correction_inverse[pid*3 + 1] = (m[0][2], m[1][2], d / tr(M), fluid flag)
-    //   correction_inverse[pid*3 + 2] = (m[1][0], m[2][0], m[2][1], 1 if a plate
-    //                                    lies inside the support of the particle)
-    // (GLSL indexing m[column][row]). Default builds:
     // Symmetric 3×3 M⁻¹, packed into 2 vec4 per particle:
     //   correction_inverse[pid*2]     = (m00, m11, m22, m01)
     //   correction_inverse[pid*2 + 1] = (m02, m12, d / tr(M), fluid flag)
@@ -884,6 +861,9 @@ layout(std430, set = 3, binding = 9) buffer RotorStateBuffer {
     float rotor_sin_theta;
     float rotor_angular_velocity_now;
     float rotor_time;
+#if WITH_THIN_PLATES
+    float rotor_angular_acceleration_now;   // d omega / dt at t_{n+1} (the ramp), rad/s^2
+#endif
 };
 
 // ----------------------------------------------------------------------------
@@ -934,13 +914,26 @@ struct ThinPlate {
     vec4  centre_extent_a;        // xyz centre; w = half length along axis_a (rectangle) or outer radius (annulus)
     vec4  normal_extent_b;        // xyz unit normal; w = half length along axis_b or inner radius
     vec4  axis_a_half_thickness;  // xyz unit in-plane axis a; w = half the plate thickness
-    vec4  axis_b_measure;         // xyz unit in-plane axis b; w = area (3D) or length (2D) of one quadrature point
+    vec4  axis_b_measure;         // xyz unit in-plane axis b; w = area (3D) or length (2D) one plate particle stands for
     uvec4 flags;                  // x = shape (0 rectangle, 1 annulus), y = frame (0 static, 1 rotor)
 };  // 80 B
 
 layout(std430, set = 3, binding = 12) buffer ThinPlateBuffer {
     ThinPlateGroup thin_plate_group[MAX_THIN_PLATE_GROUPS];
     ThinPlate      thin_plate[];
+};
+
+// Reaction of the thin plates (2026-09-30), written by force.comp, read by the
+// CPU. Two vec4 per particle slot:
+//   [2 pid]     xyz = force the FLUID particle received from the wall dummies of
+//               thin plates in this force evaluation (N, m_i a_i), w = index of
+//               the plate + 1 (0: no dummy)
+//   [2 pid + 1] xyz = position of the particle at this evaluation
+// The load on a plate is minus the sum of these forces; the torque uses the
+// positions stored here, so the records are complete in themselves (a defrag
+// after the force evaluation does not reorder this buffer).
+layout(std430, set = 3, binding = 13) buffer ThinPlateReactionBuffer {
+    vec4 thin_plate_reaction[];
 };
 #endif
 

@@ -302,7 +302,6 @@ class RegularizationConfig:
 
 
 PAIR_CORRECTION_MODES = {"own": 0, "mean": 1, "reverse": 2}
-THIN_PLATE_PRESSURE_FORMS = {"tic": 0, "difference": 1}
 THIN_PLATE_SHAPES = {"rectangle": 0, "annulus": 1}
 THIN_PLATE_FRAMES = {"static": 0, "rotor": 1}
 MAX_THIN_PLATE_GROUPS = 8          # common.glsl MAX_THIN_PLATE_GROUPS
@@ -396,22 +395,14 @@ class NumericsConfig:
     # repulsive layer on fluid-solid pairs only (see common.glsl).
     solid_pressure_offset: float = 0.0
     # Thin plates (2026-09-30, case block `thin_plates:`, shaders/thin_plates.glsl):
-    #   thin_plate_pressure_form  "tic": a particle next to a plate follows its TIC
-    #                             switch; "difference": it uses the difference form
-    #                             (P_j - P_i) for all its pairs
-    #   thin_plate_dashpot        beta of the wall pressure term beta rho c0 (v_i - v_k).n
-    #   thin_plate_viscosity      wall friction of the plates (False: free slip)
-    #   thin_plate_penalty        kappa of the penalty pressure kappa rho0 c0^2 (1 - gap / (dx/4))^2
-    #                             for a particle closer than dx / 4 to a face
-    thin_plate_pressure_form: str = "difference"
-    thin_plate_dashpot: float = 1.0
+    #   thin_plate_dashpot    beta of the acoustic term beta rho c0 (v_i - v_w).n of the
+    #                         mirrored wall pressure
+    #   thin_plate_viscosity  viscous force between the fluid and the wall dummies of a
+    #                         plate (False: free slip)
+    thin_plate_dashpot: float = 0.0
     thin_plate_viscosity: bool = True
-    thin_plate_penalty: float = 0.1
 
     def __post_init__(self):
-        if self.thin_plate_pressure_form not in THIN_PLATE_PRESSURE_FORMS:
-            raise ValueError(f"numerics.thin_plate_pressure_form must be one of "
-                             f"{list(THIN_PLATE_PRESSURE_FORMS)}, got {self.thin_plate_pressure_form!r}")
         if self.thin_plate_dashpot < 0:
             raise ValueError(f"numerics.thin_plate_dashpot must be >= 0, got {self.thin_plate_dashpot}")
         if self.solid_pressure not in SOLID_PRESSURE_MODES:
@@ -765,9 +756,9 @@ def _parse_scalars(data: dict, source: str) -> "ScalarsConfig":
 @dataclass
 class ThinPlateConfig:
     """One thin plate wetted on both sides (case.yaml block ``thin_plates:``,
-    2026-09-30, shaders/thin_plates.glsl). A plane rectangle or annulus with a
-    thickness; its particles (a `geometry.particles` entry with
-    ``thin_plate: <name>``) lie on the mid-plane and are quadrature points.
+    2026-09-30, shaders/thin_plates.glsl). A plane rectangle or annulus; its
+    particles (a `geometry.particles` entry with ``thin_plate: <name>``) are
+    one layer of solid particles on the mid-plane.
 
     ``shape``          "rectangle" or "annulus"
     ``frame``          "static" or "rotor" (given at the rotor angle 0)
@@ -776,8 +767,10 @@ class ThinPlateConfig:
     ``axis_a``         unit in-plane axis a; axis_b = normal x axis_a
     ``extent``         rectangle: half lengths along (axis_a, axis_b);
                        annulus: (outer radius, inner radius)
-    ``thickness``      plate thickness (the faces lie at +- thickness / 2)
-    ``point_measure``  area (3D) or length (2D) one quadrature point stands for
+    ``thickness``      plate thickness (used for the points of the faces where the
+                       load is evaluated; the fluid sees a plate about one particle
+                       spacing thick)
+    ``point_measure``  area (3D) or length (2D) one plate particle stands for
     """
     name: str
     shape: str
@@ -1157,10 +1150,8 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (48,  lambda case: PAIR_CORRECTION_MODES[case.numerics.pair_correction], 'I'),  # PAIR_CORRECTION_MODE
     (49,  lambda case: case.thin_plate_count,                           'I'),  # THIN_PLATE_COUNT
     (72,  lambda case: len(case.thin_plate_groups or []),               'I'),  # THIN_PLATE_GROUP_COUNT
-    (73,  lambda case: THIN_PLATE_PRESSURE_FORMS[case.numerics.thin_plate_pressure_form], 'I'),
     (74,  lambda case: case.numerics.thin_plate_dashpot,                'f'),  # THIN_PLATE_DASHPOT
     (75,  lambda case: 1 if case.numerics.thin_plate_viscosity else 0,  'I'),  # USE_THIN_PLATE_VISCOSITY
-    (76,  lambda case: case.numerics.thin_plate_penalty,                'f'),  # THIN_PLATE_PENALTY
     (50,  lambda case: case.capacities.max_per_voxel,                  'I'),
     (51,  lambda case: case.capacities.workgroup,                      'I'),
     (52,  lambda case: case.capacities.max_incoming,                   'I'),

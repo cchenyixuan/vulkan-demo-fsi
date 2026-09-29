@@ -44,7 +44,7 @@ from vulkan._vulkancache import ffi
 
 from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, MAX_THIN_PLATE_GROUPS,
                             PAIR_CORRECTION_MODES, PST_NEAR_SOLID_MODES, SOLID_PRESSURE_MODES,
-                            THIN_PLATE_FRAMES, THIN_PLATE_PRESSURE_FORMS, THIN_PLATE_SHAPES)
+                            THIN_PLATE_FRAMES, THIN_PLATE_SHAPES)
 from utils.sph.vulkan_context import VulkanContext
 
 
@@ -76,10 +76,12 @@ SHADER_NAMES_WITH_THIN_PLATES = {
     "density": "density_plates",
     "force": "force_plates",
     "force_scalar": "force_scalar_plates",
-    "defrag": "defrag_plates",
 }
 THIN_PLATE_GROUP_BYTES = 32
 THIN_PLATE_BYTES = 80
+# Marker of a plate particle in its pressure slot: -(plate index + 1) * THIN_PLATE_MARKER
+# (thin_plates.glsl THIN_PLATE_MARKER).
+THIN_PLATE_MARKER = 1.0e9
 
 
 # Spec const ids (mirrors experiment/v1/shaders/common.glsl id ranges).
@@ -129,10 +131,8 @@ SPEC_ID_PAIR_CORRECTION_MODE                = 48
 # Thin plates (2026-09-30); declared only by the *_plates builds.
 SPEC_ID_THIN_PLATE_COUNT                    = 49
 SPEC_ID_THIN_PLATE_GROUP_COUNT              = 72
-SPEC_ID_THIN_PLATE_PRESSURE_FORM            = 73
 SPEC_ID_THIN_PLATE_DASHPOT                  = 74
 SPEC_ID_USE_THIN_PLATE_VISCOSITY            = 75
-SPEC_ID_THIN_PLATE_PENALTY                  = 76
 SPEC_ID_MAX_PARTICLES_PER_VOXEL             = 50
 SPEC_ID_WORKGROUP_SIZE                      = 51
 SPEC_ID_MAX_INCOMING_PER_VOXEL              = 52
@@ -356,11 +356,10 @@ class SphSimulatorV1:
         scalar_bytes = 16 * scalar_vec4 * pool_capacity if scalar_vec4 > 0 else 16
         sgs_on = case.scalars is not None and case.scalars.sgs.enabled
         turbulent_bytes = 4 * pool_capacity if sgs_on else 16
-        # Thin plates (2026-09-30): the *_plates builds store the full correction
-        # matrix, 3 vec4 per particle instead of 2.
-        correction_bytes = (48 if case.thin_plate_count > 0 else 32) * pool_capacity
+        correction_bytes = 32 * pool_capacity
         thin_plate_bytes = (MAX_THIN_PLATE_GROUPS * THIN_PLATE_GROUP_BYTES
                             + THIN_PLATE_BYTES * max(case.thin_plate_count, 1))
+        thin_plate_reaction_bytes = 32 * pool_capacity if case.thin_plate_count > 0 else 16
 
         BSU = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         TRANSFER = (VK_BUFFER_USAGE_TRANSFER_DST_BIT
@@ -417,7 +416,7 @@ class SphSimulatorV1:
             # Rotor state (cos, sin, omega, t): CPU-written every step, GPU-read
             # by predict.comp. Host-visible + coherent, mapped for the lifetime
             # of the simulator (see _rotor_write_state).
-            _BufferSpec("rotor_state",                  3, 9,  16,                       BSU | TRANSFER, host_visible=True),
+            _BufferSpec("rotor_state",                  3, 9,  32,                       BSU | TRANSFER, host_visible=True),
             # Scalar parameters (2 vec4 per field vec4) and injection slots.
             _BufferSpec("scalar_parameters",            3, 10, 32 * max(scalar_vec4, 1), BSU | TRANSFER),
             _BufferSpec("scalar_injection",             3, 11, MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES,
@@ -425,6 +424,9 @@ class SphSimulatorV1:
             # Thin plates and their bounding groups (2026-09-30); a placeholder
             # that no kernel reads when the case has no plates.
             _BufferSpec("thin_plates",                  3, 12, thin_plate_bytes,   BSU | TRANSFER),
+            # Forces the fluid particles received from the wall dummies of thin
+            # plates, with their positions (force.comp, plates builds).
+            _BufferSpec("thin_plate_reaction",          3, 13, thin_plate_reaction_bytes, BSU | TRANSFER),
         ]
 
     def _allocate_buffer(self, size: int, usage: int, memory_properties: int) -> Buffer:
@@ -562,11 +564,11 @@ class SphSimulatorV1:
                 ratio = np.maximum(1.0 + hydrostatic / float(material.eos_constant), 0.5)
                 density_pressure[cursor:cursor + n, 0] = material.rest_density * ratio ** (1.0 / float(case.physics.power))
             if source.thin_plate_name is not None:
-                # thin plate particle (2026-09-30): marker instead of a density,
-                # ( -(plate index + 1), measure of the quadrature point )
+                # thin plate particle (2026-09-30): rho0 and, in the pressure slot, the
+                # marker -(plate index + 1) * THIN_PLATE_MARKER
                 plate = case.thin_plates[case.thin_plate_index(source.thin_plate_name)]
-                density_pressure[cursor:cursor + n, 0] = -(plate.index + 1.0)
-                density_pressure[cursor:cursor + n, 1] = plate.point_measure
+                density_pressure[cursor:cursor + n, 0] = material.rest_density
+                density_pressure[cursor:cursor + n, 1] = -(plate.index + 1.0) * THIN_PLATE_MARKER
             cursor += n
         data["density_pressure"] = density_pressure.tobytes()
 
@@ -922,10 +924,8 @@ class SphSimulatorV1:
             (SPEC_ID_PAIR_CORRECTION_MODE,         PAIR_CORRECTION_MODES[numerics.pair_correction], 'I'),
             (SPEC_ID_THIN_PLATE_COUNT,             int(case.thin_plate_count),                'I'),
             (SPEC_ID_THIN_PLATE_GROUP_COUNT,       len(case.thin_plate_groups or []),         'I'),
-            (SPEC_ID_THIN_PLATE_PRESSURE_FORM,     THIN_PLATE_PRESSURE_FORMS[numerics.thin_plate_pressure_form], 'I'),
             (SPEC_ID_THIN_PLATE_DASHPOT,           float(numerics.thin_plate_dashpot),        'f'),
             (SPEC_ID_USE_THIN_PLATE_VISCOSITY,     1 if numerics.thin_plate_viscosity else 0, 'I'),
-            (SPEC_ID_THIN_PLATE_PENALTY,           float(numerics.thin_plate_penalty),        'f'),
             (SPEC_ID_MAX_PARTICLES_PER_VOXEL,      int(capacities.max_per_voxel),             'I'),
             (SPEC_ID_WORKGROUP_SIZE,               int(capacities.workgroup),                 'I'),
             (SPEC_ID_MAX_INCOMING_PER_VOXEL,       int(capacities.max_incoming),              'I'),
@@ -1310,6 +1310,15 @@ class SphSimulatorV1:
     # Rotor: prescribed rigid rotation (2026-09-25)
     # ==================================================================
 
+    def rotor_angular_acceleration(self, time: float) -> float:
+        """d omega / dt of the rotor at `time`: w / ramp_time during the ramp, 0 after it."""
+        if self.case.rotor is None:
+            return 0.0
+        T = float(self.case.rotor.ramp_time)
+        if T <= 0.0 or time >= T:
+            return 0.0
+        return float(self.case.rotor_angular_velocity) / T
+
     def rotor_angle_and_rate(self, time: float) -> tuple[float, float]:
         """(theta, omega) at absolute time `time` for the case's rotor,
         computed in float64. omega ramps linearly from 0 over ramp_time (if
@@ -1333,8 +1342,10 @@ class SphSimulatorV1:
         if "rotor_state" not in self._mapped:
             return
         theta, omega = self.rotor_angle_and_rate(time_next)
-        payload = struct.pack("ffff", math.cos(theta), math.sin(theta), omega, time_next)
-        self._mapped["rotor_state"][:16] = payload
+        # the fifth value is read by the thin plate builds only
+        payload = struct.pack("fffff", math.cos(theta), math.sin(theta), omega, time_next,
+                              self.rotor_angular_acceleration(time_next))
+        self._mapped["rotor_state"][:20] = payload
         self.rotor_angle = theta
 
     def step(self, *, wait: bool = True) -> None:
@@ -1492,11 +1503,44 @@ class SphSimulatorV1:
         mask &= positions[:, 3] > 0
         return mask
 
-    def readback_boundary_forces(self) -> tuple:
+    def readback_thin_plate_reactions(self) -> dict:
+        """Reaction records of the thin plates (2026-09-30, force.comp of the
+        plates builds): for every fluid particle that met a wall dummy of a thin
+        plate in the last force evaluation
+            position (N, 3)  of the fluid particle at that evaluation,
+            force    (N, 3)  ON THE PLATE = minus the force the particle received
+                             from the dummies (N, with the mass factor),
+            plate    (N,)    index of the plate (case.thin_plates order; the plate
+                             of the first dummy the particle met).
+        The load on a plate is the sum of its records; the torque about an axis
+        uses the positions of the records (what the fluid loses in angular
+        momentum is what the plate receives). Empty for a case without plates."""
+        if self.case.thin_plate_count == 0:
+            return {"position": np.zeros((0, 3)), "force": np.zeros((0, 3)),
+                    "plate": np.zeros(0, dtype=np.int64)}
+        raw = np.frombuffer(self._readback_buffer(self.buffers["thin_plate_reaction"]),
+                            dtype=np.float32).reshape(-1, 2, 4)
+        plate = np.rint(raw[:, 0, 3]).astype(np.int64) - 1
+        selected = plate >= 0
+        selected[0] = False
+        return {"position": raw[selected, 1, :3].astype(np.float64),
+                "force": -raw[selected, 0, :3].astype(np.float64),
+                "plate": plate[selected]}
+
+    def thin_plate_frames(self) -> np.ndarray:
+        """frame of every plate in buffer order: True = rotor, False = static."""
+        return np.asarray([plate.frame == "rotor" for plate in (self.case.thin_plates or [])], dtype=bool)
+
+    def readback_boundary_forces(self, with_plate_index: bool = False) -> tuple:
         """Positions (N, 3) and forces m (a - g) (N, 3) of the live BOUNDARY
         particles (2026-09-29). Needs numerics.solid_reaction_force: without
         it force.comp never writes the acceleration of a BOUNDARY particle.
-        The forces carry the same mass factor as readback_rotor_torque()."""
+        The forces carry the same mass factor as readback_rotor_torque().
+        Thin plates (2026-09-30): the particles of a plate carry no load; the
+        reaction records of the STATIC plates are appended (position of the
+        fluid particle, force on the plate). with_plate_index=True returns a
+        third array: the index of the plate of every record, -1 for the
+        ordinary boundary particles."""
         if not self.case.numerics.solid_reaction_force:
             raise RuntimeError("readback_boundary_forces needs numerics.solid_reaction_force")
         groups = np.asarray([m.group_id for m in self.case.materials if m.kind == KIND_BOUNDARY], dtype=np.uint32)
@@ -1505,7 +1549,18 @@ class SphSimulatorV1:
         acceleration = self.readback_acceleration()[selected, :3].astype(np.float64)
         mass = self.readback_velocity_mass()[selected, 3].astype(np.float64)
         gravity = np.asarray(self.case.physics.gravity, dtype=np.float64)
-        return positions[selected, :3].astype(np.float64), (acceleration - gravity) * mass[:, None]
+        points = positions[selected, :3].astype(np.float64)
+        forces = (acceleration - gravity) * mass[:, None]
+        plate_index = np.full(points.shape[0], -1, dtype=np.int64)
+        if self.case.thin_plate_count > 0:
+            reactions = self.readback_thin_plate_reactions()
+            static = ~self.thin_plate_frames()[reactions["plate"]]
+            points = np.vstack([points, reactions["position"][static]])
+            forces = np.vstack([forces, reactions["force"][static]])
+            plate_index = np.concatenate([plate_index, reactions["plate"][static]])
+        if with_plate_index:
+            return points, forces, plate_index
+        return points, forces
 
     def rotor_group_ids(self) -> list[int]:
         return [m.group_id for m in self.case.materials if m.kind == KIND_ROTOR]
@@ -1569,6 +1624,13 @@ class SphSimulatorV1:
         m = self.readback_velocity_mass()[sel, 3].astype(np.float64)
         g = np.asarray(self.case.physics.gravity, dtype=np.float64)
         force_per_particle = (a - g) * m[:, None]
+        if self.case.thin_plate_count > 0:
+            # thin plates (2026-09-30): the particles of a plate carry no load, the
+            # load is the reaction stored with the fluid particles
+            reactions = self.readback_thin_plate_reactions()
+            on_rotor = self.thin_plate_frames()[reactions["plate"]]
+            x = np.vstack([x, reactions["position"][on_rotor]])
+            force_per_particle = np.vstack([force_per_particle, reactions["force"][on_rotor]])
         axis = np.asarray(self.case.rotor.axis, dtype=np.float64)
         pivot = np.asarray(self.case.rotor.pivot, dtype=np.float64)
         arm = x - pivot

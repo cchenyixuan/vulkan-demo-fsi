@@ -35,16 +35,14 @@ V1_SPV_DIR = V1_SHADER_DIR + "/spv"
 # specialization; with the macro the plain build times exactly like before the
 # scalar work (log/2026-09-27_scalar-transport.md, section 7).
 # 2026-09-30: builds with the thin plate code (-DWITH_THIN_PLATES=1, see
-# shaders/thin_plates.glsl). Every kernel that reads or writes the correction
-# matrix needs one, because those builds store it with 3 vec4 per particle.
-# The default builds contain none of the thin plate code.
+# shaders/thin_plates.glsl), for the two kernels that treat the neighbours
+# behind a plate as wall dummies. The default builds contain none of that code.
 SOURCE_VARIANTS = {
     "force.comp": [("force_scalar.comp", ["-DFORCE_WITH_SCALARS=1"]),
                    ("force_plates.comp", ["-DWITH_THIN_PLATES=1"]),
                    ("force_scalar_plates.comp", ["-DFORCE_WITH_SCALARS=1", "-DWITH_THIN_PLATES=1"])],
-    "correction.comp": [("correction_plates.comp", ["-DWITH_THIN_PLATES=1"])],
     "density.comp": [("density_plates.comp", ["-DWITH_THIN_PLATES=1"])],
-    "defrag.comp": [("defrag_plates.comp", ["-DWITH_THIN_PLATES=1"])],
+    "correction.comp": [("correction_plates.comp", ["-DWITH_THIN_PLATES=1"])],
 }
 
 

@@ -198,15 +198,9 @@ uint own_last_pid() {
 
 // Scalar-transport slots of correction_inverse (stored by correction.comp):
 // .z = d / tr(M) of the unregularized KCG matrix, .w = 1 for FLUID, else 0.
-#if WITH_THIN_PLATES
-vec2 scalar_normalisation_and_fluid_flag(uint particle_id) {
-    return correction_inverse[particle_id * 3u + 1u].zw;
-}
-#else
 vec2 scalar_normalisation_and_fluid_flag(uint particle_id) {
     return correction_inverse[particle_id * 2u + 1u].zw;
 }
-#endif
 
 // 1 for the components of scalar vec4 `vec4_index` that hold a declared field,
 // 0 for padding (fields 4 v + c >= SCALAR_FIELD_COUNT). Constant after
@@ -246,19 +240,6 @@ uint trailing_ghost_last_pid() {
 // By symmetry M[1][0] = M[0][1], M[2][0] = M[0][2], M[2][1] = M[1][2].
 // ============================================================================
 
-#if WITH_THIN_PLATES
-// full matrix, 3 vec4 per particle (see CorrectionInverseBuffer in common.glsl)
-mat3 unpack_correction_inverse(uint particle_id) {
-    vec4 a = correction_inverse[particle_id * 3u];
-    vec4 b = correction_inverse[particle_id * 3u + 1u];
-    vec4 c = correction_inverse[particle_id * 3u + 2u];
-    return mat3(
-        vec3(a.x, a.w, b.x),   // column 0
-        vec3(c.x, a.y, b.y),   // column 1
-        vec3(c.y, c.z, a.z)    // column 2
-    );
-}
-#else
 mat3 unpack_correction_inverse(uint particle_id) {
     vec4 a = correction_inverse[particle_id * 2u];
     vec4 b = correction_inverse[particle_id * 2u + 1u];
@@ -268,7 +249,6 @@ mat3 unpack_correction_inverse(uint particle_id) {
         vec3(b.x, b.y, a.z)    // column 2
     );
 }
-#endif
 
 // ============================================================================
 // Rotor helpers (2026-09-25)
