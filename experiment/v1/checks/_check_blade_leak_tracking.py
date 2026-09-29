@@ -25,6 +25,15 @@ steps apart (default 10 steps, about 0.7 ms, a displacement of at most 0.25 dx).
            of the fluid (whole tank and the Rushton zone r < 72 mm, y = 18.7 .. 58.5 mm): mean,
            1 % / 50 % / 99 % quantiles and the fraction with P < 0 (2026-09-29, background
            pressure and gravity runs). --dump then also holds density_pressure.
+           --budget BUDGET.csv (needs numerics.solid_reaction_force): every 1000 steps the angular
+           momentum budget of the fluid about the rotor axis (2026-09-29), all in N m, with the
+           particle masses of the solver (mass factor included):
+             fluid_torque   sum_fluid m (x - p) x a            what the forces do to the fluid
+             shift_torque   sum_fluid m shift x v / dt         what the particle shift does
+             rotor_reaction, wall_reaction                     torque of the fluid ON rotor / walls
+             internal       fluid_torque + rotor_reaction + wall_reaction
+                            = torque the fluid receives from fluid-fluid pairs (0 if they conserve)
+             angular_momentum, kinetic_energy                  of the fluid
   analyze  <python>      _check_blade_leak_tracking.py analyze FRAMES.npz --dx 0.003 --slab 1.0
 
 The result is given as particles per second and as a mass flow, compared with the
@@ -47,6 +56,41 @@ SUBSET_HEIGHTS = ((0.010, 0.065), (0.165, 0.225))
 PUMPING_MASS_FLOW = 998.0 * 0.75 * (200.0 / 60.0) * 0.096 ** 3
 
 
+def angular_momentum_budget(simulator):
+    """Angular momentum budget of the fluid about the rotor axis, see the module docstring."""
+    case = simulator.case
+    axis = np.asarray(case.rotor.axis, dtype=np.float64)
+    axis = axis / np.linalg.norm(axis)
+    pivot = np.asarray(case.rotor.pivot, dtype=np.float64)
+    positions = simulator.readback_positions()
+    material = simulator.readback_material()
+    live = simulator.live_slot_mask(positions)
+    fluid_groups = np.asarray([m.group_id for m in case.materials if m.kind == 0], dtype=np.uint32)
+    fluid = live & np.isin(material, fluid_groups)
+    velocity_mass = simulator.readback_velocity_mass()
+    arm = positions[fluid, :3].astype(np.float64) - pivot
+    velocity = velocity_mass[fluid, :3].astype(np.float64)
+    mass = velocity_mass[fluid, 3].astype(np.float64)
+    acceleration = simulator.readback_acceleration()[fluid, :3].astype(np.float64)
+    shift = simulator.readback_shift()[fluid, :3].astype(np.float64)
+    fluid_torque = float((mass * (np.cross(arm, acceleration) @ axis)).sum())
+    shift_torque = float((mass * (np.cross(shift, velocity) @ axis)).sum() / float(case.timestep))
+    rotor_reaction = float(simulator.readback_rotor_torque()["torque_axis"])
+    wall_positions, wall_forces = simulator.readback_boundary_forces()
+    wall_reaction = float((np.cross(wall_positions - pivot, wall_forces) @ axis).sum())
+    return {
+        "fluid_torque": fluid_torque, "shift_torque": shift_torque,
+        "rotor_reaction": rotor_reaction, "wall_reaction": wall_reaction,
+        "internal": fluid_torque + rotor_reaction + wall_reaction,
+        "angular_momentum": float((mass * (np.cross(arm, velocity) @ axis)).sum()),
+        "kinetic_energy": float(0.5 * (mass * (velocity ** 2).sum(axis=1)).sum()),
+    }
+
+
+BUDGET_COLUMNS = ("fluid_torque", "shift_torque", "rotor_reaction", "wall_reaction", "internal",
+                  "angular_momentum", "kinetic_energy")
+
+
 def run(arguments):
     from utils.sph.case import load_case
     from utils.sph.vulkan_context import VulkanContext
@@ -67,6 +111,12 @@ def run(arguments):
                 torque_log = open(arguments.torque_log, "w")
                 torque_log.write("step,time,angle,torque_axis,fx,fy,fz,torque_lower,torque_upper,torque_shaft,"
                                  "wall_torque,baffle_torque,wall_fx,wall_fy,wall_fz\n")
+            budget_log = None
+            if arguments.budget:
+                if not case.numerics.solid_reaction_force:
+                    raise SystemExit("--budget needs numerics.solid_reaction_force")
+                budget_log = open(arguments.budget, "w")
+                budget_log.write("step,time," + ",".join(BUDGET_COLUMNS) + chr(10))
             status_log = None
             if arguments.status_log:
                 status_log = open(arguments.status_log, "w")
@@ -77,6 +127,11 @@ def run(arguments):
             while simulator.step_count < end:
                 simulator.step()
                 step = simulator.step_count
+                if budget_log is not None and step % 1000 == 0:
+                    budget = angular_momentum_budget(simulator)
+                    budget_log.write(f"{step},{simulator.simulation_time:.6e},"
+                                     + ",".join(f"{budget[name]:.6e}" for name in BUDGET_COLUMNS) + chr(10))
+                    budget_log.flush()
                 if status_log is not None and step % 1000 == 0:
                     status = simulator.readback_global_status()
                     positions = simulator.readback_positions()
@@ -139,6 +194,8 @@ def run(arguments):
                 torque_log.close()
             if status_log is not None:
                 status_log.close()
+            if budget_log is not None:
+                budget_log.close()
             if arguments.dump:
                 import json
                 np.savez(arguments.dump, positions=simulator.readback_positions(),
@@ -220,6 +277,7 @@ def main():
     run_parser.add_argument("--torque-log", default=None)
     run_parser.add_argument("--dump", default=None)
     run_parser.add_argument("--status-log", default=None)
+    run_parser.add_argument("--budget", default=None)
     analyze_parser = subparsers.add_parser("analyze")
     analyze_parser.add_argument("frames")
     analyze_parser.add_argument("--dx", type=float, default=0.003)
