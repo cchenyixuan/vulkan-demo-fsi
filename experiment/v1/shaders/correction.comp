@@ -168,7 +168,8 @@ void main() {
     float scalar_laplacian_normalisation =
         (correction_matrix_trace > 1e-6) ? float(DIMENSION) / correction_matrix_trace : 1.0;
     float scalar_fluid_flag = 0.0;
-    if (SCALAR_VEC4_COUNT > 0u) {
+    // also needed by the symmetric pair correction of force.comp (2026-09-30)
+    if (SCALAR_VEC4_COUNT > 0u || USE_SYMMETRIC_PAIR_CORRECTION) {
         scalar_fluid_flag =
             (material_parameters[material[self_particle_id]].kind == MATERIAL_FLUID) ? 1.0 : 0.0;
     }

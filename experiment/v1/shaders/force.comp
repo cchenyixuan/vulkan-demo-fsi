@@ -408,6 +408,26 @@ void main() {
             vec3  kernel_gradient_corrected = self_correction_matrix * kernel_gradient_raw;
             float kernel_value              = evaluate_kernel_unguarded(distance);
 
+            // Symmetric pair correction (2026-09-30): FLUID-FLUID pairs use the
+            // mean of the two correction matrices in the pressure and viscous
+            // forces, see common.glsl. The FLUID flag of the neighbour is stored
+            // next to its matrix (correction_inverse[2 j + 1].w).
+            vec3  kernel_gradient_pair = kernel_gradient_corrected;
+            float pair_volume_viscous  = neighbor_volume_dynamic;
+            if (USE_SYMMETRIC_PAIR_CORRECTION && USE_KCG_CORRECTION && self_params.kind == MATERIAL_FLUID) {
+                vec4 neighbor_matrix_a = correction_inverse[neighbor_particle_id * 2u];
+                vec4 neighbor_matrix_b = correction_inverse[neighbor_particle_id * 2u + 1u];
+                if (neighbor_matrix_b.w > 0.5) {
+                    mat3 neighbor_correction_matrix = mat3(
+                        vec3(neighbor_matrix_a.x, neighbor_matrix_a.w, neighbor_matrix_b.x),
+                        vec3(neighbor_matrix_a.w, neighbor_matrix_a.y, neighbor_matrix_b.y),
+                        vec3(neighbor_matrix_b.x, neighbor_matrix_b.y, neighbor_matrix_a.z));
+                    kernel_gradient_pair = 0.5 * (kernel_gradient_corrected
+                                                  + neighbor_correction_matrix * kernel_gradient_raw);
+                    pair_volume_viscous = 2.0 * self_mass / (self_density + neighbor_density);
+                }
+            }
+
             // ==== Pressure force (TIC) ==============================
             // Symmetric (P_i + P_j) form when self is compressive (P_i > 0);
             // anti-symmetric (P_j - P_i) otherwise to suppress tensile
@@ -436,15 +456,15 @@ void main() {
                     ? (neighbor_pressure + self_pressure)
                     : (neighbor_pressure - self_pressure);
             a_pressure -= neighbor_volume_dynamic * pressure_combined / self_density
-                        * kernel_gradient_corrected;
+                        * kernel_gradient_pair;
 
             // ==== Viscosity (Morris) ================================
             a_viscosity +=
-                morris_coefficient * viscosity_uniform * neighbor_volume_dynamic
+                morris_coefficient * viscosity_uniform * pair_volume_viscous
                 * dot(self_velocity - neighbor_velocity,
                       position_difference_neighbor_to_self)
                 / (distance * distance + EPS_H_SQUARED)
-                * kernel_gradient_corrected;
+                * kernel_gradient_pair;
 
             // ==== Vorticity (ω_z = [∇×v]_z) — diagnostic for viz =====
             // (∇×v)_i ≈ Σ_j V_j (v_i - v_j) × ∇W̃_ij ; z-component in 2D.

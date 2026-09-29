@@ -368,6 +368,9 @@ class NumericsConfig:
     #   "extrapolate": the pressure of the fluid neighbours continued to the solid
     #                  particle (Adami et al. 2012)
     solid_pressure: str = "increment"
+    # FLUID-FLUID pairs use the mean of the two KCG matrices in the pressure and
+    # viscous forces, so that the pair forces are equal and opposite (2026-09-30).
+    symmetric_pair_correction: bool = False
     # psi_ij of the density diffusion with the renormalised density gradients
     # (vanishes for a linear density field; needed with gravity).
     density_diffusion_gradient_term: bool = False
@@ -978,6 +981,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (45,  lambda case: 1 if case.numerics.use_pst               else 0, 'I'),  # USE_PST
     (46,  lambda case: 1 if case.numerics.use_prefix_sum_defrag else 0, 'I'),  # USE_PREFIX_SUM_DEFRAG
     (47,  lambda case: 1 if case.numerics.use_neighbor_list     else 0, 'I'),  # USE_NEIGHBOR_LIST
+    (48,  lambda case: 1 if case.numerics.symmetric_pair_correction else 0, 'I'),  # USE_SYMMETRIC_PAIR_CORRECTION
     (50,  lambda case: case.capacities.max_per_voxel,                  'I'),
     (51,  lambda case: case.capacities.workgroup,                      'I'),
     (52,  lambda case: case.capacities.max_incoming,                   'I'),

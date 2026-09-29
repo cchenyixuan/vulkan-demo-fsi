@@ -243,6 +243,22 @@ layout(constant_id = 46) const bool USE_PREFIX_SUM_DEFRAG = false;
 // Default false: measured slower than the voxel scan on sorted particles
 // (see log/2026-09-25_neighbor-list.md); kept as an opt-in experiment.
 layout(constant_id = 47) const bool USE_NEIGHBOR_LIST = false;
+
+// --- Symmetric pair correction (2026-09-30) ---
+// numerics.symmetric_pair_correction. force.comp corrects the kernel gradient of
+// the pair (i, j) with the matrix of particle i: grad W~_ij = M_i^-1 grad W_ij.
+// The force of j on i and the force of i on j then differ by
+//     m V (P_i + P_j) / rho (M_i^-1 - M_j^-1) grad W_ij,
+// a net force on the pair that grows with the absolute pressure and with the
+// disorder of the particles (angular momentum budget of the tank, 2026-09-29:
+// with gravity the fluid-fluid pairs remove 37 to 87 % of the rotor's input).
+// With this switch a FLUID-FLUID pair uses the mean of the two matrices,
+//     grad W~_ij = 1/2 (M_i^-1 + M_j^-1) grad W_ij,
+// for the pressure and the viscous force, and the pair volume 2 m / (rho_i + rho_j)
+// in the viscous force: the two forces are equal and opposite. Fluid-solid pairs,
+// the density equation, the vorticity, the shift and the scalars keep M_i^-1.
+// The gradient of particle i is then no longer exactly first-order consistent.
+layout(constant_id = 48) const bool USE_SYMMETRIC_PAIR_CORRECTION = false;
 // ----- end ablation toggles ------------------------------------------------
 
 // --- Capacity / dispatch ---
