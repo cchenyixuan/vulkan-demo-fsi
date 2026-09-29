@@ -913,8 +913,8 @@ struct ThinPlateGroup {
 struct ThinPlate {
     vec4  centre_extent_a;        // xyz centre; w = half length along axis_a (rectangle) or outer radius (annulus)
     vec4  normal_extent_b;        // xyz unit normal; w = half length along axis_b or inner radius
-    vec4  axis_a_half_thickness;  // xyz unit in-plane axis a; w = half the plate thickness
-    vec4  axis_b_measure;         // xyz unit in-plane axis b; w = area (3D) or length (2D) one plate particle stands for
+    vec4  axis_a_half_thickness;  // xyz unit in-plane axis a; w = half the true plate thickness (record, not used)
+    vec4  axis_b_measure;         // xyz unit in-plane axis b; w = area (3D) or length (2D) per plate particle (record, not used)
     uvec4 flags;                  // x = shape (0 rectangle, 1 annulus), y = frame (0 static, 1 rotor)
 };  // 80 B
 

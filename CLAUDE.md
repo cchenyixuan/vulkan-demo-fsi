@@ -129,7 +129,7 @@ run scripts.
 - **Spec constants**: ids and ranges are listed in `common.glsl` and mirrored by
   `_global_spec_entries()` in `simulator_v1.py` (and `_SPEC_CONSTANT_MAPPING` in
   `utils/sph/case.py`); all must be edited together.
-  Free ranges for new constants: 49, 72–79, 89+ (34 = BACKGROUND_PRESSURE,
+  Free ranges for new constants: 73, 76–79, 89+ (49, 72, 74, 75 = thin plates, 2026-09-30; 34 = BACKGROUND_PRESSURE,
   35 = SOLID_PRESSURE_MODE, 36 = USE_SOLID_REACTION_FORCE, 37 = SOLID_PRESSURE_OFFSET, 38 = USE_DENSITY_DIFFUSION_GRADIENT_TERM, 39 = PST_NEAR_SOLID_MODE, 48 = PAIR_CORRECTION_MODE, added 2026-09-29; 47 = USE_NEIGHBOR_LIST,
   62 = MAX_NEIGHBORS, 63–71 = scalar transport, all added on the test branch).
 - **Scalar transport (test branch, 2026-09-27)**: optional case.yaml block
@@ -145,6 +145,21 @@ run scripts.
   spec constants alone left a 5 % overhead in the plain kernel. Details, formulas and validation:
   `log/2026-09-27_scalar-transport.md`; checks
   `experiment/v1/checks/_check_scalar_box.py`, `_check_scalar_sgs_couette.py`.
+- **Thin plates (test branch, 2026-09-30)**: optional case.yaml block
+  `thin_plates:` for plates wetted on both sides that are thinner than the
+  particle spacing (blades, the Rushton disk, baffles). A plate is a plane
+  rectangle or annulus with one layer of particles on its mid-plane
+  (`thin_plate: <name>` in `geometry.particles`). For a fluid particle every
+  neighbour behind a plate is a dummy of the wall (plate velocity, pressure
+  continued from the fluid particle); the load on the plates is the reaction
+  stored with the fluid particles (set 3 binding 13), already included by
+  `readback_rotor_torque()` and `readback_boundary_forces()`. Needs
+  `numerics.solid_reaction_force: true`. Own builds of `correction`,
+  `density`, `force` (`*_plates`, `-DWITH_THIN_PLATES=1`); the default builds
+  are untouched. Tank generator: `--thin-plates`. Formulas in
+  `shaders/thin_plates.glsl`, tests and known issues in
+  `log/2026-09-30_thin-plates-mirror.md`, check script
+  `experiment/v1/checks/_check_thin_plate.py`.
 - **Uniform-material simplifications** inherited from V0: `force.comp` uses
   self's mass / viscosity / volume for pair quantities (no multi-phase), no
   micropolar terms, no inlet spawn kernel (rotor motion added on the test branch, see above).

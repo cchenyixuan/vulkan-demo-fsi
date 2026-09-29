@@ -164,6 +164,9 @@ Reads (R) and Writes (W) per kernel. See `common.glsl` for binding numbers.
 | `correction_inverse[2i+1].z` = tr M | — | — | — | W | — | R (scalars) |
 | `scalar_parameters` (set 3, 10) | — | — | — | — | — | R |
 | `scalar_injection` (set 3, 11) | — | R (injection on) | — | — | — | — |
+| `thin_plates` (set 3, 12) | — | — | — | R (plates build) | R (plates build) | R (plates build) |
+| `thin_plate_reaction` (set 3, 13) | — | — | — | — | — | W (plates build) |
+| `rotor_state` (set 3, 9) | — | R | — | R (plates build) | R (plates build) | R (plates build) |
 
 Notes:
 - Density staging is **scratch+copy**: density.comp writes
@@ -182,6 +185,19 @@ Notes:
 - `force` is the most expensive: reads neighbor M, ∇ρ, mass, density, vel for
   pair-averaged formulas; uniform V0 lets us compute pair quantities from
   self only (see `force.comp` header for what's hoisted).
+- Thin plates (2026-09-30): cases with a `thin_plates:` block run the builds
+  `correction_plates`, `density_plates`, `force_plates` / `force_scalar_plates`
+  (`-DWITH_THIN_PLATES=1`, `compile_shaders_v1.SOURCE_VARIANTS`); the default
+  builds contain none of that code and are byte-identical to those before it.
+  A plate is a plane rectangle or annulus (`thin_plates`, set 3 binding 12) with
+  one layer of particles on its mid-plane, marked in the pressure slot. For a
+  fluid particle every neighbour behind a plate is a dummy of the wall: plate
+  velocity, pressure continued from the fluid particle. The correction matrix,
+  the kernel sum and the particle shift see all particles. The load on the
+  plates is the reaction stored with the fluid particles (`thin_plate_reaction`,
+  set 3 binding 13, two vec4 per particle: force + plate index, position).
+  Formulas: header of `thin_plates.glsl`; tests and known issues:
+  `log/2026-09-30_thin-plates-mirror.md`.
 - Scalar transport (2026-09-27): every scalar buffer is a 16 B placeholder
   and every scalar code path is compiled out when SCALAR_VEC4_COUNT = 0 (the
   default, i.e. cases without a `scalars:` block). defrag carries bindings
@@ -286,10 +302,14 @@ compile `_test_common.comp` by hand as a regression check after
 38       : USE_DENSITY_DIFFUSION_GRADIENT_TERM (2026-09-29)
 39       : PST_NEAR_SOLID_MODE (2026-09-29)
 48       : PAIR_CORRECTION_MODE (2026-09-30; fluid-fluid pairs: 0 own KCG matrix, 1 mean of the two, 2 reverse)
+49       : THIN_PLATE_COUNT (2026-09-30, plates builds only)
 40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, toggles, ...)
 50 - 53  : capacities + workgroup size + POOL_SIZE
 54 - 55  : ghost pool sizes (multi-GPU remnant, pinned 0)
-56 - 79  : free
+72       : THIN_PLATE_GROUP_COUNT (2026-09-30, plates builds only)
+74       : THIN_PLATE_DASHPOT (2026-09-30, plates builds only)
+75       : USE_THIN_PLATE_VISCOSITY (2026-09-30, plates builds only)
+56 - 79  : free except 62 - 72, 74, 75
 80 - 81  : ghost voxel counts (multi-GPU remnant, pinned 0)
 82 - 127 : free (90-94 were the removed ghost_send / install_migrations ids)
 ```

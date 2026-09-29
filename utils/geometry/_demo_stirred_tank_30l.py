@@ -53,7 +53,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from utils.geometry import LATTICE_GRID, tile_bounding_box          # noqa: E402
-from utils.geometry.region import Region, Box, Cylinder, Union, Intersection      # noqa: E402
+from utils.geometry.region import Region, Box, Cylinder, Union, Intersection, Difference      # noqa: E402
 
 # ----------------------------------------------------------------------------
 # Measured dimensions (m)
@@ -337,8 +337,118 @@ def conformal_baffles(dx, layers, top):
     return np.vstack(points), boxes
 
 
+def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius):
+    """The thin plates of the tank (2026-09-30, case block `thin_plates:`): the blades, the
+    Rushton disk and the baffle plates, each ONE layer of particles on its mid-plane.
+
+    Returns a list of dicts: name, shape, frame, centre, normal, axis_a, extent (the analytic
+    outline the solver uses to decide what lies behind the plate), thickness (true, for the
+    record), points (the particles) and box (a Region: lattice sites inside it are dropped).
+    Blades and baffles: plane grids as conformal_blades() / conformal_baffles(), the outermost
+    centres half a cell inside the true outline. The outline of a baffle continues `lid` into
+    the lid shell above the liquid (`top`), its particles end at the liquid surface.
+    Disk: rings of particles between `disk_inner_radius` (the surface of the hub particles) and
+    the rim; its outline is the annulus from the hub radius to the rim."""
+    plates = []
+    for name, centre, axis_a, axis_b, normal, half_a, half_b in blade_frames(impellers):
+        cells_a = max(1, int(math.ceil(2.0 * half_a / dx - 1e-9)))
+        cells_b = max(1, int(math.ceil(2.0 * half_b / dx - 1e-9)))
+        a = -half_a + (np.arange(cells_a) + 0.5) * (2.0 * half_a / cells_a)
+        b = -half_b + (np.arange(cells_b) + 0.5) * (2.0 * half_b / cells_b)
+        grid_a, grid_b = np.meshgrid(a, b, indexing="ij")
+        points = centre + grid_a.reshape(-1, 1) * axis_a + grid_b.reshape(-1, 1) * axis_b
+        thickness = RUSHTON_BLADE["thickness"] if name.startswith("rushton") else PBT_BLADE["thickness"]
+        plates.append(dict(name=name.replace("_", "_blade_"), shape="rectangle", frame="rotor", centre=centre,
+                           normal=normal, axis_a=axis_a, extent=(half_a, half_b), thickness=thickness,
+                           points=points, measure=(2.0 * half_a / cells_a) * (2.0 * half_b / cells_b),
+                           box=OrientedBox(centre, np.stack([axis_a, axis_b, normal]), [half_a, half_b, 0.5 * dx])))
+    if impellers in ("both", "rushton"):
+        disk_mid = 0.5 * (RUSHTON_DISK["y0"] + RUSHTON_DISK["y1"])
+        outer = RUSHTON_DISK["radius"]
+        rings = max(1, int(math.ceil((outer - disk_inner_radius) / dx - 1e-9)))
+        ring_width = (outer - disk_inner_radius) / rings
+        points = []
+        for ring in range(rings):
+            radius = disk_inner_radius + (ring + 0.5) * ring_width
+            count = max(6, int(round(2.0 * math.pi * radius / dx)))
+            angle = (np.arange(count) + 0.5 * (ring % 2)) * (2.0 * math.pi / count)
+            points.append(np.column_stack([radius * np.cos(angle), np.full(count, disk_mid), radius * np.sin(angle)]))
+        points = np.vstack(points)
+        centre = np.array([0.0, disk_mid, 0.0])
+        plates.append(dict(name="rushton_disk", shape="annulus", frame="rotor", centre=centre,
+                           normal=np.array([0.0, 1.0, 0.0]), axis_a=np.array([1.0, 0.0, 0.0]),
+                           extent=(outer, RUSHTON_HUB["radius"]),
+                           thickness=RUSHTON_DISK["y1"] - RUSHTON_DISK["y0"], points=points,
+                           measure=math.pi * (outer ** 2 - disk_inner_radius ** 2) / points.shape[0],
+                           box=Difference(y_cylinder(outer, disk_mid - 0.5 * dx, disk_mid + 0.5 * dx),
+                                          y_cylinder(disk_inner_radius, disk_mid - dx, disk_mid + dx))))
+    if legacy_baffles:
+        azimuths, radial = LEGACY_BAFFLES["azimuths_deg"], LEGACY_BAFFLES["radial"]
+        bottom, thickness = LEGACY_BAFFLES["y0"], LEGACY_BAFFLES["thickness"]
+    else:
+        azimuths, radial, bottom, thickness = BAFFLE_AZIMUTHS_DEG, BAFFLE_RADIAL, BAFFLE_Y0, BAFFLE_THICKNESS
+    for index, azimuth in enumerate(azimuths):
+        e_r, e_t, e_y = radial_frame(azimuth)
+        r0, r1 = radial
+        half_a, half_b = 0.5 * (r1 - r0), 0.5 * (top - bottom)
+        centre = e_r * 0.5 * (r0 + r1) + e_y * 0.5 * (bottom + top)
+        cells_a = max(1, int(math.ceil(2.0 * half_a / dx - 1e-9)))
+        cells_b = max(1, int(math.ceil(2.0 * half_b / dx - 1e-9)))
+        a = -half_a + (np.arange(cells_a) + 0.5) * (2.0 * half_a / cells_a)
+        b = -half_b + (np.arange(cells_b) + 0.5) * (2.0 * half_b / cells_b)
+        grid_a, grid_b = np.meshgrid(a, b, indexing="ij")
+        points = centre + grid_a.reshape(-1, 1) * e_r + grid_b.reshape(-1, 1) * e_y
+        plates.append(dict(name=f"baffle_{index + 1}", shape="rectangle", frame="static",
+                           centre=centre + e_y * 0.5 * lid, normal=e_t, axis_a=e_r,
+                           extent=(half_a, half_b + 0.5 * lid), thickness=thickness, points=points,
+                           measure=(2.0 * half_a / cells_a) * (2.0 * half_b / cells_b),
+                           box=OrientedBox(centre, np.stack([e_r, e_y, e_t]), [half_a, half_b, 0.5 * dx])))
+    return plates
+
+
+MAX_NEAR_THIN_PLATES = 4          # shaders/thin_plates.glsl
+
+
+def count_near_plates(points, plates, support_radius):
+    """For every point the number of plates that come closer than the support radius (the
+    solver keeps at most MAX_NEAR_THIN_PLATES of them per particle)."""
+    count = np.zeros(points.shape[0], dtype=np.int32)
+    for plate in plates:
+        relative = points - plate["centre"]
+        normal = np.asarray(plate["normal"])
+        axis_a = np.asarray(plate["axis_a"])
+        axis_b = np.cross(normal, axis_a)
+        distance_normal = relative @ normal
+        a, b = relative @ axis_a, relative @ axis_b
+        if plate["shape"] == "annulus":
+            radius = np.hypot(a, b)
+            gap = np.maximum(np.maximum(radius - plate["extent"][0], plate["extent"][1] - radius), 0.0)
+        else:
+            gap = np.hypot(np.maximum(np.abs(a) - plate["extent"][0], 0.0),
+                           np.maximum(np.abs(b) - plate["extent"][1], 0.0))
+        count += (distance_normal ** 2 + gap ** 2 < support_radius ** 2)
+    return count
+
+
+def thin_plates_block(plates) -> str:
+    """`thin_plates:` block of case.yaml."""
+    def vector(values):
+        return "[" + ", ".join(f"{float(v):.9g}" for v in values) + "]"
+    lines = ["", "# Thin plates wetted on both sides (2026-09-30, shaders/thin_plates.glsl): one layer of particles",
+             "# on the mid-plane; for a fluid particle everything behind a plate is a dummy of the wall.",
+             "# Rotor plates are given at the rotor angle 0. thickness (true) and point_measure (area per",
+             "# particle) are for the record, the solver does not use them.",
+             "thin_plates:"]
+    for plate in plates:
+        lines.append(f"  - {{name: {plate['name']}, shape: {plate['shape']}, frame: {plate['frame']}, "
+                     f"centre: {vector(plate['centre'])}, normal: {vector(plate['normal'])}, "
+                     f"axis_a: {vector(plate['axis_a'])}, extent: {vector(plate['extent'])}, "
+                     f"thickness: {plate['thickness']:.6g}, point_measure: {plate['measure']:.6g}}}")
+    return "\n".join(lines) + "\n"
+
+
 def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False, with_blades=True,
-                 legacy_baffles=False, with_baffle_plates=True, with_bell=True):
+                 legacy_baffles=False, with_baffle_plates=True, with_bell=True, with_disk=True):
     """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
     ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
     and the disk for the Rushton) are kept on the full-length shaft; used for
@@ -355,10 +465,9 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=Fa
     if with_bell:
         rotor_parts.append(RevolvedProfile(ROTOR_BELL_PROFILE))
     if keep_rushton:
-        rotor_parts += [
-            y_cylinder(RUSHTON_HUB["radius"], RUSHTON_HUB["y0"], RUSHTON_HUB["y1"]),
-            y_cylinder(RUSHTON_DISK["radius"], disk_mid - 0.5 * t_disk, disk_mid + 0.5 * t_disk),
-        ]
+        rotor_parts.append(y_cylinder(RUSHTON_HUB["radius"], RUSHTON_HUB["y0"], RUSHTON_HUB["y1"]))
+        if with_disk:
+            rotor_parts.append(y_cylinder(RUSHTON_DISK["radius"], disk_mid - 0.5 * t_disk, disk_mid + 0.5 * t_disk))
     if keep_pbt:
         rotor_parts.append(y_cylinder(PBT_HUB["radius"], PBT_HUB["y0"], PBT_HUB["y1"]))
     for k in range(6 if with_blades else 0):
@@ -379,7 +488,7 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=Fa
             rotor_parts.append(blade)
     wall_parts = [y_cylinder(BEARING_BOSS["radius"], FLOOR_BOTTOM - 0.02, BEARING_BOSS["y1"])]
     if legacy_baffles:
-        for az in LEGACY_BAFFLES["azimuths_deg"]:
+        for az in LEGACY_BAFFLES["azimuths_deg"] if with_baffle_plates else ():
             wall_parts.append(radial_slab(az, *LEGACY_BAFFLES["radial"], LEGACY_BAFFLES["y0"], top_y, t_baffle))
     else:
         for az in BAFFLE_AZIMUTHS_DEG:
@@ -581,6 +690,12 @@ def main() -> int:
                         help="blade particles on plane grids in the blades' own frames (--thin-layers flat "
                              "layers, true outline) instead of lattice sites; avoids the staircase at which "
                              "single-layer blades leak")
+    parser.add_argument("--thin-plates", action="store_true",
+                        help="blades, Rushton disk and baffle plates as thin plates (case block "
+                             "`thin_plates:`, one layer of particles each, shaders/thin_plates.glsl); needs "
+                             "--solid-reaction-force; replaces --conformal-blades / --conformal-baffles")
+    parser.add_argument("--thin-plate-dashpot", type=float, default=None,
+                        help="numerics.thin_plate_dashpot (default of the solver: 0)")
     parser.add_argument("--skin", type=float, default=0.5,
                         help="rotor / baffle / probe sites are claimed up to this many spacings outside "
                              "the solid surface (default 0.5; 0 = site centre inside the solid)")
@@ -656,12 +771,18 @@ def main() -> int:
     sites = tile_bounding_box(lo - 0.5 * dx, hi + 0.5 * dx, dx, LATTICE_GRID, 3)
     print(f"dx={dx:.4e} h={h:.4e} (h/dx={args.hdx}) border={border} thin>={args.thin_layers} layers -> {sites.shape[0]:,} lattice sites")
 
+    if args.thin_plates:
+        if args.conformal_blades or args.conformal_baffles:
+            parser.error("--thin-plates replaces --conformal-blades and --conformal-baffles")
+        if not (args.solid_reaction_force or args.solid_pressure != "increment"):
+            parser.error("--thin-plates needs --solid-reaction-force (the load on the plates is a reaction)")
     interior = DishedTankInterior(TANK_RADIUS, LIQUID_HEIGHT, FLOOR_PROFILE)
     rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers,
-                                            clip_tips=args.clip_tips, with_blades=not args.conformal_blades,
+                                            clip_tips=args.clip_tips,
+                                            with_blades=not (args.conformal_blades or args.thin_plates),
                                             legacy_baffles=args.legacy_baffles,
-                                            with_baffle_plates=not args.conformal_baffles,
-                                            with_bell=not args.no_rotor_bell)
+                                            with_baffle_plates=not (args.conformal_baffles or args.thin_plates),
+                                            with_bell=not args.no_rotor_bell, with_disk=not args.thin_plates)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 
@@ -715,6 +836,36 @@ def main() -> int:
                                                  < (0.6 * dx) ** 2).any(axis=1)
             in_baffle[near[too_close]] = True
         in_blade = in_blade | in_baffle          # from here on: "replaced by a conformal sheet"
+    plates = []
+    if args.thin_plates:
+        # Thin plates: one layer of particles each. Lattice sites inside the slab of a plate (one
+        # spacing thick) are dropped, and so is every other lattice site closer than 0.6 dx to a
+        # plate particle. Where two plates meet (disk and blades) the particles of the later
+        # plate that come closer than 0.6 dx to those of an earlier one are dropped.
+        plates = thin_plate_sheets(dx, args.impellers, LIQUID_HEIGHT, shell, args.legacy_baffles,
+                                   RUSHTON_HUB["radius"] + skin)
+        kept = np.zeros((0, 3))
+        for plate in plates:
+            points = plate["points"]
+            if kept.shape[0]:
+                difference = points[:, None, :] - kept[None, :, :]
+                points = points[(np.einsum("ijk,ijk->ij", difference, difference) >= (0.6 * dx) ** 2).all(axis=1)]
+            plate["points"] = points
+            kept = np.vstack([kept, points])
+        sdf_plates = Union(*[plate["box"] for plate in plates]).signed_distance(sites)
+        in_plate = sdf_plates <= 0.0
+        near = np.nonzero(~in_plate & (sdf_plates < 2.0 * dx))[0]
+        too_close = np.zeros(near.size, dtype=bool)
+        for start in range(0, near.size, 2000):
+            block = sites[near[start:start + 2000]]
+            difference = block[:, None, :] - kept[None, :, :]
+            too_close[start:start + 2000] = (np.einsum("ijk,ijk->ij", difference, difference)
+                                             < (0.6 * dx) ** 2).any(axis=1)
+        in_plate[near[too_close]] = True
+        is_rotor &= ~in_plate
+        in_blade = in_blade | in_plate
+        print(f"thin plates: {len(plates)} plates, {kept.shape[0]:,} particles, "
+              f"{int(in_plate.sum()):,} lattice sites dropped")
     is_wall_solid = (sdf_wall_solid <= skin) & ~is_rotor & ~in_blade
     is_fluid = (sdf_interior <= -0.5 * dx) & ~is_rotor & ~is_wall_solid & ~in_blade
     # Everything else inside the frame that is not liquid = tank shell (walls, floor, lid).
@@ -723,6 +874,13 @@ def main() -> int:
     is_shell &= sdf_interior <= shell + 0.5 * dx
 
     fluid = sites[is_fluid]
+    if plates:
+        near_count = count_near_plates(fluid, plates, h)
+        print(f"thin plates: {int((near_count > 0).sum()):,} fluid particles ({100.0 * (near_count > 0).mean():.2f} %) "
+              f"have a plate inside their support; at most {int(near_count.max())} plates at once "
+              f"(the solver keeps {MAX_NEAR_THIN_PLATES})")
+        if near_count.max() > MAX_NEAR_THIN_PLATES:
+            parser.error("more plates inside one support than the solver keeps (MAX_NEAR_THIN_PLATES)")
     wall = np.vstack([sites[is_wall_solid | is_shell], baffle_points])
     if args.conformal_baffles:
         print(f"conformal baffles: {baffle_points.shape[0]:,} baffle particles in {args.thin_layers} layer(s)")
@@ -730,7 +888,9 @@ def main() -> int:
     if args.conformal_blades:
         print(f"conformal blades: {blade_points.shape[0]:,} blade particles in {args.thin_layers} layer(s), "
               f"{int(in_blade.sum()):,} lattice sites dropped")
-    n_fluid, n_wall, n_rotor = fluid.shape[0], wall.shape[0], rotor.shape[0]
+    n_plate_rotor = sum(plate["points"].shape[0] for plate in plates if plate["frame"] == "rotor")
+    n_plate_static = sum(plate["points"].shape[0] for plate in plates if plate["frame"] == "static")
+    n_fluid, n_wall, n_rotor = fluid.shape[0], wall.shape[0] + n_plate_static, rotor.shape[0] + n_plate_rotor
     total = n_fluid + n_wall + n_rotor
     pool_size = int(math.ceil(total * 1.15 / 128) * 128)
 
@@ -752,7 +912,9 @@ def main() -> int:
     write_obj(out / "fluid.obj", fluid)
     write_obj(out / "wall.obj", wall)
     write_obj(out / "rotor.obj", rotor)
-    all_points = np.vstack([fluid, wall, rotor])
+    for plate in plates:
+        write_obj(out / f"plate_{plate['name']}.obj", plate["points"])
+    all_points = np.vstack([fluid, wall, rotor] + [plate["points"] for plate in plates])
     write_frame_obj(out / "frame.obj", all_points.min(axis=0) - 0.6 * dx, all_points.max(axis=0) + 0.6 * dx)
     case_text = CASE_YAML.format(
         dx=dx, h=h, hdx=args.hdx, thin_layers=args.thin_layers, n_fluid=n_fluid, n_wall=n_wall,
@@ -786,6 +948,19 @@ def main() -> int:
             parser.error("--hydrostatic needs --gravity")
         assert case_text.count("  gravity: [") == 1
         case_text = case_text.replace("  gravity: [", f"  hydrostatic_reference: [0.0, {LIQUID_HEIGHT}, 0.0]\n  gravity: [")
+    if args.thin_plates:
+        assert case_text.count("    - {file: rotor.obj, material: impeller}\n") == 1
+        entries = "".join(
+            f"    - {{file: plate_{plate['name']}.obj, "
+            f"material: {'impeller' if plate['frame'] == 'rotor' else 'tank_wall'}, thin_plate: {plate['name']}}}\n"
+            for plate in plates)
+        case_text = case_text.replace("    - {file: rotor.obj, material: impeller}\n",
+                                      "    - {file: rotor.obj, material: impeller}\n" + entries)
+        case_text += thin_plates_block(plates)
+        if args.thin_plate_dashpot is not None:
+            assert case_text.count("  use_pst: true") == 1
+            case_text = case_text.replace("  use_pst: true",
+                                          f"  thin_plate_dashpot: {args.thin_plate_dashpot:g}\n  use_pst: true")
     (out / "case.yaml").write_text(case_text, encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity), encoding="utf-8")
     if args.tracers > 0:

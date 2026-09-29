@@ -767,10 +767,12 @@ class ThinPlateConfig:
     ``axis_a``         unit in-plane axis a; axis_b = normal x axis_a
     ``extent``         rectangle: half lengths along (axis_a, axis_b);
                        annulus: (outer radius, inner radius)
-    ``thickness``      plate thickness (used for the points of the faces where the
-                       load is evaluated; the fluid sees a plate about one particle
-                       spacing thick)
-    ``point_measure``  area (3D) or length (2D) one plate particle stands for
+    ``thickness``      true thickness of the plate, for the record
+    ``point_measure``  area (3D) or length (2D) one plate particle stands for, for
+                       the record
+    The solver uses neither of the last two: the fluid sees a plate about one
+    particle spacing thick, and the load on a plate is the reaction of the forces
+    the fluid receives from it.
     """
     name: str
     shape: str
@@ -779,8 +781,8 @@ class ThinPlateConfig:
     normal: tuple
     axis_a: tuple
     extent: tuple
-    thickness: float
-    point_measure: float
+    thickness: float = 0.0
+    point_measure: float = 1.0
     index: int = -1                                 # position in the plate buffer, set by Case
 
     def __post_init__(self):

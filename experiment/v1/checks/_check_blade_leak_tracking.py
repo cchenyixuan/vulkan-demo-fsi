@@ -195,11 +195,15 @@ def run(arguments):
                     if case.numerics.solid_reaction_force:
                         # torque of the fluid on the walls about the rotor axis (+y through the
                         # origin); "baffle": wall particles inside the tank radius above the floor
-                        wall_positions, wall_forces = simulator.readback_boundary_forces()
+                        # thin plates (2026-09-30): the records of the static plates (the baffle
+                        # plates) come with the index of their plate and count as baffle
+                        wall_positions, wall_forces, wall_plate = simulator.readback_boundary_forces(
+                            with_plate_index=True)
                         wall_torque = (wall_positions[:, 2] * wall_forces[:, 0]
                                        - wall_positions[:, 0] * wall_forces[:, 2])
                         wall_radius = np.hypot(wall_positions[:, 0], wall_positions[:, 2])
-                        baffle = (wall_radius < 0.1395) & (wall_radius > 0.10) & (wall_positions[:, 1] > 0.0)
+                        baffle = (((wall_radius < 0.1395) & (wall_radius > 0.10) & (wall_positions[:, 1] > 0.0))
+                                  | (wall_plate >= 0))
                         total = wall_forces.sum(axis=0)
                         torque_log.write(f"{wall_torque.sum():.6e},{wall_torque[baffle].sum():.6e},"
                                          f"{total[0]:.6e},{total[1]:.6e},{total[2]:.6e},")
