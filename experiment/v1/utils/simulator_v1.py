@@ -42,9 +42,9 @@ import numpy as np
 from vulkan import *
 from vulkan._vulkancache import ffi
 
-from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, PAIR_CORRECTION_MODES,
-                            PST_NEAR_SOLID_MODES,
-                            SOLID_PRESSURE_MODES)
+from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, MAX_THIN_PLATE_GROUPS,
+                            PAIR_CORRECTION_MODES, PST_NEAR_SOLID_MODES, SOLID_PRESSURE_MODES,
+                            THIN_PLATE_FRAMES, THIN_PLATE_PRESSURE_FORMS, THIN_PLATE_SHAPES)
 from utils.sph.vulkan_context import VulkanContext
 
 
@@ -69,6 +69,17 @@ SHADER_NAME_DEFRAG = "defrag"
 # Scalar build of force.comp (compile_shaders_v1.SOURCE_VARIANTS, 2026-09-27):
 # used for the "force" pipeline when the case has a `scalars:` block.
 SHADER_NAME_FORCE_WITH_SCALARS = "force_scalar"
+# Builds with the thin plate code (2026-09-30, -DWITH_THIN_PLATES=1): used for
+# cases with a `thin_plates:` block. pipeline name -> module name.
+SHADER_NAMES_WITH_THIN_PLATES = {
+    "correction": "correction_plates",
+    "density": "density_plates",
+    "force": "force_plates",
+    "force_scalar": "force_scalar_plates",
+    "defrag": "defrag_plates",
+}
+THIN_PLATE_GROUP_BYTES = 32
+THIN_PLATE_BYTES = 80
 
 
 # Spec const ids (mirrors experiment/v1/shaders/common.glsl id ranges).
@@ -115,6 +126,13 @@ SPEC_ID_USE_PST                             = 45
 SPEC_ID_USE_PREFIX_SUM_DEFRAG               = 46
 SPEC_ID_USE_NEIGHBOR_LIST                   = 47
 SPEC_ID_PAIR_CORRECTION_MODE                = 48
+# Thin plates (2026-09-30); declared only by the *_plates builds.
+SPEC_ID_THIN_PLATE_COUNT                    = 49
+SPEC_ID_THIN_PLATE_GROUP_COUNT              = 72
+SPEC_ID_THIN_PLATE_PRESSURE_FORM            = 73
+SPEC_ID_THIN_PLATE_DASHPOT                  = 74
+SPEC_ID_USE_THIN_PLATE_VISCOSITY            = 75
+SPEC_ID_THIN_PLATE_PENALTY                  = 76
 SPEC_ID_MAX_PARTICLES_PER_VOXEL             = 50
 SPEC_ID_WORKGROUP_SIZE                      = 51
 SPEC_ID_MAX_INCOMING_PER_VOXEL              = 52
@@ -300,6 +318,8 @@ class SphSimulatorV1:
     def _load_shader_modules(self) -> dict:
         modules: dict = {}
         names = list(SHADER_NAMES_HOT) + [SHADER_NAME_DEFRAG, SHADER_NAME_FORCE_WITH_SCALARS]
+        if self.case.thin_plate_count > 0:
+            names += list(SHADER_NAMES_WITH_THIN_PLATES.values())
         for name in names:
             spv_path = SHADER_DIR / f"{name}.comp.spv"
             if not spv_path.exists():
@@ -336,6 +356,11 @@ class SphSimulatorV1:
         scalar_bytes = 16 * scalar_vec4 * pool_capacity if scalar_vec4 > 0 else 16
         sgs_on = case.scalars is not None and case.scalars.sgs.enabled
         turbulent_bytes = 4 * pool_capacity if sgs_on else 16
+        # Thin plates (2026-09-30): the *_plates builds store the full correction
+        # matrix, 3 vec4 per particle instead of 2.
+        correction_bytes = (48 if case.thin_plate_count > 0 else 32) * pool_capacity
+        thin_plate_bytes = (MAX_THIN_PLATE_GROUPS * THIN_PLATE_GROUP_BYTES
+                            + THIN_PLATE_BYTES * max(case.thin_plate_count, 1))
 
         BSU = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         TRANSFER = (VK_BUFFER_USAGE_TRANSFER_DST_BIT
@@ -351,7 +376,7 @@ class SphSimulatorV1:
             _BufferSpec("acceleration",                 0, 4, 16 * pool_capacity, BSU | TRANSFER),
             _BufferSpec("shift",                        0, 5, 16 * pool_capacity, BSU | TRANSFER),
             _BufferSpec("material",                     0, 6,  4 * pool_capacity, BSU | TRANSFER),
-            _BufferSpec("correction_inverse",           0, 7, 32 * pool_capacity, BSU | TRANSFER),
+            _BufferSpec("correction_inverse",           0, 7, correction_bytes,   BSU | TRANSFER),
             _BufferSpec("density_gradient_kernel_sum", 0, 8, 16 * pool_capacity, BSU | TRANSFER),
             _BufferSpec("extension_fields",             0, 9, 16 * pool_capacity, BSU | TRANSFER),
             # ---- Scalar transport (2026-09-27). Placeholders (16 B) when the
@@ -397,6 +422,9 @@ class SphSimulatorV1:
             _BufferSpec("scalar_parameters",            3, 10, 32 * max(scalar_vec4, 1), BSU | TRANSFER),
             _BufferSpec("scalar_injection",             3, 11, MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES,
                         BSU | TRANSFER),
+            # Thin plates and their bounding groups (2026-09-30); a placeholder
+            # that no kernel reads when the case has no plates.
+            _BufferSpec("thin_plates",                  3, 12, thin_plate_bytes,   BSU | TRANSFER),
         ]
 
     def _allocate_buffer(self, size: int, usage: int, memory_properties: int) -> Buffer:
@@ -533,8 +561,36 @@ class SphSimulatorV1:
                 hydrostatic = material.rest_density * (offset @ np.asarray(case.physics.gravity, dtype=np.float64))
                 ratio = np.maximum(1.0 + hydrostatic / float(material.eos_constant), 0.5)
                 density_pressure[cursor:cursor + n, 0] = material.rest_density * ratio ** (1.0 / float(case.physics.power))
+            if source.thin_plate_name is not None:
+                # thin plate particle (2026-09-30): marker instead of a density,
+                # ( -(plate index + 1), measure of the quadrature point )
+                plate = case.thin_plates[case.thin_plate_index(source.thin_plate_name)]
+                density_pressure[cursor:cursor + n, 0] = -(plate.index + 1.0)
+                density_pressure[cursor:cursor + n, 1] = plate.point_measure
             cursor += n
         data["density_pressure"] = density_pressure.tobytes()
+
+        # ---- thin plates: bounding groups + plates (2026-09-30) -------------
+        if case.thin_plate_count > 0:
+            blob = bytearray()
+            for slot in range(MAX_THIN_PLATE_GROUPS):
+                if slot < len(case.thin_plate_groups):
+                    group = case.thin_plate_groups[slot]
+                    blob += struct.pack("4f4I", group.centre[0], group.centre[1], group.centre[2], group.radius,
+                                        group.first, group.count, THIN_PLATE_FRAMES[group.frame], 0)
+                else:
+                    blob += b"\x00" * THIN_PLATE_GROUP_BYTES
+            for plate in case.thin_plates:
+                axis_b = plate.axis_b
+                blob += struct.pack(
+                    "4f4f4f4f4I",
+                    plate.centre[0], plate.centre[1], plate.centre[2], plate.extent[0],
+                    plate.normal[0], plate.normal[1], plate.normal[2], plate.extent[1],
+                    plate.axis_a[0], plate.axis_a[1], plate.axis_a[2], 0.5 * plate.thickness,
+                    axis_b[0], axis_b[1], axis_b[2], plate.point_measure,
+                    THIN_PLATE_SHAPES[plate.shape], THIN_PLATE_FRAMES[plate.frame], 0, 0)
+            assert len(blob) == MAX_THIN_PLATE_GROUPS * THIN_PLATE_GROUP_BYTES + THIN_PLATE_BYTES * case.thin_plate_count
+            data["thin_plates"] = bytes(blob)
 
         # ---- material (group_id, 0 for unallocated slots) -------------------
         material_array = np.zeros(pool_capacity, dtype=np.uint32)
@@ -864,6 +920,12 @@ class SphSimulatorV1:
             (SPEC_ID_USE_PREFIX_SUM_DEFRAG,        1 if numerics.use_prefix_sum_defrag else 0, 'I'),
             (SPEC_ID_USE_NEIGHBOR_LIST,            1 if numerics.use_neighbor_list else 0,    'I'),
             (SPEC_ID_PAIR_CORRECTION_MODE,         PAIR_CORRECTION_MODES[numerics.pair_correction], 'I'),
+            (SPEC_ID_THIN_PLATE_COUNT,             int(case.thin_plate_count),                'I'),
+            (SPEC_ID_THIN_PLATE_GROUP_COUNT,       len(case.thin_plate_groups or []),         'I'),
+            (SPEC_ID_THIN_PLATE_PRESSURE_FORM,     THIN_PLATE_PRESSURE_FORMS[numerics.thin_plate_pressure_form], 'I'),
+            (SPEC_ID_THIN_PLATE_DASHPOT,           float(numerics.thin_plate_dashpot),        'f'),
+            (SPEC_ID_USE_THIN_PLATE_VISCOSITY,     1 if numerics.thin_plate_viscosity else 0, 'I'),
+            (SPEC_ID_THIN_PLATE_PENALTY,           float(numerics.thin_plate_penalty),        'f'),
             (SPEC_ID_MAX_PARTICLES_PER_VOXEL,      int(capacities.max_per_voxel),             'I'),
             (SPEC_ID_WORKGROUP_SIZE,               int(capacities.workgroup),                 'I'),
             (SPEC_ID_MAX_INCOMING_PER_VOXEL,       int(capacities.max_incoming),              'I'),
@@ -932,14 +994,18 @@ class SphSimulatorV1:
     def _module_name_for_pipeline(self, pipeline_name: str) -> str:
         """force uses the scalar build of force.comp for cases with scalars
         (2026-09-27); every other pipeline uses the module of the same name."""
+        name = pipeline_name
         if pipeline_name == "force" and self.case.scalar_vec4_count > 0:
-            return SHADER_NAME_FORCE_WITH_SCALARS
-        return pipeline_name
+            name = SHADER_NAME_FORCE_WITH_SCALARS
+        if self.case.thin_plate_count > 0:
+            # builds with the thin plate code (2026-09-30)
+            name = SHADER_NAMES_WITH_THIN_PLATES.get(name, name)
+        return name
 
     def _build_defrag_pipeline(self):
         stage = VkPipelineShaderStageCreateInfo(
             stage=VK_SHADER_STAGE_COMPUTE_BIT,
-            module=self.shader_modules[SHADER_NAME_DEFRAG],
+            module=self.shader_modules[self._module_name_for_pipeline(SHADER_NAME_DEFRAG)],
             pName="main",
             pSpecializationInfo=self.spec_info_global,
         )

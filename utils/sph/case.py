@@ -302,6 +302,10 @@ class RegularizationConfig:
 
 
 PAIR_CORRECTION_MODES = {"own": 0, "mean": 1, "reverse": 2}
+THIN_PLATE_PRESSURE_FORMS = {"tic": 0, "difference": 1}
+THIN_PLATE_SHAPES = {"rectangle": 0, "annulus": 1}
+THIN_PLATE_FRAMES = {"static": 0, "rotor": 1}
+MAX_THIN_PLATE_GROUPS = 8          # common.glsl MAX_THIN_PLATE_GROUPS
 SOLID_PRESSURE_MODES = {"increment": 0, "mirror": 1, "mirror_tic": 2, "accumulate": 3, "extrapolate": 4}
 PST_NEAR_SOLID_MODES = {"full": 0, "tangential": 1}
 
@@ -391,8 +395,25 @@ class NumericsConfig:
     # Mirror modes: constant p_w (Pa) added to the mirrored solid pressure, a
     # repulsive layer on fluid-solid pairs only (see common.glsl).
     solid_pressure_offset: float = 0.0
+    # Thin plates (2026-09-30, case block `thin_plates:`, shaders/thin_plates.glsl):
+    #   thin_plate_pressure_form  "tic": a particle next to a plate follows its TIC
+    #                             switch; "difference": it uses the difference form
+    #                             (P_j - P_i) for all its pairs
+    #   thin_plate_dashpot        beta of the wall pressure term beta rho c0 (v_i - v_k).n
+    #   thin_plate_viscosity      wall friction of the plates (False: free slip)
+    #   thin_plate_penalty        kappa of the penalty pressure kappa rho0 c0^2 (1 - gap / (dx/4))^2
+    #                             for a particle closer than dx / 4 to a face
+    thin_plate_pressure_form: str = "difference"
+    thin_plate_dashpot: float = 1.0
+    thin_plate_viscosity: bool = True
+    thin_plate_penalty: float = 0.1
 
     def __post_init__(self):
+        if self.thin_plate_pressure_form not in THIN_PLATE_PRESSURE_FORMS:
+            raise ValueError(f"numerics.thin_plate_pressure_form must be one of "
+                             f"{list(THIN_PLATE_PRESSURE_FORMS)}, got {self.thin_plate_pressure_form!r}")
+        if self.thin_plate_dashpot < 0:
+            raise ValueError(f"numerics.thin_plate_dashpot must be >= 0, got {self.thin_plate_dashpot}")
         if self.solid_pressure not in SOLID_PRESSURE_MODES:
             raise ValueError(f"numerics.solid_pressure must be one of {list(SOLID_PRESSURE_MODES)}, "
                              f"got {self.solid_pressure!r}")
@@ -742,12 +763,136 @@ def _parse_scalars(data: dict, source: str) -> "ScalarsConfig":
 
 
 @dataclass
+class ThinPlateConfig:
+    """One thin plate wetted on both sides (case.yaml block ``thin_plates:``,
+    2026-09-30, shaders/thin_plates.glsl). A plane rectangle or annulus with a
+    thickness; its particles (a `geometry.particles` entry with
+    ``thin_plate: <name>``) lie on the mid-plane and are quadrature points.
+
+    ``shape``          "rectangle" or "annulus"
+    ``frame``          "static" or "rotor" (given at the rotor angle 0)
+    ``centre``         centre of the rectangle / of the annulus
+    ``normal``         unit normal of the plate
+    ``axis_a``         unit in-plane axis a; axis_b = normal x axis_a
+    ``extent``         rectangle: half lengths along (axis_a, axis_b);
+                       annulus: (outer radius, inner radius)
+    ``thickness``      plate thickness (the faces lie at +- thickness / 2)
+    ``point_measure``  area (3D) or length (2D) one quadrature point stands for
+    """
+    name: str
+    shape: str
+    frame: str
+    centre: tuple
+    normal: tuple
+    axis_a: tuple
+    extent: tuple
+    thickness: float
+    point_measure: float
+    index: int = -1                                 # position in the plate buffer, set by Case
+
+    def __post_init__(self):
+        if self.shape not in THIN_PLATE_SHAPES:
+            raise ValueError(f"thin plate {self.name}: shape must be one of {list(THIN_PLATE_SHAPES)}")
+        if self.frame not in THIN_PLATE_FRAMES:
+            raise ValueError(f"thin plate {self.name}: frame must be one of {list(THIN_PLATE_FRAMES)}")
+        normal = np.asarray(self.normal, dtype=np.float64)
+        axis_a = np.asarray(self.axis_a, dtype=np.float64)
+        if normal.shape != (3,) or axis_a.shape != (3,) or np.linalg.norm(normal) == 0 or np.linalg.norm(axis_a) == 0:
+            raise ValueError(f"thin plate {self.name}: normal and axis_a must be non-zero 3-vectors")
+        normal = normal / np.linalg.norm(normal)
+        axis_a = axis_a - np.dot(axis_a, normal) * normal
+        if np.linalg.norm(axis_a) < 1e-6:
+            raise ValueError(f"thin plate {self.name}: axis_a is parallel to the normal")
+        axis_a = axis_a / np.linalg.norm(axis_a)
+        self.normal = tuple(float(v) for v in normal)
+        self.axis_a = tuple(float(v) for v in axis_a)
+        self.centre = tuple(float(v) for v in self.centre)
+        self.extent = tuple(float(v) for v in self.extent)
+        if len(self.centre) != 3 or len(self.extent) != 2:
+            raise ValueError(f"thin plate {self.name}: centre needs 3 and extent 2 numbers")
+        if self.shape == "annulus" and not self.extent[0] > self.extent[1] >= 0:
+            raise ValueError(f"thin plate {self.name}: annulus extent is (outer radius, inner radius)")
+        self.thickness = float(self.thickness)
+        self.point_measure = float(self.point_measure)
+        if self.thickness < 0 or self.point_measure <= 0:
+            raise ValueError(f"thin plate {self.name}: thickness >= 0 and point_measure > 0 required")
+
+    @property
+    def axis_b(self) -> tuple:
+        return tuple(float(v) for v in np.cross(np.asarray(self.normal), np.asarray(self.axis_a)))
+
+    def corner_radius(self) -> float:
+        """Largest in-plane distance of a point of the plate from its centre."""
+        if self.shape == "annulus":
+            return self.extent[0]
+        return math.hypot(self.extent[0], self.extent[1])
+
+
+@dataclass
+class ThinPlateGroup:
+    """Bounding sphere (world coordinates) of a run of plates of one frame."""
+    centre: tuple
+    radius: float
+    first: int
+    count: int
+    frame: str
+
+
+def build_thin_plate_groups(plates: list, support_radius: float, rotor: Optional["RotorConfig"]) -> tuple:
+    """Order the plates and group them: every static plate is a group of its
+    own (sphere around the plate); the rotor plates are clustered along the
+    rotor axis, their spheres centred ON the axis so that they do not move.
+    Returns (plates in buffer order with .index set, groups)."""
+    static = [plate for plate in plates if plate.frame == "static"]
+    moving = [plate for plate in plates if plate.frame == "rotor"]
+    ordered, groups = [], []
+    for plate in static:
+        groups.append(ThinPlateGroup(centre=plate.centre,
+                                     radius=plate.corner_radius() + 0.5 * plate.thickness + 1.01 * support_radius,
+                                     first=len(ordered), count=1, frame="static"))
+        ordered.append(plate)
+    if moving:
+        if rotor is None:
+            raise ValueError("thin plates with frame: rotor need a `rotor:` block")
+        axis = np.asarray(rotor.axis, dtype=np.float64)
+        pivot = np.asarray(rotor.pivot, dtype=np.float64)
+        height = [float(np.dot(np.asarray(plate.centre) - pivot, axis)) for plate in moving]
+        order = np.argsort(height)
+        clusters = []
+        for k in order:
+            plate = moving[int(k)]
+            if clusters and height[int(k)] - clusters[-1]["top"] < 4.0 * support_radius + 2.0 * plate.corner_radius():
+                clusters[-1]["plates"].append(plate)
+                clusters[-1]["top"] = max(clusters[-1]["top"], height[int(k)])
+            else:
+                clusters.append({"plates": [plate], "bottom": height[int(k)], "top": height[int(k)]})
+        for cluster in clusters:
+            centre_height = 0.5 * (cluster["bottom"] + cluster["top"])
+            centre = pivot + centre_height * axis
+            radius = 0.0
+            for plate in cluster["plates"]:
+                offset = float(np.linalg.norm(np.asarray(plate.centre) - centre))
+                radius = max(radius, offset + plate.corner_radius() + 0.5 * plate.thickness)
+            groups.append(ThinPlateGroup(centre=tuple(float(v) for v in centre),
+                                         radius=radius + 1.01 * support_radius,
+                                         first=len(ordered), count=len(cluster["plates"]), frame="rotor"))
+            ordered.extend(cluster["plates"])
+    if len(groups) > MAX_THIN_PLATE_GROUPS:
+        raise ValueError(f"{len(groups)} thin plate groups, at most {MAX_THIN_PLATE_GROUPS} "
+                         f"(every static plate is one group)")
+    for index, plate in enumerate(ordered):
+        plate.index = index
+    return ordered, groups
+
+
+@dataclass
 class ParticleSource:
     """One obj file's vertices + its material assignment."""
     obj_path: pathlib.Path
     vertices: np.ndarray                            # (N, 3) float32
     material_name: str
     material_group_id: int                          # backfilled at Case construction
+    thin_plate_name: Optional[str] = None           # quadrature points of this plate (2026-09-30)
 
 
 # ============================================================================
@@ -782,6 +927,19 @@ class Case:
     case_dir: pathlib.Path                          # for relative path debugging
     rotor: Optional["RotorConfig"] = None           # present iff case.yaml has a `rotor:` block
     scalars: Optional["ScalarsConfig"] = None       # present iff case.yaml has a `scalars:` block
+    # Thin plates (2026-09-30), in buffer order, and their bounding groups.
+    thin_plates: Optional[list] = None
+    thin_plate_groups: Optional[list] = None
+
+    @property
+    def thin_plate_count(self) -> int:
+        return 0 if not self.thin_plates else len(self.thin_plates)
+
+    def thin_plate_index(self, name: str) -> int:
+        for plate in self.thin_plates or []:
+            if plate.name == name:
+                return plate.index
+        raise ValueError(f"unknown thin plate {name!r}")
 
     @property
     def scalar_vec4_count(self) -> int:
@@ -997,6 +1155,12 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (46,  lambda case: 1 if case.numerics.use_prefix_sum_defrag else 0, 'I'),  # USE_PREFIX_SUM_DEFRAG
     (47,  lambda case: 1 if case.numerics.use_neighbor_list     else 0, 'I'),  # USE_NEIGHBOR_LIST
     (48,  lambda case: PAIR_CORRECTION_MODES[case.numerics.pair_correction], 'I'),  # PAIR_CORRECTION_MODE
+    (49,  lambda case: case.thin_plate_count,                           'I'),  # THIN_PLATE_COUNT
+    (72,  lambda case: len(case.thin_plate_groups or []),               'I'),  # THIN_PLATE_GROUP_COUNT
+    (73,  lambda case: THIN_PLATE_PRESSURE_FORMS[case.numerics.thin_plate_pressure_form], 'I'),
+    (74,  lambda case: case.numerics.thin_plate_dashpot,                'f'),  # THIN_PLATE_DASHPOT
+    (75,  lambda case: 1 if case.numerics.thin_plate_viscosity else 0,  'I'),  # USE_THIN_PLATE_VISCOSITY
+    (76,  lambda case: case.numerics.thin_plate_penalty,                'f'),  # THIN_PLATE_PENALTY
     (50,  lambda case: case.capacities.max_per_voxel,                  'I'),
     (51,  lambda case: case.capacities.workgroup,                      'I'),
     (52,  lambda case: case.capacities.max_incoming,                   'I'),
@@ -1148,6 +1312,38 @@ def load_case(case_yaml_path) -> Case:
         if not any(m.kind == KIND_FLUID for m in materials):
             raise ValueError(f"{case_yaml_path}: `scalars:` block but no fluid-kind material")
 
+    # Optional thin plates (2026-09-30).
+    thin_plates, thin_plate_groups = None, None
+    plate_sources = [source for source in particle_sources if source.thin_plate_name is not None]
+    if case_data.get("thin_plates"):
+        declared = [ThinPlateConfig(**entry) for entry in case_data["thin_plates"]]
+        names = [plate.name for plate in declared]
+        if len(set(names)) != len(names):
+            raise ValueError(f"{case_yaml_path}: thin plate names must be unique")
+        thin_plates, thin_plate_groups = build_thin_plate_groups(declared, physics.h, rotor)
+        if not numerics.solid_reaction_force:
+            raise ValueError(f"{case_yaml_path}: thin plates need numerics.solid_reaction_force: true "
+                             f"(the load on a plate particle is evaluated in the reaction branch)")
+        kind_of_frame = {"static": KIND_BOUNDARY, "rotor": KIND_ROTOR}
+        by_name = {plate.name: plate for plate in thin_plates}
+        for source in plate_sources:
+            if source.thin_plate_name not in by_name:
+                raise ValueError(f"{source.obj_path.name}: unknown thin plate {source.thin_plate_name!r}")
+            plate = by_name[source.thin_plate_name]
+            material = materials[source.material_group_id]
+            if material.kind != kind_of_frame[plate.frame]:
+                raise ValueError(f"{source.obj_path.name}: a plate of frame {plate.frame} needs a material "
+                                 f"of kind {'rotor' if plate.frame == 'rotor' else 'boundary'}")
+            # the particles must lie on the mid-plane, inside the outline (at the rotor angle 0)
+            relative = np.asarray(source.vertices, dtype=np.float64) - np.asarray(plate.centre)
+            off_plane = np.abs(relative @ np.asarray(plate.normal)).max() if len(relative) else 0.0
+            if off_plane > 1e-5:
+                raise ValueError(f"{source.obj_path.name}: particles lie up to {off_plane:.2e} m off the "
+                                 f"mid-plane of plate {plate.name}")
+    elif plate_sources:
+        raise ValueError(f"{case_yaml_path}: geometry.particles refers to thin plates but the case has "
+                         f"no `thin_plates:` block")
+
     return Case(
         physics=physics,
         numerics=numerics,
@@ -1159,6 +1355,8 @@ def load_case(case_yaml_path) -> Case:
         case_dir=case_dir,
         rotor=rotor,
         scalars=scalars,
+        thin_plates=thin_plates,
+        thin_plate_groups=thin_plate_groups,
     )
 
 
@@ -1203,6 +1401,7 @@ def _load_particle_sources(case_dir, geometry_dict):
             vertices=vertices,
             material_name=material_name,
             material_group_id=-1,                   # backfilled in load_case
+            thin_plate_name=entry.get("thin_plate"),
         ))
         if material_name not in used_names:
             used_names.append(material_name)        # preserve first-seen order

@@ -184,8 +184,14 @@ void main() {
         dst_acceleration[new_id]                 = acceleration[old_id];
         dst_shift[new_id]                        = shift[old_id];
         dst_material[new_id]                     = material[old_id];
+#if WITH_THIN_PLATES
+        dst_correction_inverse[new_id * 3u]      = correction_inverse[old_id * 3u];
+        dst_correction_inverse[new_id * 3u + 1u] = correction_inverse[old_id * 3u + 1u];
+        dst_correction_inverse[new_id * 3u + 2u] = correction_inverse[old_id * 3u + 2u];
+#else
         dst_correction_inverse[new_id * 2u]      = correction_inverse[old_id * 2u];
         dst_correction_inverse[new_id * 2u + 1u] = correction_inverse[old_id * 2u + 1u];
+#endif
         dst_density_gradient_kernel_sum[new_id]  = density_gradient_kernel_sum[old_id];
         dst_extension_fields[new_id]             = extension_fields[old_id];
         dst_particle_uid[new_id]                 = particle_uid[old_id];

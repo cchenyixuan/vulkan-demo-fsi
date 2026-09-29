@@ -2,6 +2,9 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 #include "helpers.glsl"
+#if WITH_THIN_PLATES
+#include "thin_plates.glsl"
+#endif
 
 // ============================================================================
 // correction.comp - δ-plus WCSPH KCG correction matrix + density gradient +
@@ -58,6 +61,22 @@ void main() {
 
     // Read self's density from the canonical buffer.
     float self_density = density_pressure[self_particle_id].x;
+
+#if WITH_THIN_PLATES
+    // Thin plates (2026-09-30). A plate particle is a quadrature point only:
+    // it needs no matrix of its own.
+    if (is_thin_plate_point(self_density)) {
+        correction_inverse[self_particle_id * 3u]      = vec4(1.0, 1.0, 1.0, 0.0);
+        correction_inverse[self_particle_id * 3u + 1u] = vec4(0.0, 0.0, 1.0, 0.0);
+        correction_inverse[self_particle_id * 3u + 2u] = vec4(0.0);
+        density_gradient_kernel_sum[self_particle_id]  = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    MaterialParameters thin_plate_self_params = material_parameters[material[self_particle_id]];
+    gather_near_thin_plates(self_position);
+    // surface part of the matrix, N_wall = sum_k w_k W_is n_out (x) (x_s - x_i)
+    mat3 wall_matrix = mat3(0.0);
+#endif
 
     // --- Decode self voxel coord ---------------------------------------------
     ivec3 self_voxel_coord = own_coord_of(self_voxel_id);
@@ -123,6 +142,43 @@ void main() {
             // --- Read neighbor mass / density / volume --------------
             float neighbor_mass    = velocity_mass[neighbor_particle_id].w;
             float neighbor_density = density_pressure[neighbor_particle_id].x;
+#if WITH_THIN_PLATES
+            if (is_thin_plate_point(neighbor_density)) {
+                // quadrature point of a plate: surface terms of the faces this particle sees
+                uint slot = thin_plate_slot_of_point(neighbor_density);
+                if (slot == MAX_NEAR_THIN_PLATES) continue;
+                vec3 face_position[2];
+                vec3 face_normal_out[2];
+                bool face_is_own_side[2];
+                uint face_count = thin_plate_visible_faces(slot, neighbor_position, self_position,
+                                                           face_position, face_normal_out, face_is_own_side);
+                float point_weight = thin_plate_point_weight(slot, thin_plate_self_params.volume,
+                                                             thin_plate_self_params.radius);
+                // kernel sum: the point as one particle of a layer of the spacing dx
+                kernel_sum += point_weight * 2.0 * thin_plate_self_params.radius
+                            * evaluate_kernel_unguarded(distance);
+                for (uint face = 0u; face < face_count; face++) {
+                    vec3  offset      = face_position[face] - self_position;         // x_s - x_i
+                    float face_kernel = evaluate_kernel(length(offset));
+                    wall_matrix += point_weight * face_kernel * outerProduct(face_normal_out[face], offset);
+                    // density on the face: the particle's own, continued with the body force
+                    // in the frame of the plate (as the wall pressure, without the dashpot)
+                    vec3 relative_body_force = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z)
+                                             - thin_plate_point_acceleration(slot, face_position[face]);
+                    float wall_density_difference = self_density * dot(relative_body_force, offset)
+                                                  / (SPEED_OF_SOUND * SPEED_OF_SOUND);
+                    density_gradient += point_weight * face_kernel * wall_density_difference
+                                      * face_normal_out[face];
+                }
+                continue;
+            }
+            if (near_thin_plate_count > 0u
+                    && thin_plate_blocks_segment(self_position, neighbor_position)) {
+                // behind a plate: counts for the kernel sum only
+                kernel_sum += neighbor_mass / neighbor_density * evaluate_kernel_unguarded(distance);
+                continue;
+            }
+#endif
             float neighbor_volume  = neighbor_mass / neighbor_density;
 
             // --- Evaluate kernel and gradient -----------------------
@@ -163,6 +219,14 @@ void main() {
     //   .w = 1 for FLUID, 0 otherwise (lets force skip solid neighbours with
     //        the load it already makes, instead of material[] + material_parameters[])
     // Not used by any momentum term.
+#if WITH_THIN_PLATES
+    // The volume part sum_j V_j (x_j - x_i) (x) grad W_ij is symmetric, the
+    // surface part is not (next to a plate edge). Both in the convention
+    // N[row][column] = (gradient or normal)_row (offset)_column, so that
+    // N^-1 applied to the kernel gradient (or to n_out) gives the exact
+    // gradient of a linear field.
+    correction_matrix += wall_matrix;
+#endif
     float correction_matrix_trace = correction_matrix[0][0] + correction_matrix[1][1]
         + ((DIMENSION == 3u) ? correction_matrix[2][2] : 0.0);
     float scalar_laplacian_normalisation =
@@ -220,6 +284,26 @@ void main() {
     //     correction_inverse[pid * 2]     = (m00, m11, m22, m01)
     //     correction_inverse[pid * 2 + 1] = (m02, m12, _, _)
     // ========================================================================
+#if WITH_THIN_PLATES
+    correction_inverse[self_particle_id * 3u] = vec4(
+        correction_matrix_inverse[0][0],
+        correction_matrix_inverse[1][1],
+        correction_matrix_inverse[2][2],
+        correction_matrix_inverse[0][1]);
+    correction_inverse[self_particle_id * 3u + 1u] = vec4(
+        correction_matrix_inverse[0][2],
+        correction_matrix_inverse[1][2],
+        scalar_laplacian_normalisation,
+        scalar_fluid_flag);
+    // .w = 1: a plate lies inside the support of this particle. Its matrix
+    // carries the surface term (up to 1.4 times the matrix of the bulk along
+    // the normal) and must not enter the pair correction of its neighbours.
+    correction_inverse[self_particle_id * 3u + 2u] = vec4(
+        correction_matrix_inverse[1][0],
+        correction_matrix_inverse[2][0],
+        correction_matrix_inverse[2][1],
+        (near_thin_plate_count > 0u) ? 1.0 : 0.0);
+#else
     correction_inverse[self_particle_id * 2u] = vec4(
         correction_matrix_inverse[0][0],
         correction_matrix_inverse[1][1],
@@ -230,6 +314,7 @@ void main() {
         correction_matrix_inverse[1][2],
         scalar_laplacian_normalisation,   // d / tr(M), unregularized (2026-09-27)
         scalar_fluid_flag);               // 1 = FLUID (2026-09-27, scalars only)
+#endif
 
     density_gradient_kernel_sum[self_particle_id] = vec4(density_gradient, kernel_sum);
 }

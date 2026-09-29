@@ -2,6 +2,9 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 #include "helpers.glsl"
+#if WITH_THIN_PLATES
+#include "thin_plates.glsl"
+#endif
 
 // Scalar transport build switch (2026-09-27). compile_shaders_v1.py builds this
 // file twice: force.comp.spv (FORCE_WITH_SCALARS = 0, the scalar code below is
@@ -156,6 +159,10 @@ vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 sel
             float distance_squared = dot(position_difference_solid_to_fluid, position_difference_solid_to_fluid);
             if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
             float distance = sqrt(distance_squared);
+#if WITH_THIN_PLATES
+            if (near_thin_plate_count > 0u
+                    && thin_plate_blocks_segment(self_position, fluid_position)) continue;
+#endif
 
             vec4  fluid_velocity_mass = velocity_mass[fluid_particle_id];
             vec2  fluid_density_pressure = density_pressure[fluid_particle_id];
@@ -191,6 +198,154 @@ vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 sel
     }
     return reaction + gravity_vector;
 }
+
+#if WITH_THIN_PLATES
+// ============================================================================
+// Particle shift of one neighbour (2026-09-30): the formulas of the main loop
+// as a function, for the neighbours that take part in the shift only (fluid
+// particles behind a plate, plate points).
+// ============================================================================
+void thin_plate_add_shift(float distance, float density_ratio, vec3 kernel_gradient_corrected,
+                          float kernel_value, float neighbour_volume, float self_kernel_sum,
+                          float delta_x, float kernel_value_at_delta_x, float pst_base_factor,
+                          inout vec3 shift_main, inout vec3 shift_anti) {
+    float distance_ratio = (distance - delta_x) / delta_x;
+    float disorder = (distance_ratio > 0.0) ? 0.0 : distance_ratio * min(density_ratio, 1.0);
+    float crowding_ratio = (kernel_value_at_delta_x > 1e-12) ? kernel_value / kernel_value_at_delta_x : 0.0;
+    float crowding_term = crowding_ratio * crowding_ratio;
+    crowding_term *= crowding_term;
+    float main_scalar = 1.0 - disorder + 0.1 * self_kernel_sum + 0.2 * crowding_term;
+    shift_main += -pst_base_factor * main_scalar * kernel_gradient_corrected * neighbour_volume;
+    float anti_scalar = (distance / delta_x) * PST_ANTI_SHIFT_COEFFICIENT;
+    shift_anti += pst_base_factor * anti_scalar * kernel_gradient_corrected * neighbour_volume;
+}
+
+// ============================================================================
+// Load on a quadrature point of a thin plate (2026-09-30).
+// Pressure: pressure integration, the pressure on each face is the Shepard
+// mean of what the fluid particles that see the face find there (Li et al.
+// 2022 eq. 12 and 32, Peng et al. 2021 eq. 38),
+//     P_face = sum_i V_i W_is (P_i + P_ik) / 2  /  sum_i V_i W_is,
+//     F_k    = (V_p / dx^d) A_k sum_faces P_face n_out,
+// A_k the true area of the point; the factor V_p / dx^d is the mass factor
+// every other force read back carries. The denominator also counts the
+// ORDINARY solid particles that see the face (with no pressure in the
+// numerator): a point of the plate that lies inside a wall or a hub is wetted
+// only in part. The renormalised surface term of the
+// momentum equation (with B_i) is NOT the load: summed over the fluid next to
+// a plane wall it is 2 ln 2 = 1.39 times P A, the excess is balanced inside
+// the fluid. Without the Shepard normalisation the sum depends on how densely
+// the fluid is packed next to the face (5 % low in the static test).
+// Friction: the reaction of the wall friction term of the fluid particles.
+// gather_near_thin_plates(self_position) must have been called.
+// ============================================================================
+vec3 thin_plate_point_acceleration_from_fluid(uint self_particle_id, vec3 self_position,
+                                              ivec3 self_voxel_coord, vec3 self_velocity,
+                                              float self_mass, float self_density,
+                                              float particle_volume, float particle_radius) {
+    vec3 gravity_vector = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z);
+    uint slot = thin_plate_slot_of_point(self_density);
+    if (slot == MAX_NEAR_THIN_PLATES) return gravity_vector;
+    float point_measure = near_thin_plate[slot].point_measure;
+    float point_weight  = thin_plate_point_weight(slot, particle_volume, particle_radius);
+    vec3  plate_normal  = near_thin_plate[slot].normal;
+    vec3  load = vec3(0.0);
+    // Shepard sums of the two faces: index 0 = the face on the side the normal points to
+    float face_weight_sum[2]   = float[2](0.0, 0.0);
+    float face_pressure_sum[2] = float[2](0.0, 0.0);
+    uint cell_count = USE_NEIGHBOR_LIST ? 1u : (NEIGHBOR_Z_RANGE == 0u ? 9u : 27u);
+    for (uint cell = 0u; cell < cell_count; cell++) {
+        uint candidate_count;
+        uint candidate_base = 0u;
+        if (USE_NEIGHBOR_LIST) {
+            candidate_count = neighbor_count[self_particle_id];
+        } else {
+            ivec3 delta = ivec3(int(cell % 3u) - 1,
+                                int((cell / 3u) % 3u) - 1,
+                                int(cell / 9u) - int(NEIGHBOR_Z_RANGE));
+            ivec3 neighbor_coord = self_voxel_coord + delta;
+            if (!in_own_grid(neighbor_coord)) continue;
+            uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
+            candidate_count = inside_particle_count[neighbor_voxel_id];
+            candidate_base  = neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL;
+        }
+        for (uint candidate = 0u; candidate < candidate_count; candidate++) {
+            uint fluid_particle_id;
+            if (USE_NEIGHBOR_LIST) {
+                fluid_particle_id = neighbor_list[candidate * neighbor_list_stride() + self_particle_id];
+            } else {
+                fluid_particle_id = inside_particle_index[candidate_base + candidate];
+                if (fluid_particle_id == INSIDE_SLOT_EMPTY) break;
+                if (fluid_particle_id == self_particle_id) continue;
+            }
+            MaterialParameters fluid_params = material_parameters[material[fluid_particle_id]];
+
+            vec3  fluid_position = position_voxel_id[fluid_particle_id].xyz;
+            vec3  to_fluid = fluid_position - self_position;
+            float distance_squared = dot(to_fluid, to_fluid);
+            if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
+
+            vec4  fluid_velocity_mass    = velocity_mass[fluid_particle_id];
+            vec2  fluid_density_pressure = density_pressure[fluid_particle_id];
+            float fluid_density  = fluid_density_pressure.x;
+            float fluid_pressure = fluid_density_pressure.y;
+            if (is_thin_plate_point(fluid_density)) continue;          // a point of a plate
+
+            vec3 face_position[2];
+            vec3 face_normal_out[2];
+            bool face_is_own_side[2];
+            uint face_count = thin_plate_visible_faces(slot, self_position, fluid_position,
+                                                       face_position, face_normal_out, face_is_own_side);
+            if (face_count == 0u) continue;
+            float fluid_volume   = fluid_velocity_mass.w / fluid_density;
+            if (fluid_params.kind != MATERIAL_FLUID) {
+                // ordinary solid particle in front of the face: it covers part of it
+                for (uint face = 0u; face < face_count; face++) {
+                    uint covered_index = (dot(face_normal_out[face], plate_normal) < 0.0) ? 0u : 1u;
+                    face_weight_sum[covered_index] += fluid_volume
+                        * evaluate_kernel(length(fluid_position - face_position[face]));
+                }
+                continue;
+            }
+            float eta_squared    = 0.04 * fluid_params.radius * fluid_params.radius;
+            for (uint face = 0u; face < face_count; face++) {
+                vec3  offset = fluid_position - face_position[face];                  // x_i - x_s
+                float face_distance_squared = dot(offset, offset);
+                float face_kernel = evaluate_kernel(sqrt(face_distance_squared));
+                float wall_pressure = thin_plate_wall_pressure(
+                    slot, fluid_pressure, fluid_density, fluid_position, fluid_velocity_mass.xyz,
+                    face_position[face], face_normal_out[face], self_velocity,
+                    face_is_own_side[face], fluid_params.rest_density, fluid_params.radius);
+                uint face_index = (dot(face_normal_out[face], plate_normal) < 0.0) ? 0u : 1u;
+                face_weight_sum[face_index]   += fluid_volume * face_kernel;
+                face_pressure_sum[face_index] += fluid_volume * face_kernel
+                                               * 0.5 * (fluid_pressure + wall_pressure);
+                if (USE_THIN_PLATE_VISCOSITY) {
+                    // minus the friction this fluid particle receives from the point
+                    mat3 fluid_correction_matrix = USE_KCG_CORRECTION
+                        ? unpack_correction_inverse(fluid_particle_id)
+                        : mat3(1.0);
+                    load -= fluid_velocity_mass.w * 2.0 * fluid_params.viscosity * point_weight * face_kernel
+                          * dot(offset, fluid_correction_matrix * face_normal_out[face])
+                          / (face_distance_squared + eta_squared)
+                          * (fluid_velocity_mass.xyz - self_velocity);
+                }
+            }
+        }
+    }
+    // pressure on the two faces times the area; n_out of face 0 is -normal
+    float spacing     = 2.0 * particle_radius;
+    float cell        = (DIMENSION == 3u) ? spacing * spacing * spacing : spacing * spacing;
+    float mass_factor = particle_volume / cell;
+    for (uint face_index = 0u; face_index < 2u; face_index++) {
+        if (face_weight_sum[face_index] < 1e-3) continue;
+        float face_pressure = face_pressure_sum[face_index] / face_weight_sum[face_index];
+        vec3  normal_out    = (face_index == 0u) ? -plate_normal : plate_normal;
+        load += mass_factor * point_measure * face_pressure * normal_out;
+    }
+    return load / self_mass + gravity_vector;
+}
+#endif
 
 layout(local_size_x_id = 51, local_size_y = 1, local_size_z = 1) in;
 
@@ -251,6 +406,22 @@ void main() {
 
     // --- Decode self voxel coord ---------------------------------------------
     ivec3 self_voxel_coord = own_coord_of(self_voxel_id);
+
+#if WITH_THIN_PLATES
+    // --- Thin plates (2026-09-30) ---------------------------------------------
+    gather_near_thin_plates(self_position);
+    if (is_thin_plate_point(self_density)) {
+        // quadrature point of a plate: the load of the fluid on it
+        vec3 plate_acceleration = thin_plate_point_acceleration_from_fluid(
+            self_particle_id, self_position, self_voxel_coord, self_velocity, self_mass, self_density,
+            self_params.volume, self_params.radius);
+        acceleration[self_particle_id] = vec4(plate_acceleration, 0.0);
+        shift[self_particle_id]        = vec4(0.0);
+        return;
+    }
+    // THIN_PLATE_PRESSURE_FORM 1: difference form for a particle next to a plate
+    bool plate_difference_form = (THIN_PLATE_PRESSURE_FORM == 1u) && (near_thin_plate_count > 0u);
+#endif
 
     // --- Solid particle: reaction of the fluid (2026-09-29) --------------------
     if (USE_SOLID_REACTION_FORCE && is_solid_kind(self_params.kind)) {
@@ -401,6 +572,76 @@ void main() {
             vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
             float neighbor_density  = neighbor_density_pressure.x;
             float neighbor_pressure = neighbor_density_pressure.y;
+#if WITH_THIN_PLATES
+            if (is_thin_plate_point(neighbor_density)) {
+                // ==== Quadrature point of a thin plate: surface terms ====
+                uint slot = thin_plate_slot_of_point(neighbor_density);
+                if (slot == MAX_NEAR_THIN_PLATES || self_params.kind != MATERIAL_FLUID) continue;
+                vec3 face_position[2];
+                vec3 face_normal_out[2];
+                bool face_is_own_side[2];
+                uint face_count = thin_plate_visible_faces(slot, neighbor_position, self_position,
+                                                           face_position, face_normal_out, face_is_own_side);
+                float point_weight = thin_plate_point_weight(slot, self_params.volume, self_params.radius);
+                for (uint face = 0u; face < face_count; face++) {
+                    vec3  offset = self_position - face_position[face];               // x_i - x_s
+                    float face_distance_squared = dot(offset, offset);
+                    float face_distance = sqrt(face_distance_squared);
+                    float face_kernel   = evaluate_kernel(face_distance);
+                    vec3  corrected_normal = self_correction_matrix * face_normal_out[face];
+
+                    // pressure
+                    float wall_pressure = thin_plate_wall_pressure(
+                        slot, self_pressure, self_density, self_position, self_velocity,
+                        face_position[face], face_normal_out[face], neighbor_velocity,
+                        face_is_own_side[face], self_params.rest_density, self_params.radius);
+                    bool  wall_symmetric_form = (self_pressure > 0.0 || near_surface) && !plate_difference_form;
+                    float wall_pressure_combined = wall_symmetric_form
+                        ? (wall_pressure + self_pressure)
+                        : (wall_pressure - self_pressure);
+                    a_pressure -= point_weight * face_kernel / self_density
+                                * wall_pressure_combined * corrected_normal;
+
+                    // wall friction (Morris form with n W w in place of grad W V, Li et al. 2022)
+                    if (USE_THIN_PLATE_VISCOSITY) {
+                        float eta_squared = 0.04 * self_params.radius * self_params.radius;
+                        a_viscosity += 2.0 * viscosity_uniform * point_weight * face_kernel
+                                     * dot(offset, corrected_normal) / (face_distance_squared + eta_squared)
+                                     * (self_velocity - neighbor_velocity);
+                    }
+
+                    // vorticity (diagnostic)
+                    vec3 wall_velocity_difference = self_velocity - neighbor_velocity;
+                    vorticity_z += point_weight * face_kernel
+                        * (wall_velocity_difference.x * corrected_normal.y
+                         - wall_velocity_difference.y * corrected_normal.x);
+
+                }
+                // particle shift: the point as one particle of a layer of the spacing dx
+                if (USE_PST) {
+                    thin_plate_add_shift(
+                        distance, 1.0,
+                        self_correction_matrix * evaluate_kernel_gradient_unguarded(position_difference_neighbor_to_self, distance),
+                        evaluate_kernel_unguarded(distance), point_weight * delta_x_uniform,
+                        self_kernel_sum, delta_x_uniform, kernel_value_at_delta_x, pst_base_factor,
+                        particle_shift_main, particle_shift_anti);
+                }
+                continue;
+            }
+            if (near_thin_plate_count > 0u
+                    && thin_plate_blocks_segment(self_position, neighbor_position)) {
+                // behind a plate: no force, but it takes part in the particle shift
+                if (USE_PST && self_params.kind == MATERIAL_FLUID) {
+                    thin_plate_add_shift(
+                        distance, neighbor_density / self_density,
+                        self_correction_matrix * evaluate_kernel_gradient_unguarded(position_difference_neighbor_to_self, distance),
+                        evaluate_kernel_unguarded(distance), volume_ij_uniform,
+                        self_kernel_sum, delta_x_uniform, kernel_value_at_delta_x, pst_base_factor,
+                        particle_shift_main, particle_shift_anti);
+                }
+                continue;
+            }
+#endif
             float neighbor_volume_dynamic = self_mass / neighbor_density;
 
             // --- Kernel gradient (raw + M_i-corrected) + kernel value ---
@@ -417,13 +658,35 @@ void main() {
             float pair_volume_viscous      = neighbor_volume_dynamic;
             bool  pair_is_corrected        = false;
             if (PAIR_CORRECTION_MODE != 0u && USE_KCG_CORRECTION && self_params.kind == MATERIAL_FLUID) {
+#if WITH_THIN_PLATES
+                vec4 neighbor_matrix_a = correction_inverse[neighbor_particle_id * 3u];
+                vec4 neighbor_matrix_b = correction_inverse[neighbor_particle_id * 3u + 1u];
+                vec4 neighbor_matrix_c = correction_inverse[neighbor_particle_id * 3u + 2u];
+#else
                 vec4 neighbor_matrix_a = correction_inverse[neighbor_particle_id * 2u];
                 vec4 neighbor_matrix_b = correction_inverse[neighbor_particle_id * 2u + 1u];
+#endif
+#if WITH_THIN_PLATES
+                // A pair with a particle next to a plate (on either end) keeps the matrix of
+                // the particle itself: the matrix next to a plate contains the surface
+                // term and differs from the one of the bulk by up to 40 %; in the pair
+                // correction P_i (B_i + B_j) grad W that difference is a force
+                // proportional to the absolute pressure (free edge test, 2026-09-30:
+                // exponential growth from round-off, 10 m/s after 350 steps).
+                if (neighbor_matrix_c.w > 0.5 || near_thin_plate_count > 0u) neighbor_matrix_b.w = 0.0;
+#endif
                 if (neighbor_matrix_b.w > 0.5) {
+#if WITH_THIN_PLATES
+                    mat3 neighbor_correction_matrix = mat3(
+                        vec3(neighbor_matrix_a.x, neighbor_matrix_a.w, neighbor_matrix_b.x),
+                        vec3(neighbor_matrix_c.x, neighbor_matrix_a.y, neighbor_matrix_b.y),
+                        vec3(neighbor_matrix_c.y, neighbor_matrix_c.z, neighbor_matrix_a.z));
+#else
                     mat3 neighbor_correction_matrix = mat3(
                         vec3(neighbor_matrix_a.x, neighbor_matrix_a.w, neighbor_matrix_b.x),
                         vec3(neighbor_matrix_a.w, neighbor_matrix_a.y, neighbor_matrix_b.y),
                         vec3(neighbor_matrix_b.x, neighbor_matrix_b.y, neighbor_matrix_a.z));
+#endif
                     kernel_gradient_neighbor = neighbor_correction_matrix * kernel_gradient_raw;
                     kernel_gradient_pair = 0.5 * (kernel_gradient_corrected + kernel_gradient_neighbor);
                     pair_volume_viscous = 2.0 * self_mass / (self_density + neighbor_density);
@@ -439,6 +702,9 @@ void main() {
             // for a solid neighbour the stored pressure is replaced by the
             // fluid particle's own pressure continued to the solid particle.
             bool symmetric_form = (self_pressure > 0.0 || near_surface);
+#if WITH_THIN_PLATES
+            if (plate_difference_form) symmetric_form = false;
+#endif
             if (PST_NEAR_SOLID_MODE != 0u) {
                 uint neighbor_kind = material_parameters[material[neighbor_particle_id]].kind;
                 if (is_solid_kind(neighbor_kind)) {
@@ -465,6 +731,10 @@ void main() {
                     ? (self_pressure * kernel_gradient_neighbor + neighbor_pressure * kernel_gradient_corrected)
                     : (pressure_combined * kernel_gradient_corrected);
             }
+#if WITH_THIN_PLATES
+            // next to a plate: the first-order exact gradient of the particle itself
+            if (plate_difference_form) pressure_gradient_pair = pressure_combined * kernel_gradient_corrected;
+#endif
             a_pressure -= neighbor_volume_dynamic / self_density * pressure_gradient_pair;
 
             // ==== Viscosity (Morris) ================================
@@ -605,6 +875,12 @@ void main() {
                 particle_shift -= dot(particle_shift, solid_normal) * solid_normal;
             }
         }
+#if WITH_THIN_PLATES
+        // never into a plate
+        if (near_thin_plate_count > 0u && self_params.kind == MATERIAL_FLUID) {
+            particle_shift = thin_plate_limit_shift(particle_shift, self_position, self_params.radius);
+        }
+#endif
     } else {
         particle_shift = vec3(0.0);
     }

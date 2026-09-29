@@ -2,6 +2,9 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 #include "helpers.glsl"
+#if WITH_THIN_PLATES
+#include "thin_plates.glsl"
+#endif
 
 // ============================================================================
 // density.comp - δ-plus WCSPH density + pressure update (stage 4 of leapfrog).
@@ -84,6 +87,16 @@ void main() {
 
     vec3  self_velocity = velocity_mass[self_particle_id].xyz;
     float self_density  = density_pressure[self_particle_id].x;   // ρ_n
+
+#if WITH_THIN_PLATES
+    // Thin plates (2026-09-30): a plate particle keeps its marker
+    // (-(plate index + 1), measure of the point).
+    if (is_thin_plate_point(self_density)) {
+        density_pressure_scratch[self_particle_id] = density_pressure[self_particle_id];
+        return;
+    }
+    gather_near_thin_plates(self_position);
+#endif
 
     // KCG correction matrix and density gradient from correction.comp output.
     // When USE_KCG_CORRECTION is false (ablation), substitute identity / zero
@@ -207,6 +220,35 @@ void main() {
             float neighbor_mass     = velocity_mass[neighbor_particle_id].w;
             vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
             float neighbor_density  = neighbor_density_pressure.x;
+#if WITH_THIN_PLATES
+            if (is_thin_plate_point(neighbor_density)) {
+                // quadrature point of a plate: surface term of the continuity equation,
+                //     d rho_i / dt += rho_i w_k W_is (v_i - v_k) . B_i n_out.
+                // It takes no part in the density diffusion. (A solid self never
+                // gets here: solid-solid pairs are skipped above.)
+                uint slot = thin_plate_slot_of_point(neighbor_density);
+                if (slot == MAX_NEAR_THIN_PLATES || !self_is_fluid) continue;
+                vec3 face_position[2];
+                vec3 face_normal_out[2];
+                bool face_is_own_side[2];
+                uint face_count = thin_plate_visible_faces(slot, neighbor_position, self_position,
+                                                           face_position, face_normal_out, face_is_own_side);
+                float point_weight = thin_plate_point_weight(slot, self_params.volume, self_params.radius);
+                for (uint face = 0u; face < face_count; face++) {
+                    float face_kernel = evaluate_kernel(length(face_position[face] - self_position));
+                    vec3  corrected_normal = self_correction_matrix * face_normal_out[face];
+                    density_drift += self_density * point_weight * face_kernel
+                                   * dot(self_velocity - neighbor_velocity, corrected_normal);
+                    if (USE_SCALAR_SGS) {
+                        velocity_gradient += point_weight * face_kernel
+                            * outerProduct(neighbor_velocity - self_velocity, face_normal_out[face]);
+                    }
+                }
+                continue;
+            }
+            if (near_thin_plate_count > 0u
+                    && thin_plate_blocks_segment(self_position, neighbor_position)) continue;
+#endif
             float neighbor_volume   = neighbor_mass / neighbor_density;
             if (SOLID_PRESSURE_MODE == 4u && self_is_solid) {
                 // only fluid neighbours reach this point for a solid self
