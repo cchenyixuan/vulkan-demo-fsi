@@ -137,12 +137,7 @@ void main() {
 
             // --- Read neighbor mass / density / volume --------------
             float neighbor_mass    = velocity_mass[neighbor_particle_id].w;
-#if WITH_THIN_PLATES
-            vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
-            float neighbor_density = neighbor_density_pressure.x;
-#else
             float neighbor_density = density_pressure[neighbor_particle_id].x;
-#endif
             float neighbor_volume  = neighbor_mass / neighbor_density;
 
             // --- Evaluate kernel and gradient -----------------------
@@ -162,23 +157,6 @@ void main() {
 
             // ---- Kernel sum: Σ V_j · W_ij
             kernel_sum += neighbor_volume * kernel_value;
-#if WITH_THIN_PLATES
-            if (near_thin_plate_count > 0u) {
-                bool neighbor_is_wall_dummy =
-                    thin_plate_wall_slot(self_position, neighbor_position, neighbor_density_pressure.y)
-                        != MAX_NEAR_THIN_PLATES
-                    || is_thin_plate_particle(neighbor_density_pressure.y);
-                if (neighbor_is_wall_dummy) {
-                    has_wall_dummy = true;
-                } else {
-                    visible_matrix += neighbor_volume
-                                    * outerProduct(position_difference_self_to_neighbor, kernel_gradient_value);
-                    visible_density_gradient += neighbor_volume
-                                              * (neighbor_density - self_density)
-                                              * kernel_gradient_value;
-                }
-            }
-#endif
         }
     }
 
@@ -269,6 +247,57 @@ void main() {
         scalar_fluid_flag);               // 1 = FLUID (2026-09-27, scalars only)
 
 #if WITH_THIN_PLATES
+    // The one-sided sums: a second pass over the neighbours, only for a particle
+    // with a plate inside its support. (Inside the main loop this code cost
+    // time for every particle, 1.7 ms per step on the 4 mm tank.)
+    if (near_thin_plate_count > 0u && !self_is_plate_particle) {
+        for (uint cell = 0u; cell < cell_count; cell++) {
+            uint candidate_count;
+            uint candidate_base = 0u;
+            if (USE_NEIGHBOR_LIST) {
+                candidate_count = neighbor_count[self_particle_id];
+            } else {
+                ivec3 delta = ivec3(int(cell % 3u) - 1,
+                                    int((cell / 3u) % 3u) - 1,
+                                    int(cell / 9u) - int(NEIGHBOR_Z_RANGE));
+                ivec3 neighbor_coord = self_voxel_coord + delta;
+                if (!in_own_grid(neighbor_coord)) continue;
+                uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
+                candidate_count = inside_particle_count[neighbor_voxel_id];
+                candidate_base  = neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL;
+            }
+            for (uint candidate = 0u; candidate < candidate_count; candidate++) {
+                uint neighbor_particle_id;
+                if (USE_NEIGHBOR_LIST) {
+                    neighbor_particle_id = neighbor_list[candidate * neighbor_list_stride() + self_particle_id];
+                } else {
+                    neighbor_particle_id = inside_particle_index[candidate_base + candidate];
+                    if (neighbor_particle_id == INSIDE_SLOT_EMPTY) break;
+                    if (neighbor_particle_id == self_particle_id) continue;
+                }
+                vec3  neighbor_position = position_voxel_id[neighbor_particle_id].xyz;
+                vec3  position_difference_neighbor_to_self = self_position - neighbor_position;
+                float distance_squared = dot(position_difference_neighbor_to_self,
+                                             position_difference_neighbor_to_self);
+                if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
+                vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
+                if (thin_plate_wall_slot(self_position, neighbor_position, neighbor_density_pressure.y)
+                        != MAX_NEAR_THIN_PLATES
+                        || is_thin_plate_particle(neighbor_density_pressure.y)) {
+                    has_wall_dummy = true;
+                    continue;
+                }
+                float neighbor_volume = velocity_mass[neighbor_particle_id].w / neighbor_density_pressure.x;
+                vec3  kernel_gradient_value = evaluate_kernel_gradient_unguarded(
+                    position_difference_neighbor_to_self, sqrt(distance_squared));
+                visible_matrix += neighbor_volume
+                                * outerProduct(-position_difference_neighbor_to_self, kernel_gradient_value);
+                visible_density_gradient += neighbor_volume
+                                          * (neighbor_density_pressure.x - self_density)
+                                          * kernel_gradient_value;
+            }
+        }
+    }
     if (self_is_plate_particle) {
         density_gradient = vec3(0.0);
     } else if (has_wall_dummy) {
@@ -283,12 +312,18 @@ void main() {
         } else {
             visible_matrix[2][2] += REGULARIZATION_XI;
         }
-        vec3 one_sided_gradient = vec3(0.0);
-        if (abs(determinant(visible_matrix)) > REGULARIZATION_DETERMINANT_THRESHOLD) {
-            one_sided_gradient = inverse(visible_matrix) * visible_density_gradient;
-        }
+        // (the matrices handed to inverse() are regular also where the result is not used)
+        bool visible_matrix_is_regular =
+            abs(determinant(visible_matrix)) > REGULARIZATION_DETERMINANT_THRESHOLD;
+        mat3 visible_matrix_inverse = inverse(visible_matrix_is_regular ? visible_matrix : mat3(1.0));
+        vec3 one_sided_gradient = visible_matrix_is_regular
+            ? visible_matrix_inverse * visible_density_gradient
+            : vec3(0.0);
         // stored such that (stored matrix) * (stored vector) is the one-sided gradient
-        density_gradient = inverse(correction_matrix_inverse) * one_sided_gradient;
+        bool stored_matrix_is_regular = abs(determinant(correction_matrix_inverse)) > 1.0e-12;
+        density_gradient = stored_matrix_is_regular
+            ? inverse(correction_matrix_inverse) * one_sided_gradient
+            : vec3(0.0);
     }
 #endif
     density_gradient_kernel_sum[self_particle_id] = vec4(density_gradient, kernel_sum);

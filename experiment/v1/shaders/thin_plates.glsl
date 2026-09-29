@@ -67,6 +67,20 @@
 // paddle test, log/2026-09-30_thin-plates-mirror.md).
 // ============================================================================
 
+//
+// RULE FOR THIS FILE AND FOR THE PLATE CODE OF THE KERNELS: every expression
+// must be finite for ANY input, also inside a branch that is not taken. GPU
+// compilers evaluate both sides of a short branch and select afterwards, and
+// on the RTX 5090 (driver 580.82) the value of the side not taken reached the
+// result: NaN after the first step, or a dispatch that never returned. RTX
+// 4090 and 4070 Ti ran the same SPIR-V without fault. What produced the NaN:
+// normalize() of the rotor axis (0, 0, 0) of a case without a rotor, slots of
+// near_thin_plate[] that had never been written, the slot index
+// MAX_NEAR_THIN_PLATES ("no plate") used as an array index, a division by the
+// difference of two equal distances. Hence: all slots are initialised, a slot
+// index is clamped before it is used, no normalize(), no unguarded division.
+// ============================================================================
+
 #ifndef SPH_THIN_PLATES_GLSL_INCLUDED
 #define SPH_THIN_PLATES_GLSL_INCLUDED
 
@@ -119,11 +133,38 @@ float thin_plate_outline_gap_squared(uint shape, float extent_a, float extent_b,
     return dot(gap, gap);
 }
 
+// Unit vector of the rotor axis; (0, 0, 0) for a case without a rotor (never NaN).
+vec3 thin_plate_rotor_axis() {
+    vec3 axis = vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z);
+    return axis * inversesqrt(max(dot(axis, axis), 1.0e-30));
+}
+
+// A slot index that may be used as an array index.
+uint thin_plate_safe_slot(uint slot) {
+    return min(slot, MAX_NEAR_THIN_PLATES - 1u);
+}
+
 // Fill near_thin_plate[] with the plates that come closer than the support
 // radius to `position`.
 void gather_near_thin_plates(vec3 position) {
     near_thin_plate_count = 0u;
-    vec3 rotor_axis  = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
+    NearThinPlate empty;
+    empty.centre          = vec3(0.0);
+    empty.normal          = vec3(0.0, 0.0, 1.0);
+    empty.axis_a          = vec3(1.0, 0.0, 0.0);
+    empty.axis_b          = vec3(0.0, 1.0, 0.0);
+    empty.extent_a        = 0.0;
+    empty.extent_b        = 0.0;
+    empty.half_thickness  = 0.0;
+    empty.point_measure   = 0.0;
+    empty.self_distance   = 0.0;
+    empty.self_over_plate = false;
+    empty.shape           = THIN_PLATE_SHAPE_RECTANGLE;
+    empty.frame           = THIN_PLATE_FRAME_STATIC;
+    empty.index           = 0xFFFFFFFFu;
+    for (uint slot = 0u; slot < MAX_NEAR_THIN_PLATES; slot++) near_thin_plate[slot] = empty;
+
+    vec3 rotor_axis  = thin_plate_rotor_axis();
     vec3 rotor_pivot = vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
     for (uint group_index = 0u; group_index < THIN_PLATE_GROUP_COUNT; group_index++) {
         vec4 bounding_sphere = thin_plate_group[group_index].centre_radius;
@@ -178,14 +219,17 @@ void gather_near_thin_plates(vec3 position) {
 
 // Does the segment cross the mid-plane of the near plate `slot` inside its outline?
 bool thin_plate_slot_blocks_segment(uint slot, vec3 from_position, vec3 to_position) {
+    slot = thin_plate_safe_slot(slot);
     vec3  normal        = near_thin_plate[slot].normal;
     vec3  centre        = near_thin_plate[slot].centre;
     float distance_from = dot(normal, from_position - centre);
     float distance_to   = dot(normal, to_position - centre);
-    if (distance_from * distance_to >= 0.0) return false;
-    float fraction = distance_from / (distance_from - distance_to);
+    bool  opposite_sides = distance_from * distance_to < 0.0;
+    // on opposite sides |distance_from - distance_to| = |distance_from| + |distance_to| > 0
+    float fraction = distance_from / (opposite_sides ? (distance_from - distance_to) : 1.0);
     vec3  crossing = from_position + fraction * (to_position - from_position) - centre;
-    return thin_plate_outline_contains(near_thin_plate[slot].shape,
+    return opposite_sides
+        && thin_plate_outline_contains(near_thin_plate[slot].shape,
                                        near_thin_plate[slot].extent_a, near_thin_plate[slot].extent_b,
                                        dot(crossing, near_thin_plate[slot].axis_a),
                                        dot(crossing, near_thin_plate[slot].axis_b));
@@ -207,7 +251,7 @@ bool is_thin_plate_particle(float stored_pressure) {
 // Slot of the plate a plate particle belongs to; MAX_NEAR_THIN_PLATES if that
 // plate is not in the near list.
 uint thin_plate_slot_of_particle(float stored_pressure) {
-    uint plate_index = uint(-stored_pressure / THIN_PLATE_MARKER - 0.5);
+    uint plate_index = uint(max(-stored_pressure / THIN_PLATE_MARKER - 0.5, 0.0));
     for (uint slot = 0u; slot < near_thin_plate_count; slot++) {
         if (near_thin_plate[slot].index == plate_index) return slot;
     }
@@ -227,18 +271,21 @@ uint thin_plate_wall_slot(vec3 position, vec3 neighbor_position, float neighbor_
 // Velocity and acceleration of the plate `slot` at a point (rigid rotation for
 // a rotor plate: centripetal part plus the angular acceleration of the ramp).
 vec3 thin_plate_velocity(uint slot, vec3 position) {
-    if (near_thin_plate[slot].frame != THIN_PLATE_FRAME_ROTOR) return vec3(0.0);
-    vec3 rotor_axis = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
+    slot = thin_plate_safe_slot(slot);
+    float on_rotor  = (near_thin_plate[slot].frame == THIN_PLATE_FRAME_ROTOR) ? 1.0 : 0.0;
+    vec3 rotor_axis = thin_plate_rotor_axis();
     vec3 arm        = position - vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
-    return rotor_angular_velocity_now * cross(rotor_axis, arm);
+    return on_rotor * rotor_angular_velocity_now * cross(rotor_axis, arm);
 }
 
 vec3 thin_plate_acceleration(uint slot, vec3 position) {
-    if (near_thin_plate[slot].frame != THIN_PLATE_FRAME_ROTOR) return vec3(0.0);
-    vec3 rotor_axis = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
-    vec3 arm        = position - vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
-    return solid_particle_acceleration(MATERIAL_ROTOR, position)
-         + rotor_angular_acceleration_now * cross(rotor_axis, arm);
+    slot = thin_plate_safe_slot(slot);
+    float on_rotor   = (near_thin_plate[slot].frame == THIN_PLATE_FRAME_ROTOR) ? 1.0 : 0.0;
+    vec3  rotor_axis = thin_plate_rotor_axis();
+    vec3  arm        = position - vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
+    vec3  radial_arm = arm - dot(arm, rotor_axis) * rotor_axis;
+    return on_rotor * (rotor_angular_acceleration_now * cross(rotor_axis, arm)
+                       - rotor_angular_velocity_now * rotor_angular_velocity_now * radial_arm);
 }
 
 // Pressure of a wall dummy at `dummy_position` as the fluid particle sees it.
@@ -249,6 +296,7 @@ float thin_plate_mirror_pressure(uint slot, float fluid_pressure, float fluid_de
                                  vec3 fluid_position, vec3 fluid_velocity,
                                  float fluid_distance, bool over_plate, vec3 dummy_position,
                                  vec3 fluid_pressure_gradient) {
+    slot = thin_plate_safe_slot(slot);
     vec3 offset = dummy_position - fluid_position;
     if (!over_plate) {
         // beside the plate: the field of this side continued into the shadow

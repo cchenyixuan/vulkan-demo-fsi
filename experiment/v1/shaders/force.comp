@@ -455,8 +455,8 @@ void main() {
                     neighbor_velocity = thin_plate_velocity(wall_slot, neighbor_position);
                     neighbor_pressure = thin_plate_mirror_pressure(
                         wall_slot, self_pressure, self_density, self_position, self_velocity,
-                        near_thin_plate[wall_slot].self_distance,
-                        near_thin_plate[wall_slot].self_over_plate, neighbor_position,
+                        near_thin_plate[thin_plate_safe_slot(wall_slot)].self_distance,
+                        near_thin_plate[thin_plate_safe_slot(wall_slot)].self_over_plate, neighbor_position,
                         self_pressure_gradient);
                 } else if (is_thin_plate_particle(neighbor_pressure)) {
                     continue;
@@ -547,7 +547,9 @@ void main() {
                         * kernel_gradient_pair;
                 }
                 thin_plate_force += self_mass * plate_pair_acceleration;
-                if (thin_plate_first == 0u) thin_plate_first = near_thin_plate[wall_slot].index + 1u;
+                if (thin_plate_first == 0u) {
+                    thin_plate_first = near_thin_plate[thin_plate_safe_slot(wall_slot)].index + 1u;
+                }
             }
             if (!neighbor_is_wall_dummy || USE_THIN_PLATE_VISCOSITY)
 #endif
