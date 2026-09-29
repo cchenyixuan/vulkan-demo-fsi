@@ -503,7 +503,12 @@ def main() -> int:
     parser.add_argument("--background-pressure", type=float, default=0.0,
                         help="constant added to the Tait pressure, Pa (physics.background_pressure); keeps the "
                              "pressure behind the blades positive. About rho * U_tip^2 = 1000 Pa. 0 = off")
-    parser.add_argument("--solid-pressure", choices=("increment", "mirror", "mirror_tic"), default="increment",
+    parser.add_argument("--diffusion-gradient-term", action="store_true",
+                        help="numerics.density_diffusion_gradient_term (needed with gravity)")
+    parser.add_argument("--pst-near-solid", choices=("full", "tangential"), default="full",
+                        help="numerics.pst_near_solid")
+    parser.add_argument("--solid-pressure", choices=("increment", "mirror", "mirror_tic", "accumulate", "extrapolate"),
+                        default="increment",
                         help="numerics.solid_pressure: pressure of the solid particles seen by the fluid "
                              "(increment = original one-step value, mirror = pairwise mirror)")
     parser.add_argument("--solid-pressure-offset", type=float, default=0.0,
@@ -640,6 +645,12 @@ def main() -> int:
         case_text = case_text.replace("  use_pst: true", f"  solid_pressure: {args.solid_pressure}\n"
                                       f"  solid_reaction_force: true\n"
                                       f"  solid_pressure_offset: {args.solid_pressure_offset:g}\n  use_pst: true")
+    if args.diffusion_gradient_term:
+        assert case_text.count("  use_pst: true") == 1
+        case_text = case_text.replace("  use_pst: true", "  density_diffusion_gradient_term: true\n  use_pst: true")
+    if args.pst_near_solid != "full":
+        assert case_text.count("  use_pst: true") == 1
+        case_text = case_text.replace("  use_pst: true", f"  pst_near_solid: {args.pst_near_solid}\n  use_pst: true")
     if args.hydrostatic:
         if args.gravity == 0.0:
             parser.error("--hydrostatic needs --gravity")

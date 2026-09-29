@@ -169,7 +169,7 @@ vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 sel
             // the solid particle as the fluid particle sees it
             float solid_volume_dynamic = fluid_velocity_mass.w / self_density;
             float solid_pressure = self_pressure;
-            if (SOLID_PRESSURE_MODE != 0u) {
+            if (solid_pressure_is_mirrored()) {
                 solid_pressure = fluid_pressure + SOLID_PRESSURE_OFFSET
                     + fluid_density * dot(relative_body_force, -position_difference_solid_to_fluid);
             }
@@ -319,6 +319,9 @@ void main() {
     // units (1/s). Positive = counter-clockwise. Stashed in acceleration.w
     // (line ~271), a slot the pipeline otherwise leaves at 0.
     float vorticity_z = 0.0;
+    // PST_NEAR_SOLID_MODE: sum of V_j grad W_ij over the solid neighbours, the
+    // direction of the local solid normal.
+    vec3 solid_kernel_gradient_sum = vec3(0.0);
 
     // ========================================================================
     // Loop-invariant constants (all pair-averaged quantities uniform in V0).
@@ -413,7 +416,13 @@ void main() {
             // for a solid neighbour the stored pressure is replaced by the
             // fluid particle's own pressure continued to the solid particle.
             bool symmetric_form = (self_pressure > 0.0 || near_surface);
-            if (SOLID_PRESSURE_MODE != 0u) {
+            if (PST_NEAR_SOLID_MODE != 0u) {
+                uint neighbor_kind = material_parameters[material[neighbor_particle_id]].kind;
+                if (is_solid_kind(neighbor_kind)) {
+                    solid_kernel_gradient_sum += neighbor_volume_dynamic * kernel_gradient_raw;
+                }
+            }
+            if (solid_pressure_is_mirrored()) {
                 uint neighbor_kind = material_parameters[material[neighbor_particle_id]].kind;
                 if (is_solid_kind(neighbor_kind)) {
                     vec3 relative_body_force = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z)
@@ -560,6 +569,13 @@ void main() {
         blend_weight *= blend_weight;  // ^4
         particle_shift = blend_weight * particle_shift_main
                        + (1.0 - blend_weight) * particle_shift_anti;
+        if (PST_NEAR_SOLID_MODE == 1u && self_params.kind == MATERIAL_FLUID) {
+            float solid_gradient_length = length(solid_kernel_gradient_sum);
+            if (solid_gradient_length * delta_x_uniform > 0.01) {
+                vec3 solid_normal = solid_kernel_gradient_sum / solid_gradient_length;
+                particle_shift -= dot(particle_shift, solid_normal) * solid_normal;
+            }
+        }
     } else {
         particle_shift = vec3(0.0);
     }

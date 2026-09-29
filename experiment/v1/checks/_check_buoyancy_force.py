@@ -54,7 +54,7 @@ def write_points(path, points):
 
 
 def build_case(directory, dx, hdx, cells=30, block_cells=8, speed_of_sound=12.0, solid_pressure="increment",
-               hydrostatic=False):
+               hydrostatic=False, reaction=False, gradient_term=False):
     directory.mkdir(parents=True, exist_ok=True)
     half = 0.5 * cells * dx
     centers = (np.arange(cells) + 0.5) * dx - half
@@ -99,6 +99,10 @@ def build_case(directory, dx, hdx, cells=30, block_cells=8, speed_of_sound=12.0,
     }
     if solid_pressure != "increment":
         case["numerics"]["solid_pressure"] = solid_pressure
+    if reaction:
+        case["numerics"]["solid_reaction_force"] = True
+    if gradient_term:
+        case["numerics"]["density_diffusion_gradient_term"] = True
     if hydrostatic:
         case["physics"]["hydrostatic_reference"] = [0.0, float(half), 0.0]
     (directory / "case.yaml").write_text(yaml.safe_dump(case, sort_keys=False), encoding="utf-8")
@@ -118,7 +122,9 @@ def main():
     parser.add_argument("--steps", type=int, default=12000)
     parser.add_argument("--out", default="output/buoyancy")
     parser.add_argument("--solid-pressure", nargs="+", default=["increment"],
-                        choices=("increment", "mirror", "mirror_tic"))
+                        choices=("increment", "mirror", "mirror_tic", "accumulate", "extrapolate"))
+    parser.add_argument("--reaction", action="store_true", help="numerics.solid_reaction_force")
+    parser.add_argument("--gradient-term", action="store_true", help="numerics.density_diffusion_gradient_term")
     parser.add_argument("--hydrostatic", action="store_true", help="hydrostatic initial density")
     arguments = parser.parse_args()
     compile_shaders_v1.compile_v1_shaders()
@@ -126,7 +132,9 @@ def main():
     print("h/dx   V_p/dx^3   block particles   F_y read back [N]   rho0 g N dx^3 [N]   ratio   std of samples   mass read back / (rho0 dx^3)")
     for hdx, mode in [(hdx, mode) for mode in arguments.solid_pressure for hdx in arguments.hdx]:
         case_path, block_count, fluid_count = build_case(out / f"hdx_{hdx:g}_{mode}", arguments.dx, hdx,
-                                                         solid_pressure=mode, hydrostatic=arguments.hydrostatic)
+                                                         solid_pressure=mode, hydrostatic=arguments.hydrostatic,
+                                                         reaction=arguments.reaction,
+                                                         gradient_term=arguments.gradient_term)
         case = load_case(str(case_path))
         samples = []
         wall_samples = []

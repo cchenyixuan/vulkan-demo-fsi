@@ -283,7 +283,8 @@ compile `_test_common.comp` by hand as a regression check after
 35       : SOLID_PRESSURE_MODE (2026-09-29; 0 increment, 1 mirror, 2 mirror with TIC)
 36       : USE_SOLID_REACTION_FORCE (2026-09-29)
 37       : SOLID_PRESSURE_OFFSET (2026-09-29)
-38 - 39  : free
+38       : USE_DENSITY_DIFFUSION_GRADIENT_TERM (2026-09-29)
+39       : PST_NEAR_SOLID_MODE (2026-09-29)
 40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, toggles, ...)
 50 - 53  : capacities + workgroup size + POOL_SIZE
 54 - 55  : ghost pool sizes (multi-GPU remnant, pinned 0)

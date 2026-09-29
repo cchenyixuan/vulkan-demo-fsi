@@ -124,6 +124,12 @@ void main() {
 
     float density_drift     = 0.0;
     float density_diffusion = 0.0;
+    // SOLID_PRESSURE_MODE 4 (extrapolate), solid self: kernel-weighted sums over
+    // the fluid neighbours.
+    bool  self_is_solid = is_solid_kind(self_params.kind);
+    float extrapolation_weight_sum   = 0.0;
+    float extrapolation_pressure_sum = 0.0;
+    vec3  extrapolation_offset_sum   = vec3(0.0);     // sum_f rho_f (x_s - x_f) W_sf
 
     // ------------------------------------------------------------------------
     // Neighbour loop (2026-09-25). Two candidate sources, chosen at pipeline
@@ -199,8 +205,16 @@ void main() {
             // --- Read neighbor state --------------------------------
             vec3  neighbor_velocity = velocity_mass[neighbor_particle_id].xyz;
             float neighbor_mass     = velocity_mass[neighbor_particle_id].w;
-            float neighbor_density  = density_pressure[neighbor_particle_id].x;
+            vec2  neighbor_density_pressure = density_pressure[neighbor_particle_id];
+            float neighbor_density  = neighbor_density_pressure.x;
             float neighbor_volume   = neighbor_mass / neighbor_density;
+            if (SOLID_PRESSURE_MODE == 4u && self_is_solid) {
+                // only fluid neighbours reach this point for a solid self
+                float kernel_value = evaluate_kernel(distance);
+                extrapolation_weight_sum   += kernel_value;
+                extrapolation_pressure_sum += neighbor_density_pressure.y * kernel_value;
+                extrapolation_offset_sum   += neighbor_density * position_difference_neighbor_to_self * kernel_value;
+            }
 
             // Read neighbor correction matrix and density gradient
             // (or identity / zero when KCG ablated; spec-const DCE'd).
@@ -256,6 +270,9 @@ void main() {
                 vec3 corrected_density_gradient_sum = self_corrected_density_gradient + neighbor_corrected_density_gradient;
                 vec3 position_difference_self_to_neighbor = -position_difference_neighbor_to_self; // -x_ij
                 float psi_ij = (neighbor_density - self_density);// - 0.5 * dot(corrected_density_gradient_sum, position_difference_self_to_neighbor);
+                if (USE_DENSITY_DIFFUSION_GRADIENT_TERM) {
+                    psi_ij -= 0.5 * dot(corrected_density_gradient_sum, position_difference_self_to_neighbor);
+                }
                 // 2026-09-29, mirrored solid pressure: the solid neighbours keep rho0 here.
                 // rho0 - rho_i pulls the density of the fluid next to a solid toward rho0;
                 // it is a pressure sink under gravity, but it is also what absorbs the
@@ -286,9 +303,26 @@ void main() {
     // ========================================================================
     // Tait EOS: P = eos_constant · ((ρ/ρ₀)^γ - 1) + p_b
     // ========================================================================
+    if (self_is_solid && SOLID_PRESSURE_MODE == 3u) {
+        // accumulate: the solid keeps its density, never below rho0
+        new_density = max(new_density, self_params.rest_density);
+    }
     float density_ratio = new_density / self_params.rest_density;
     float new_pressure  = self_params.eos_constant * (pow(density_ratio, POWER_PARAMETER) - 1.0)
                         + BACKGROUND_PRESSURE;
+    if (self_is_solid && SOLID_PRESSURE_MODE == 4u) {
+        // extrapolate: pressure of the fluid continued to the solid particle
+        if (extrapolation_weight_sum > 1e-12) {
+            vec3 relative_body_force = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z)
+                - solid_particle_acceleration(self_params.kind, self_position);
+            new_pressure = (extrapolation_pressure_sum + dot(relative_body_force, extrapolation_offset_sum))
+                         / extrapolation_weight_sum;
+        } else {
+            new_pressure = BACKGROUND_PRESSURE;
+        }
+        float pressure_ratio = max(1.0 + (new_pressure - BACKGROUND_PRESSURE) / self_params.eos_constant, 0.1);
+        new_density = self_params.rest_density * pow(pressure_ratio, 1.0 / POWER_PARAMETER);
+    }
 
     // ========================================================================
     // Write to scratch (simulator copies scratch → primary right after this
@@ -309,7 +343,10 @@ void main() {
     // its pressure still comes from the per-step new_density, which includes
     // the fluid-relative velocity divergence term, so fluid approaching a
     // blade sees a rising pressure exactly as at a static wall.
-    float density_to_store = is_solid_kind(self_params.kind)
+    // 2026-09-29: SOLID_PRESSURE_MODE 3 (accumulate) and 4 (extrapolate) store the
+    // solid's own density, so that the fluid sees a solid at the density that
+    // belongs to its pressure (volume, density diffusion).
+    float density_to_store = (self_is_solid && SOLID_PRESSURE_MODE != 3u && SOLID_PRESSURE_MODE != 4u)
         ? self_params.rest_density
         : new_density;
     density_pressure_scratch[self_particle_id] = vec2(density_to_store, new_pressure);

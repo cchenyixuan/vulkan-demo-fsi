@@ -261,6 +261,10 @@ bool is_solid_kind(uint kind) {
     return kind == MATERIAL_BOUNDARY || kind == MATERIAL_ROTOR;
 }
 
+bool solid_pressure_is_mirrored() {
+    return SOLID_PRESSURE_MODE == 1u || SOLID_PRESSURE_MODE == 2u;
+}
+
 // Acceleration of a solid particle (2026-09-29, mirrored solid pressure):
 // 0 for a wall, the centripetal acceleration -omega^2 r_perp for the rotor
 // (the angular acceleration during the ramp is neglected).

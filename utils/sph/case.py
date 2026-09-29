@@ -301,7 +301,8 @@ class RegularizationConfig:
                 f"regularization.frobenius_max must be > 0, got {self.frobenius_max}")
 
 
-SOLID_PRESSURE_MODES = {"increment": 0, "mirror": 1, "mirror_tic": 2}
+SOLID_PRESSURE_MODES = {"increment": 0, "mirror": 1, "mirror_tic": 2, "accumulate": 3, "extrapolate": 4}
+PST_NEAR_SOLID_MODES = {"full": 0, "tangential": 1}
 
 
 @dataclass
@@ -362,7 +363,17 @@ class NumericsConfig:
     #   "mirror"     : pairwise mirror P_j = P_i + rho_i (g - a_j).(x_j - x_i),
     #                  fluid-solid pairs always in the symmetric form
     #   "mirror_tic" : the same, fluid-solid pairs follow the TIC switch
+    #   "accumulate" : the solid integrates its density in time, lower bound rho0
+    #                  (dynamic boundary condition, Crespo et al. 2007)
+    #   "extrapolate": the pressure of the fluid neighbours continued to the solid
+    #                  particle (Adami et al. 2012)
     solid_pressure: str = "increment"
+    # psi_ij of the density diffusion with the renormalised density gradients
+    # (vanishes for a linear density field; needed with gravity).
+    density_diffusion_gradient_term: bool = False
+    # "full" or "tangential": remove the solid-normal component of the shift of
+    # fluid particles with solid neighbours.
+    pst_near_solid: str = "full"
     # The acceleration of ROTOR / BOUNDARY particles is the reaction of the
     # fluid (exactly minus what the fluid receives). Forced on by the mirror
     # modes, where a solid particle has no pressure of its own.
@@ -375,8 +386,11 @@ class NumericsConfig:
         if self.solid_pressure not in SOLID_PRESSURE_MODES:
             raise ValueError(f"numerics.solid_pressure must be one of {list(SOLID_PRESSURE_MODES)}, "
                              f"got {self.solid_pressure!r}")
-        if self.solid_pressure != "increment":
+        if self.solid_pressure in ("mirror", "mirror_tic"):
             self.solid_reaction_force = True
+        if self.pst_near_solid not in PST_NEAR_SOLID_MODES:
+            raise ValueError(f"numerics.pst_near_solid must be one of {list(PST_NEAR_SOLID_MODES)}, "
+                             f"got {self.pst_near_solid!r}")
         if self.delta_coefficient < 0:
             raise ValueError(
                 f"numerics.delta_coefficient must be >= 0, got {self.delta_coefficient}")
@@ -952,6 +966,8 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (35,  lambda case: SOLID_PRESSURE_MODES[case.numerics.solid_pressure], 'I'),  # SOLID_PRESSURE_MODE
     (36,  lambda case: 1 if case.numerics.solid_reaction_force else 0, 'I'),  # USE_SOLID_REACTION_FORCE
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
+    (38,  lambda case: 1 if case.numerics.density_diffusion_gradient_term else 0, 'I'),
+    (39,  lambda case: PST_NEAR_SOLID_MODES[case.numerics.pst_near_solid], 'I'),  # PST_NEAR_SOLID_MODE
     (40,  lambda case: case.eps_h_squared,                             'f'),
     (41,  lambda case: case.numerics.pst_main,                         'f'),
     (42,  lambda case: case.numerics.pst_anti,                         'f'),

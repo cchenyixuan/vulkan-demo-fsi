@@ -42,7 +42,8 @@ import numpy as np
 from vulkan import *
 from vulkan._vulkancache import ffi
 
-from utils.sph.case import Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, SOLID_PRESSURE_MODES
+from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, PST_NEAR_SOLID_MODES,
+                            SOLID_PRESSURE_MODES)
 from utils.sph.vulkan_context import VulkanContext
 
 
@@ -102,6 +103,8 @@ SPEC_ID_BACKGROUND_PRESSURE                 = 34
 SPEC_ID_SOLID_PRESSURE_MODE                 = 35
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
+SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM = 38
+SPEC_ID_PST_NEAR_SOLID_MODE                 = 39
 SPEC_ID_EPS_H_SQUARED                       = 40
 SPEC_ID_PST_MAIN_SHIFT_COEFFICIENT          = 41
 SPEC_ID_PST_ANTI_SHIFT_COEFFICIENT          = 42
@@ -848,6 +851,8 @@ class SphSimulatorV1:
             (SPEC_ID_SOLID_PRESSURE_MODE,          int(SOLID_PRESSURE_MODES[numerics.solid_pressure]), 'I'),
             (SPEC_ID_USE_SOLID_REACTION_FORCE,     1 if numerics.solid_reaction_force else 0, 'I'),
             (SPEC_ID_SOLID_PRESSURE_OFFSET,        float(numerics.solid_pressure_offset),     'f'),
+            (SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM, 1 if numerics.density_diffusion_gradient_term else 0, 'I'),
+            (SPEC_ID_PST_NEAR_SOLID_MODE,          int(PST_NEAR_SOLID_MODES[numerics.pst_near_solid]), 'I'),
             (SPEC_ID_EPS_H_SQUARED,                float(case.eps_h_squared),                 'f'),
             (SPEC_ID_PST_MAIN_SHIFT_COEFFICIENT,   float(numerics.pst_main),                  'f'),
             (SPEC_ID_PST_ANTI_SHIFT_COEFFICIENT,   float(numerics.pst_anti),                  'f'),

@@ -117,6 +117,20 @@ layout(constant_id = 34) const float BACKGROUND_PRESSURE = 0.0;
 //                    uses the symmetric form (P_i + P_j), also for P_i < 0.
 //   2 "mirror_tic" : as 1, but the fluid-solid pair follows the TIC switch of
 //                    the fluid particle like a fluid-fluid pair.
+//   3 "accumulate" : the solid particle integrates its continuity equation in
+//                    time like a fluid particle (no reset to rho0), with rho0 as
+//                    the lower bound; P_s = EOS(rho_s). The dynamic boundary
+//                    condition of Crespo et al. (2007) as in DualSPHysics: the
+//                    solid keeps the pressure it has built up, so it carries a
+//                    static load.
+//   4 "extrapolate": P_s is the pressure of the fluid neighbours continued to
+//                    the solid particle (Adami et al. 2012),
+//                        P_s = [ sum_f P_f W_sf + (g - a_s) . sum_f rho_f (x_s - x_f) W_sf ]
+//                              / sum_f W_sf,
+//                    with the fluid pressure of the previous step; the stored
+//                    density is the one the EOS gives for P_s.
+// Modes 3 and 4 only change what density.comp stores for a solid particle;
+// force.comp reads the stored pressure as in mode 0.
 // The density diffusion of density.comp is not changed by the mode: a solid
 // neighbour keeps rho0 there (see the note in density.comp).
 // USE_SOLID_REACTION_FORCE (numerics.solid_reaction_force; forced on by the
@@ -137,6 +151,21 @@ layout(constant_id = 36) const bool USE_SOLID_REACTION_FORCE = false;
 // without p_w the fluid enters the walls wherever its pressure is negative
 // (lid-driven cavity, 2026-09-29).
 layout(constant_id = 37) const float SOLID_PRESSURE_OFFSET = 0.0;
+
+// --- Density diffusion: gradient term (2026-09-29) ---
+// numerics.density_diffusion_gradient_term. psi_ij of the delta-SPH diffusion
+// with the renormalised density gradients (Antuono et al. 2010),
+//     psi_ij = (rho_j - rho_i) - 1/2 (<grad rho>_i + <grad rho>_j) . (x_j - x_i),
+// which vanishes for a linear density field also where the neighbourhood is
+// one-sided. Without it (the V0 simplification, default) the diffusion flattens
+// a hydrostatic density profile at every wall.
+layout(constant_id = 38) const bool USE_DENSITY_DIFFUSION_GRADIENT_TERM = false;
+
+// --- Particle shift near solids (2026-09-29) ---
+// numerics.pst_near_solid: 0 "full" (default), 1 "tangential": the component of
+// the shift along the local solid normal (direction of sum_solid V_j grad W_ij)
+// is removed for fluid particles with solid neighbours.
+layout(constant_id = 39) const uint PST_NEAR_SOLID_MODE = 0u;
 
 // --- Voxel layout ---
 layout(constant_id = 20) const uint VOXEL_ORDER = 0u;             // 0 = linear z-major; 1 = Morton (future)
