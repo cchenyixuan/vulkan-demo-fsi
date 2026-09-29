@@ -256,7 +256,15 @@ void main() {
                 vec3 corrected_density_gradient_sum = self_corrected_density_gradient + neighbor_corrected_density_gradient;
                 vec3 position_difference_self_to_neighbor = -position_difference_neighbor_to_self; // -x_ij
                 float psi_ij = (neighbor_density - self_density);// - 0.5 * dot(corrected_density_gradient_sum, position_difference_self_to_neighbor);
-
+                // 2026-09-29, mirrored solid pressure: the solid neighbours keep rho0 here.
+                // rho0 - rho_i pulls the density of the fluid next to a solid toward rho0;
+                // it is a pressure sink under gravity, but it is also what absorbs the
+                // density drift of the particle shift (the shift moves particles without
+                // a term in the continuity equation). Both alternatives were tried on a
+                // box at rest under gravity and drifted: zero flux to solids (pressure
+                // -1700 Pa in 0.075 s, then the fluid entered the walls) and the density
+                // continued with the body force (pressure +250 Pa in 0.015 s).
+                // log/2026-09-29_mirrored-solid-pressure.md.
                 // --- D_ij = 2·ψ_ij · (-x_ij · ∇W̃_ij) / (r² + ε_h²) · V_j ---
                 float dot_xji_gradient = dot(position_difference_self_to_neighbor, corrected_gradient);
                 float d_ij = 2.0 * psi_ij * dot_xji_gradient / (distance * distance + EPS_H_SQUARED) * neighbor_volume;

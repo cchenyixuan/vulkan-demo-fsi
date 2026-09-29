@@ -301,6 +301,9 @@ class RegularizationConfig:
                 f"regularization.frobenius_max must be > 0, got {self.frobenius_max}")
 
 
+SOLID_PRESSURE_MODES = {"increment": 0, "mirror": 1, "mirror_tic": 2}
+
+
 @dataclass
 class NumericsConfig:
     delta_coefficient: float                        # δ in δ-SPH density diffusion
@@ -354,8 +357,26 @@ class NumericsConfig:
     # canonical live data, scratch is purely transient.
     defrag_enabled: bool = True
     defrag_cadence: int = 1000
+    # Pressure of the solid particles seen by the fluid (2026-09-29):
+    #   "increment"  : the stored one-step value EOS(rho0 + dt d rho/dt) (original)
+    #   "mirror"     : pairwise mirror P_j = P_i + rho_i (g - a_j).(x_j - x_i),
+    #                  fluid-solid pairs always in the symmetric form
+    #   "mirror_tic" : the same, fluid-solid pairs follow the TIC switch
+    solid_pressure: str = "increment"
+    # The acceleration of ROTOR / BOUNDARY particles is the reaction of the
+    # fluid (exactly minus what the fluid receives). Forced on by the mirror
+    # modes, where a solid particle has no pressure of its own.
+    solid_reaction_force: bool = False
+    # Mirror modes: constant p_w (Pa) added to the mirrored solid pressure, a
+    # repulsive layer on fluid-solid pairs only (see common.glsl).
+    solid_pressure_offset: float = 0.0
 
     def __post_init__(self):
+        if self.solid_pressure not in SOLID_PRESSURE_MODES:
+            raise ValueError(f"numerics.solid_pressure must be one of {list(SOLID_PRESSURE_MODES)}, "
+                             f"got {self.solid_pressure!r}")
+        if self.solid_pressure != "increment":
+            self.solid_reaction_force = True
         if self.delta_coefficient < 0:
             raise ValueError(
                 f"numerics.delta_coefficient must be >= 0, got {self.delta_coefficient}")
@@ -928,6 +949,9 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (32,  lambda case: case.kernel_coefficient,                        'f'),
     (33,  lambda case: case.kernel_gradient_coefficient,               'f'),
     (34,  lambda case: case.physics.background_pressure,               'f'),  # BACKGROUND_PRESSURE
+    (35,  lambda case: SOLID_PRESSURE_MODES[case.numerics.solid_pressure], 'I'),  # SOLID_PRESSURE_MODE
+    (36,  lambda case: 1 if case.numerics.solid_reaction_force else 0, 'I'),  # USE_SOLID_REACTION_FORCE
+    (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
     (40,  lambda case: case.eps_h_squared,                             'f'),
     (41,  lambda case: case.numerics.pst_main,                         'f'),
     (42,  lambda case: case.numerics.pst_anti,                         'f'),

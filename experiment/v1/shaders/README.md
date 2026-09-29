@@ -280,7 +280,10 @@ compile `_test_common.comp` by hand as a regression check after
 20 - 29  : voxel layout / micropolar (reserved)
 30 - 33  : dimension + kernel coefficients
 34       : BACKGROUND_PRESSURE (2026-09-29; constant added to the Tait pressure, 0 = off)
-35 - 39  : free
+35       : SOLID_PRESSURE_MODE (2026-09-29; 0 increment, 1 mirror, 2 mirror with TIC)
+36       : USE_SOLID_REACTION_FORCE (2026-09-29)
+37       : SOLID_PRESSURE_OFFSET (2026-09-29)
+38 - 39  : free
 40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, toggles, ...)
 50 - 53  : capacities + workgroup size + POOL_SIZE
 54 - 55  : ghost pool sizes (multi-GPU remnant, pinned 0)

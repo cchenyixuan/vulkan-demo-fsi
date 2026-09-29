@@ -261,6 +261,17 @@ bool is_solid_kind(uint kind) {
     return kind == MATERIAL_BOUNDARY || kind == MATERIAL_ROTOR;
 }
 
+// Acceleration of a solid particle (2026-09-29, mirrored solid pressure):
+// 0 for a wall, the centripetal acceleration -omega^2 r_perp for the rotor
+// (the angular acceleration during the ramp is neglected).
+vec3 solid_particle_acceleration(uint kind, vec3 position) {
+    if (kind != MATERIAL_ROTOR) return vec3(0.0);
+    vec3 rotor_axis  = normalize(vec3(ROTOR_AXIS_X, ROTOR_AXIS_Y, ROTOR_AXIS_Z));
+    vec3 arm         = position - vec3(ROTOR_PIVOT_X, ROTOR_PIVOT_Y, ROTOR_PIVOT_Z);
+    vec3 radial_arm  = arm - dot(arm, rotor_axis) * rotor_axis;
+    return -(rotor_angular_velocity_now * rotor_angular_velocity_now) * radial_arm;
+}
+
 // Rodrigues rotation of `vector` about the unit `axis` by the angle whose
 // cosine / sine are given (right-hand rule).
 vec3 rotate_about_axis(vec3 vector, vec3 axis, float cos_theta, float sin_theta) {

@@ -107,6 +107,91 @@
 // density.comp and force.comp (Option D, V1.0a/V1.1).
 // ============================================================================
 
+// ============================================================================
+// Reaction force on a solid particle (2026-09-29, USE_SOLID_REACTION_FORCE).
+// For every FLUID neighbour i of the solid particle j the acceleration that i
+// receives from j is evaluated exactly as in the fluid particle's own loop
+// (its matrix M_i, its density and pressure, its TIC switch, the solid
+// pressure of SOLID_PRESSURE_MODE), and j receives the opposite momentum:
+//     a_j = - sum_i (m_i / m_j) a_(i <- j).
+// Solid neighbours are skipped.
+// ============================================================================
+vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 self_position,
+                                 ivec3 self_voxel_coord, vec3 self_velocity, float self_mass,
+                                 float self_density, float self_pressure) {
+    vec3 reaction = vec3(0.0);
+    vec3 gravity_vector = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z);
+    vec3 relative_body_force = gravity_vector - solid_particle_acceleration(self_kind, self_position);
+    float morris_coefficient = 2.0 * (float(DIMENSION) + 2.0);
+    uint cell_count = USE_NEIGHBOR_LIST ? 1u : (NEIGHBOR_Z_RANGE == 0u ? 9u : 27u);
+    for (uint cell = 0u; cell < cell_count; cell++) {
+        uint candidate_count;
+        uint candidate_base = 0u;
+        if (USE_NEIGHBOR_LIST) {
+            candidate_count = neighbor_count[self_particle_id];
+        } else {
+            ivec3 delta = ivec3(int(cell % 3u) - 1,
+                                int((cell / 3u) % 3u) - 1,
+                                int(cell / 9u) - int(NEIGHBOR_Z_RANGE));
+            ivec3 neighbor_coord = self_voxel_coord + delta;
+            if (!in_own_grid(neighbor_coord)) continue;
+            uint neighbor_voxel_id = own_voxel_id_of(neighbor_coord);
+            candidate_count = inside_particle_count[neighbor_voxel_id];
+            candidate_base  = neighbor_voxel_id * MAX_PARTICLES_PER_VOXEL;
+        }
+        for (uint candidate = 0u; candidate < candidate_count; candidate++) {
+            uint fluid_particle_id;
+            if (USE_NEIGHBOR_LIST) {
+                fluid_particle_id = neighbor_list[candidate * neighbor_list_stride() + self_particle_id];
+            } else {
+                fluid_particle_id = inside_particle_index[candidate_base + candidate];
+                if (fluid_particle_id == INSIDE_SLOT_EMPTY) break;
+                if (fluid_particle_id == self_particle_id) continue;
+            }
+            MaterialParameters fluid_params = material_parameters[material[fluid_particle_id]];
+            if (fluid_params.kind != MATERIAL_FLUID) continue;
+
+            vec3 fluid_position = position_voxel_id[fluid_particle_id].xyz;
+            vec3 position_difference_solid_to_fluid = fluid_position - self_position;      // x_ij, i = fluid
+            float distance_squared = dot(position_difference_solid_to_fluid, position_difference_solid_to_fluid);
+            if (distance_squared >= smoothing_length_squared() || distance_squared < 1e-24) continue;
+            float distance = sqrt(distance_squared);
+
+            vec4  fluid_velocity_mass = velocity_mass[fluid_particle_id];
+            vec2  fluid_density_pressure = density_pressure[fluid_particle_id];
+            float fluid_density  = fluid_density_pressure.x;
+            float fluid_pressure = fluid_density_pressure.y;
+            mat3  fluid_correction_matrix = USE_KCG_CORRECTION
+                ? unpack_correction_inverse(fluid_particle_id)
+                : mat3(1.0);
+            bool  fluid_near_surface = density_gradient_kernel_sum[fluid_particle_id].w < 0.75;
+
+            // the solid particle as the fluid particle sees it
+            float solid_volume_dynamic = fluid_velocity_mass.w / self_density;
+            float solid_pressure = self_pressure;
+            if (SOLID_PRESSURE_MODE != 0u) {
+                solid_pressure = fluid_pressure + SOLID_PRESSURE_OFFSET
+                    + fluid_density * dot(relative_body_force, -position_difference_solid_to_fluid);
+            }
+            bool symmetric_form = (fluid_pressure > 0.0 || fluid_near_surface) || (SOLID_PRESSURE_MODE == 1u);
+            float pressure_combined = symmetric_form
+                ? (solid_pressure + fluid_pressure)
+                : (solid_pressure - fluid_pressure);
+
+            vec3 kernel_gradient_corrected = fluid_correction_matrix
+                * evaluate_kernel_gradient_unguarded(position_difference_solid_to_fluid, distance);
+            vec3 fluid_acceleration_from_solid =
+                -solid_volume_dynamic * pressure_combined / fluid_density * kernel_gradient_corrected
+                + morris_coefficient * fluid_params.viscosity * solid_volume_dynamic
+                  * dot(fluid_velocity_mass.xyz - self_velocity, position_difference_solid_to_fluid)
+                  / (distance_squared + EPS_H_SQUARED)
+                  * kernel_gradient_corrected;
+            reaction -= (fluid_velocity_mass.w / self_mass) * fluid_acceleration_from_solid;
+        }
+    }
+    return reaction + gravity_vector;
+}
+
 layout(local_size_x_id = 51, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
@@ -121,7 +206,9 @@ void main() {
     // Boundary particles are static by definition — no force-driven motion and
     // no PST applies. They still participate in density.comp so fluid particles
     // can read their pressure, but their own acceleration / shift are never used.
-    if (self_params.kind == MATERIAL_BOUNDARY) return;
+    // 2026-09-29: with USE_SOLID_REACTION_FORCE they receive the reaction of the
+    // fluid (diagnostic only: predict.comp never moves a BOUNDARY particle).
+    if (self_params.kind == MATERIAL_BOUNDARY && !USE_SOLID_REACTION_FORCE) return;
     // Inlet particles are emitter templates with no valid SPH state.
     if (self_params.kind == MATERIAL_INLET)    return;
 
@@ -164,6 +251,16 @@ void main() {
 
     // --- Decode self voxel coord ---------------------------------------------
     ivec3 self_voxel_coord = own_coord_of(self_voxel_id);
+
+    // --- Solid particle: reaction of the fluid (2026-09-29) --------------------
+    if (USE_SOLID_REACTION_FORCE && is_solid_kind(self_params.kind)) {
+        vec3 reaction_acceleration = solid_reaction_acceleration(
+            self_particle_id, self_params.kind, self_position, self_voxel_coord,
+            self_velocity, self_mass, self_density, self_pressure);
+        acceleration[self_particle_id] = vec4(reaction_acceleration, 0.0);
+        shift[self_particle_id]        = vec4(0.0);
+        return;
+    }
 
 #if FORCE_WITH_SCALARS
     // --- Scalar transport: self state (2026-09-27) ---------------------------
@@ -312,8 +409,21 @@ void main() {
             // Symmetric (P_i + P_j) form when self is compressive (P_i > 0);
             // anti-symmetric (P_j - P_i) otherwise to suppress tensile
             // instability in the interior.
-            float pressure_combined =
-                (self_pressure > 0.0 || near_surface)
+            // Mirrored solid pressure (2026-09-29, SOLID_PRESSURE_MODE 1 / 2):
+            // for a solid neighbour the stored pressure is replaced by the
+            // fluid particle's own pressure continued to the solid particle.
+            bool symmetric_form = (self_pressure > 0.0 || near_surface);
+            if (SOLID_PRESSURE_MODE != 0u) {
+                uint neighbor_kind = material_parameters[material[neighbor_particle_id]].kind;
+                if (is_solid_kind(neighbor_kind)) {
+                    vec3 relative_body_force = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z)
+                        - solid_particle_acceleration(neighbor_kind, neighbor_position);
+                    neighbor_pressure = self_pressure + SOLID_PRESSURE_OFFSET
+                        + self_density * dot(relative_body_force, -position_difference_neighbor_to_self);
+                    symmetric_form = symmetric_form || (SOLID_PRESSURE_MODE == 1u);
+                }
+            }
+            float pressure_combined = symmetric_form
                     ? (neighbor_pressure + self_pressure)
                     : (neighbor_pressure - self_pressure);
             a_pressure -= neighbor_volume_dynamic * pressure_combined / self_density

@@ -19,8 +19,14 @@ matrix and do not depend on that factor, but a force m a does. This check measur
 for several h/dx. A ratio equal to V_p / dx^3 means that every force, torque and power
 number read back so far carries that factor.
 
+2026-09-29: --solid-pressure increment | mirror | mirror_tic (numerics.solid_pressure). The check
+also prints the pressure of the fluid against rho0 g depth, the largest fluid speed, the number
+of fluid particles beyond the inner wall surface and, with the reaction forces, the vertical
+force on the walls: walls + block carry the weight of the fluid, F_y = - M_fluid g.
+
 Usage (repo root, solver env):
     python experiment/v1/checks/_check_buoyancy_force.py [--hdx 2.5 3 4] [--dx 0.004] [--out output/buoyancy]
+        [--solid-pressure increment mirror] [--hydrostatic]
 """
 import argparse
 import math
@@ -47,7 +53,8 @@ def write_points(path, points):
     np.savetxt(path, points, fmt="v %.7f %.7f %.7f", header=f"# {points.shape[0]} particles", comments="")
 
 
-def build_case(directory, dx, hdx, cells=30, block_cells=8, speed_of_sound=12.0):
+def build_case(directory, dx, hdx, cells=30, block_cells=8, speed_of_sound=12.0, solid_pressure="increment",
+               hydrostatic=False):
     directory.mkdir(parents=True, exist_ok=True)
     half = 0.5 * cells * dx
     centers = (np.arange(cells) + 0.5) * dx - half
@@ -90,6 +97,10 @@ def build_case(directory, dx, hdx, cells=30, block_cells=8, speed_of_sound=12.0)
                                    {"file": "wall.obj", "material": "box_wall"},
                                    {"file": "block.obj", "material": "block"}]},
     }
+    if solid_pressure != "increment":
+        case["numerics"]["solid_pressure"] = solid_pressure
+    if hydrostatic:
+        case["physics"]["hydrostatic_reference"] = [0.0, float(half), 0.0]
     (directory / "case.yaml").write_text(yaml.safe_dump(case, sort_keys=False), encoding="utf-8")
     materials = {"schema_version": 1,
                  "box_fluid": {"kind": "fluid", "rest_density": REST_DENSITY, "viscosity": 1.0e-6},
@@ -106,14 +117,19 @@ def main():
     parser.add_argument("--dx", type=float, default=0.004)
     parser.add_argument("--steps", type=int, default=12000)
     parser.add_argument("--out", default="output/buoyancy")
+    parser.add_argument("--solid-pressure", nargs="+", default=["increment"],
+                        choices=("increment", "mirror", "mirror_tic"))
+    parser.add_argument("--hydrostatic", action="store_true", help="hydrostatic initial density")
     arguments = parser.parse_args()
     compile_shaders_v1.compile_v1_shaders()
     out = pathlib.Path(arguments.out)
     print("h/dx   V_p/dx^3   block particles   F_y read back [N]   rho0 g N dx^3 [N]   ratio   std of samples   mass read back / (rho0 dx^3)")
-    for hdx in arguments.hdx:
-        case_path, block_count, fluid_count = build_case(out / f"hdx_{hdx:g}", arguments.dx, hdx)
+    for hdx, mode in [(hdx, mode) for mode in arguments.solid_pressure for hdx in arguments.hdx]:
+        case_path, block_count, fluid_count = build_case(out / f"hdx_{hdx:g}_{mode}", arguments.dx, hdx,
+                                                         solid_pressure=mode, hydrostatic=arguments.hydrostatic)
         case = load_case(str(case_path))
         samples = []
+        wall_samples = []
         with VulkanContext.create(application_name="buoyancy", enable_validation=False) as context:
             simulator = SphSimulatorV1(context, case)
             try:
@@ -122,13 +138,35 @@ def main():
                     simulator.step()
                     if simulator.step_count > arguments.steps // 2 and simulator.step_count % 20 == 0:
                         samples.append(simulator.readback_rotor_torque()["force"][1])
+                        if case.numerics.solid_reaction_force:
+                            wall_samples.append(simulator.readback_boundary_forces()[1][:, 1].sum())
                 status = simulator.readback_global_status()
                 mass = float(simulator.readback_velocity_mass()[1, 3])
+                positions = simulator.readback_positions()
+                fluid = simulator.live_slot_mask(positions) & (simulator.readback_material() == 0)
+                fluid_positions = positions[fluid, :3].astype(np.float64)
+                fluid_pressure = simulator.readback_density_pressure()[fluid, 1].astype(np.float64)
+                fluid_speed = np.linalg.norm(simulator.readback_velocity_mass()[fluid, :3].astype(np.float64), axis=1)
             finally:
                 simulator.destroy()
         samples = np.array(samples)
         expected = REST_DENSITY * GRAVITY * block_count * arguments.dx ** 3
         calibrated = _calibrate_particle_volume(hdx * arguments.dx, 0.5 * arguments.dx, 3, "grid") / arguments.dx ** 3
+        half = 0.5 * 30 * arguments.dx
+        print(f"--- solid_pressure = {mode}, h/dx = {hdx:g}: fluid particles {int(fluid.sum()):,} of {fluid_count:,}, "
+              f"beyond the inner wall surface {int((np.abs(fluid_positions) > half).any(axis=1).sum())}, "
+              f"largest fluid speed {fluid_speed.max():.4f} m/s (mean {fluid_speed.mean():.5f})")
+        away = (np.abs(fluid_positions[:, 0]) > 0.5 * half) & (np.abs(fluid_positions[:, 2]) > 0.5 * half)   # columns away from the block
+        for depth_fraction in (0.1, 0.3, 0.5, 0.7, 0.9):
+            height = half - depth_fraction * 2 * half
+            layer = away & (np.abs(fluid_positions[:, 1] - height) < 0.75 * arguments.dx)
+            if layer.any():
+                print(f"       depth {depth_fraction * 2 * half * 1e3:5.1f} mm: pressure median {np.median(fluid_pressure[layer]):8.2f} Pa, "
+                      f"rho0 g depth {REST_DENSITY * GRAVITY * depth_fraction * 2 * half:8.2f} Pa")
+        if wall_samples:
+            fluid_weight = int(fluid.sum()) * mass * GRAVITY
+            print(f"       vertical force: walls {np.mean(wall_samples):.4f} N + block {samples.mean():.4f} N = "
+                  f"{np.mean(wall_samples) + samples.mean():.4f} N; minus the weight of the fluid {-fluid_weight:.4f} N")
         print(f"{hdx:4g}   {calibrated:8.4f}   {block_count:15d}   {samples.mean():18.4f}   {expected:17.4f}   "
               f"{samples.mean() / expected:5.3f}   {samples.std():14.4f}   {mass / (REST_DENSITY * arguments.dx ** 3):.4f}"
               f"      (alive {status['alive_particle_count']:,}, overflow {status['overflow_inside_count']}/"

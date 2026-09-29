@@ -65,7 +65,8 @@ def run(arguments):
             torque_log = None
             if arguments.torque_log:
                 torque_log = open(arguments.torque_log, "w")
-                torque_log.write("step,time,angle,torque_axis,fx,fy,fz,torque_lower,torque_upper,torque_shaft\n")
+                torque_log.write("step,time,angle,torque_axis,fx,fy,fz,torque_lower,torque_upper,torque_shaft,"
+                                 "wall_torque,baffle_torque,wall_fx,wall_fy,wall_fz\n")
             status_log = None
             if arguments.status_log:
                 status_log = open(arguments.status_log, "w")
@@ -104,7 +105,20 @@ def run(arguments):
                     torque_log.write(f"{step},{simulator.simulation_time:.6e},{torque['rotor_angle']:.6e},"
                                      f"{torque['torque_axis']:.6e},{fx:.6e},{fy:.6e},{fz:.6e},"
                                      f"{torque['torque_axis_lower']:.6e},{torque['torque_axis_upper']:.6e},"
-                                     f"{torque['torque_axis_shaft']:.6e}\n")
+                                     f"{torque['torque_axis_shaft']:.6e},")
+                    if case.numerics.solid_reaction_force:
+                        # torque of the fluid on the walls about the rotor axis (+y through the
+                        # origin); "baffle": wall particles inside the tank radius above the floor
+                        wall_positions, wall_forces = simulator.readback_boundary_forces()
+                        wall_torque = (wall_positions[:, 2] * wall_forces[:, 0]
+                                       - wall_positions[:, 0] * wall_forces[:, 2])
+                        wall_radius = np.hypot(wall_positions[:, 0], wall_positions[:, 2])
+                        baffle = (wall_radius < 0.1395) & (wall_radius > 0.10) & (wall_positions[:, 1] > 0.0)
+                        total = wall_forces.sum(axis=0)
+                        torque_log.write(f"{wall_torque.sum():.6e},{wall_torque[baffle].sum():.6e},"
+                                         f"{total[0]:.6e},{total[1]:.6e},{total[2]:.6e}\n")
+                    else:
+                        torque_log.write("nan,nan,nan,nan,nan\n")
                     torque_log.flush()
                 if step >= arguments.dense_start and (step - arguments.dense_start) % arguments.dense_every == 0:
                     positions = simulator.readback_positions()

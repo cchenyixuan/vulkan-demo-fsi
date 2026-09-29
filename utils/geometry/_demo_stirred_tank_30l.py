@@ -503,6 +503,15 @@ def main() -> int:
     parser.add_argument("--background-pressure", type=float, default=0.0,
                         help="constant added to the Tait pressure, Pa (physics.background_pressure); keeps the "
                              "pressure behind the blades positive. About rho * U_tip^2 = 1000 Pa. 0 = off")
+    parser.add_argument("--solid-pressure", choices=("increment", "mirror", "mirror_tic"), default="increment",
+                        help="numerics.solid_pressure: pressure of the solid particles seen by the fluid "
+                             "(increment = original one-step value, mirror = pairwise mirror)")
+    parser.add_argument("--solid-pressure-offset", type=float, default=0.0,
+                        help="numerics.solid_pressure_offset p_w (Pa), mirror modes: repulsive layer on "
+                             "fluid-solid pairs, pair pressure 2 P_i + p_w")
+    parser.add_argument("--solid-reaction-force", action="store_true",
+                        help="numerics.solid_reaction_force: forces on rotor and walls as the reaction of the "
+                             "fluid (always on with the mirror modes)")
     parser.add_argument("--hydrostatic", action="store_true",
                         help="with --gravity: the fluid starts with the hydrostatic density, zero pressure at the lid "
                              "(physics.hydrostatic_reference)")
@@ -626,6 +635,11 @@ def main() -> int:
         # written only when used, so that the files of all other cases stay as they were
         assert case_text.count("  gravity: [") == 1
         case_text = case_text.replace("  gravity: [", f"  background_pressure: {args.background_pressure:g}\n  gravity: [")
+    if args.solid_pressure != "increment" or args.solid_reaction_force:
+        assert case_text.count("  use_pst: true") == 1
+        case_text = case_text.replace("  use_pst: true", f"  solid_pressure: {args.solid_pressure}\n"
+                                      f"  solid_reaction_force: true\n"
+                                      f"  solid_pressure_offset: {args.solid_pressure_offset:g}\n  use_pst: true")
     if args.hydrostatic:
         if args.gravity == 0.0:
             parser.error("--hydrostatic needs --gravity")

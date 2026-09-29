@@ -42,7 +42,7 @@ import numpy as np
 from vulkan import *
 from vulkan._vulkancache import ffi
 
-from utils.sph.case import Case, KIND_FLUID, KIND_ROTOR
+from utils.sph.case import Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, SOLID_PRESSURE_MODES
 from utils.sph.vulkan_context import VulkanContext
 
 
@@ -99,6 +99,9 @@ SPEC_ID_NEIGHBOR_Z_RANGE                    = 31
 SPEC_ID_KERNEL_COEFFICIENT                  = 32
 SPEC_ID_KERNEL_GRADIENT_COEFFICIENT         = 33
 SPEC_ID_BACKGROUND_PRESSURE                 = 34
+SPEC_ID_SOLID_PRESSURE_MODE                 = 35
+SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
+SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
 SPEC_ID_EPS_H_SQUARED                       = 40
 SPEC_ID_PST_MAIN_SHIFT_COEFFICIENT          = 41
 SPEC_ID_PST_ANTI_SHIFT_COEFFICIENT          = 42
@@ -842,6 +845,9 @@ class SphSimulatorV1:
             (SPEC_ID_KERNEL_COEFFICIENT,           float(case.kernel_coefficient),            'f'),
             (SPEC_ID_KERNEL_GRADIENT_COEFFICIENT,  float(case.kernel_gradient_coefficient),   'f'),
             (SPEC_ID_BACKGROUND_PRESSURE,          float(physics.background_pressure),        'f'),
+            (SPEC_ID_SOLID_PRESSURE_MODE,          int(SOLID_PRESSURE_MODES[numerics.solid_pressure]), 'I'),
+            (SPEC_ID_USE_SOLID_REACTION_FORCE,     1 if numerics.solid_reaction_force else 0, 'I'),
+            (SPEC_ID_SOLID_PRESSURE_OFFSET,        float(numerics.solid_pressure_offset),     'f'),
             (SPEC_ID_EPS_H_SQUARED,                float(case.eps_h_squared),                 'f'),
             (SPEC_ID_PST_MAIN_SHIFT_COEFFICIENT,   float(numerics.pst_main),                  'f'),
             (SPEC_ID_PST_ANTI_SHIFT_COEFFICIENT,   float(numerics.pst_anti),                  'f'),
@@ -1411,6 +1417,21 @@ class SphSimulatorV1:
         mask[1:alive_count + 1] = True
         mask &= positions[:, 3] > 0
         return mask
+
+    def readback_boundary_forces(self) -> tuple:
+        """Positions (N, 3) and forces m (a - g) (N, 3) of the live BOUNDARY
+        particles (2026-09-29). Needs numerics.solid_reaction_force: without
+        it force.comp never writes the acceleration of a BOUNDARY particle.
+        The forces carry the same mass factor as readback_rotor_torque()."""
+        if not self.case.numerics.solid_reaction_force:
+            raise RuntimeError("readback_boundary_forces needs numerics.solid_reaction_force")
+        groups = np.asarray([m.group_id for m in self.case.materials if m.kind == KIND_BOUNDARY], dtype=np.uint32)
+        positions = self.readback_positions()
+        selected = np.isin(self.readback_material(), groups) & self.live_slot_mask(positions)
+        acceleration = self.readback_acceleration()[selected, :3].astype(np.float64)
+        mass = self.readback_velocity_mass()[selected, 3].astype(np.float64)
+        gravity = np.asarray(self.case.physics.gravity, dtype=np.float64)
+        return positions[selected, :3].astype(np.float64), (acceleration - gravity) * mass[:, None]
 
     def rotor_group_ids(self) -> list[int]:
         return [m.group_id for m in self.case.materials if m.kind == KIND_ROTOR]

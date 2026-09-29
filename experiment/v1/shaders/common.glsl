@@ -103,6 +103,41 @@ layout(constant_id = 19) const float GRAVITY_Z = 0.0;
 // surface. case.yaml: physics.background_pressure (default 0).
 layout(constant_id = 34) const float BACKGROUND_PRESSURE = 0.0;
 
+// --- Pressure of the solid particles seen by the fluid (2026-09-29) ---
+// SOLID_PRESSURE_MODE (case.yaml numerics.solid_pressure):
+//   0 "increment"  : the pressure density.comp stores for the solid particle,
+//                    P_s = EOS(rho0 + dt (d rho / dt)_s) (the original code).
+//   1 "mirror"     : pairwise mirror. In the pair (fluid i, solid j) the solid
+//                    pressure is the fluid particle's own pressure continued to
+//                    the solid particle with the body force in the frame of the
+//                    solid,
+//                        P_j = P_i + rho_i (g - a_j) . (x_j - x_i),
+//                    a_j = acceleration of the solid particle (0 for a wall,
+//                    centripetal for the rotor). The fluid-solid pair always
+//                    uses the symmetric form (P_i + P_j), also for P_i < 0.
+//   2 "mirror_tic" : as 1, but the fluid-solid pair follows the TIC switch of
+//                    the fluid particle like a fluid-fluid pair.
+// The density diffusion of density.comp is not changed by the mode: a solid
+// neighbour keeps rho0 there (see the note in density.comp).
+// USE_SOLID_REACTION_FORCE (numerics.solid_reaction_force; forced on by the
+// mirror modes): the acceleration written for a ROTOR or BOUNDARY particle is
+// the reaction of what its fluid neighbours receive from it,
+//     a_j = - sum_i (m_i / m_j) a_(i <- j) + g,
+// evaluated with the fluid particle's matrix, density and pressure, so the
+// force read back on a solid is exactly minus the force on the fluid.
+layout(constant_id = 35) const uint SOLID_PRESSURE_MODE = 0u;
+layout(constant_id = 36) const bool USE_SOLID_REACTION_FORCE = false;
+// SOLID_PRESSURE_OFFSET p_w (numerics.solid_pressure_offset, Pa; mirror modes
+// only): constant added to the mirrored solid pressure,
+//     P_j = P_i + rho_i (g - a_j) . (x_j - x_i) + p_w,
+// so the fluid-solid pair pressure is 2 P_i + p_w. It acts on fluid-solid pairs
+// only: a repulsive layer along every solid surface (the potential
+// p_w * (smoothed solid volume fraction)), none of the background pressure's
+// effect on fluid-fluid pairs. A mirrored solid has no stiffness of its own;
+// without p_w the fluid enters the walls wherever its pressure is negative
+// (lid-driven cavity, 2026-09-29).
+layout(constant_id = 37) const float SOLID_PRESSURE_OFFSET = 0.0;
+
 // --- Voxel layout ---
 layout(constant_id = 20) const uint VOXEL_ORDER = 0u;             // 0 = linear z-major; 1 = Morton (future)
 
