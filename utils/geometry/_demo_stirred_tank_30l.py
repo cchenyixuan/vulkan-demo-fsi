@@ -74,11 +74,24 @@ FLOOR_PROFILE = np.array([
 ])
 FLOOR_BOTTOM = float(FLOOR_PROFILE[:, 1].min())
 BEARING_BOSS = dict(radius=0.0145, y1=-0.023)
-BAFFLE_Y0 = 0.010
-
-BAFFLE_AZIMUTHS_DEG = (62.0, 182.0, 302.0)
-BAFFLE_RADIAL = (0.1254, 0.1384)
-BAFFLE_THICKNESS = 2.65e-3
+# Baffles, measured 2026-09-29 on sections of the dataset's static body
+# (30L_saticbody.stl, mm, same origin): three plates 24.0 mm wide (T / 12) from
+# r = 114.35 to 138.36 mm, 2.55-2.63 mm thick, in planes through the axis at
+# 61.45 / 181.45 / 301.45 deg, from y = 1 mm to above the liquid level; each is
+# fixed to the wall by a bracket at its lower end (y = 1.0 .. 20.7 mm): 9.2 mm
+# wide from r = 128 mm, widening with a fillet to 30.6 mm at the wall. The
+# bracket is modelled by three boxes (BAFFLE_FOOT: r0, r1, width).
+# Until 2026-09-29 the generator used r = 125.4 .. 138.4 mm (13 mm wide, 54 % of
+# the true width), 62 / 182 / 302 deg, 2.65 mm, from y = 10 mm, no block:
+# LEGACY_BAFFLES, generator flag --legacy-baffles. Every tank run before that
+# date has the narrow baffles.
+BAFFLE_Y0 = 0.001
+BAFFLE_AZIMUTHS_DEG = (61.45, 181.45, 301.45)
+BAFFLE_RADIAL = (0.11435, 0.13836)
+BAFFLE_THICKNESS = 2.6e-3
+BAFFLE_FOOT = dict(y0=0.001, y1=0.0207,
+                   parts=((0.1280, 0.1370, 0.0096), (0.1370, 0.1395, 0.0180), (0.1395, 0.1445, 0.0306)))
+LEGACY_BAFFLES = dict(y0=0.010, azimuths_deg=(62.0, 182.0, 302.0), radial=(0.1254, 0.1384), thickness=2.65e-3)
 
 SHAFT_RADIUS = 0.004
 
@@ -265,14 +278,40 @@ def conformal_blades(dx, layers, impellers="both"):
     return np.vstack(points), boxes
 
 
-def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False, with_blades=True):
+def conformal_baffles(dx, layers, top):
+    """Baffle plates as plane grids of particles in the baffles' own frames (2026-09-29), like
+    conformal_blades(): `layers` flat layers, spacing <= dx in the plate, true outline from
+    BAFFLE_RADIAL and BAFFLE_Y0 up to `top` (the liquid surface; the lid shell closes the tank
+    above it). Two of the three baffles cross the lattice obliquely; taken from the lattice a
+    single-layer baffle is a staircase whose neighbouring particles touch only at corners.
+    Returns (points, boxes) as conformal_blades()."""
+    points, boxes = [], []
+    for azimuth in BAFFLE_AZIMUTHS_DEG:
+        e_r, e_t, e_y = radial_frame(azimuth)
+        r0, r1 = BAFFLE_RADIAL
+        half_a, half_b = 0.5 * (r1 - r0), 0.5 * (top - BAFFLE_Y0)
+        centre = e_r * 0.5 * (r0 + r1) + e_y * 0.5 * (BAFFLE_Y0 + top)
+        cells_a = max(1, int(math.ceil(2.0 * half_a / dx - 1e-9)))
+        cells_b = max(1, int(math.ceil(2.0 * half_b / dx - 1e-9)))
+        a = -half_a + (np.arange(cells_a) + 0.5) * (2.0 * half_a / cells_a)
+        b = -half_b + (np.arange(cells_b) + 0.5) * (2.0 * half_b / cells_b)
+        n = (np.arange(layers) - 0.5 * (layers - 1)) * dx
+        grid_a, grid_b, grid_n = np.meshgrid(a, b, n, indexing="ij")
+        points.append(centre + grid_a.reshape(-1, 1) * e_r + grid_b.reshape(-1, 1) * e_y
+                      + grid_n.reshape(-1, 1) * e_t)
+        boxes.append(OrientedBox(centre, np.stack([e_r, e_y, e_t]), [half_a, half_b, 0.5 * layers * dx]))
+    return np.vstack(points), boxes
+
+
+def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False, with_blades=True,
+                 legacy_baffles=False, with_baffle_plates=True):
     """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
     ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
     and the disk for the Rushton) are kept on the full-length shaft; used for
     the single-impeller control runs of 2026-09-26."""
     keep_rushton = impellers in ("both", "rushton")
     keep_pbt = impellers in ("both", "pbt")
-    t_baffle = max(BAFFLE_THICKNESS, thin)
+    t_baffle = max(LEGACY_BAFFLES["thickness"] if legacy_baffles else BAFFLE_THICKNESS, thin)
     t_rblade = max(RUSHTON_BLADE["thickness"], thin)
     t_disk = max(RUSHTON_DISK["y1"] - RUSHTON_DISK["y0"], thin)
     t_pblade = max(PBT_BLADE["thickness"], thin)
@@ -303,8 +342,15 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=Fa
                 blade = Intersection(blade, y_cylinder(PBT_TIP_RADIUS, shaft_y0, shaft_y1))
             rotor_parts.append(blade)
     wall_parts = [y_cylinder(BEARING_BOSS["radius"], FLOOR_BOTTOM - 0.02, BEARING_BOSS["y1"])]
-    for az in BAFFLE_AZIMUTHS_DEG:
-        wall_parts.append(radial_slab(az, *BAFFLE_RADIAL, BAFFLE_Y0, top_y, t_baffle))
+    if legacy_baffles:
+        for az in LEGACY_BAFFLES["azimuths_deg"]:
+            wall_parts.append(radial_slab(az, *LEGACY_BAFFLES["radial"], LEGACY_BAFFLES["y0"], top_y, t_baffle))
+    else:
+        for az in BAFFLE_AZIMUTHS_DEG:
+            if with_baffle_plates:
+                wall_parts.append(radial_slab(az, *BAFFLE_RADIAL, BAFFLE_Y0, top_y, t_baffle))
+            for r0, r1, width in BAFFLE_FOOT["parts"]:
+                wall_parts.append(radial_slab(az, r0, r1, BAFFLE_FOOT["y0"], BAFFLE_FOOT["y1"], width))
     for cx, cz in PROBE_CENTERS:
         wall_parts.append(Box([cx - PROBE_HALF, PROBE_Y[0], cz - PROBE_HALF],
                               [cx + PROBE_HALF, top_y, cz + PROBE_HALF]))
@@ -487,6 +533,12 @@ def main() -> int:
                              "term is 0.841 of the exact operator on the h/dx = 3 lattice with xi = 0.01 "
                              "(_check_operator_consistency.py), so 1.0e-6 / 0.8408 = 1.18934e-6 gives an "
                              "effective viscosity of 1.0e-6")
+    parser.add_argument("--conformal-baffles", action="store_true",
+                        help="baffle plates on plane grids in the baffles' own frames (--thin-layers flat "
+                             "layers), like --conformal-blades; not with --legacy-baffles")
+    parser.add_argument("--legacy-baffles", action="store_true",
+                        help="baffles as until 2026-09-29: 13 mm wide (r = 125.4 .. 138.4 mm), 62 / 182 / 302 deg, "
+                             "from y = 10 mm, no block at the lower end; the true baffles are 24 mm wide")
     parser.add_argument("--conformal-blades", action="store_true",
                         help="blade particles on plane grids in the blades' own frames (--thin-layers flat "
                              "layers, true outline) instead of lattice sites; avoids the staircase at which "
@@ -563,7 +615,9 @@ def main() -> int:
 
     interior = DishedTankInterior(TANK_RADIUS, LIQUID_HEIGHT, FLOOR_PROFILE)
     rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers,
-                                            clip_tips=args.clip_tips, with_blades=not args.conformal_blades)
+                                            clip_tips=args.clip_tips, with_blades=not args.conformal_blades,
+                                            legacy_baffles=args.legacy_baffles,
+                                            with_baffle_plates=not args.conformal_baffles)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 
@@ -597,6 +651,26 @@ def main() -> int:
         is_rotor &= ~in_blade
     else:
         in_blade = np.zeros(sites.shape[0], dtype=bool)
+    baffle_points = np.zeros((0, 3))
+    if args.conformal_baffles:
+        if args.legacy_baffles:
+            parser.error("--conformal-baffles cannot be combined with --legacy-baffles")
+        # Baffle plates: plane sheets in the baffle frames. The lattice sites inside the sheets'
+        # boxes are dropped, and so is every other lattice site (fluid, bracket, shell) that
+        # would sit closer than 0.6 dx to a baffle particle.
+        baffle_points, baffle_boxes = conformal_baffles(dx, args.thin_layers, LIQUID_HEIGHT)
+        sdf_baffle = Union(*baffle_boxes).signed_distance(sites)
+        in_baffle = sdf_baffle <= 0.0
+        near = np.nonzero(~in_baffle & (sdf_baffle < dx))[0]
+        if near.size:
+            too_close = np.zeros(near.size, dtype=bool)
+            for start in range(0, near.size, 2000):
+                block = sites[near[start:start + 2000]]
+                difference = block[:, None, :] - baffle_points[None, :, :]
+                too_close[start:start + 2000] = (np.einsum("ijk,ijk->ij", difference, difference)
+                                                 < (0.6 * dx) ** 2).any(axis=1)
+            in_baffle[near[too_close]] = True
+        in_blade = in_blade | in_baffle          # from here on: "replaced by a conformal sheet"
     is_wall_solid = (sdf_wall_solid <= skin) & ~is_rotor & ~in_blade
     is_fluid = (sdf_interior <= -0.5 * dx) & ~is_rotor & ~is_wall_solid & ~in_blade
     # Everything else inside the frame that is not liquid = tank shell (walls, floor, lid).
@@ -605,7 +679,9 @@ def main() -> int:
     is_shell &= sdf_interior <= shell + 0.5 * dx
 
     fluid = sites[is_fluid]
-    wall = sites[is_wall_solid | is_shell]
+    wall = np.vstack([sites[is_wall_solid | is_shell], baffle_points])
+    if args.conformal_baffles:
+        print(f"conformal baffles: {baffle_points.shape[0]:,} baffle particles in {args.thin_layers} layer(s)")
     rotor = np.vstack([sites[is_rotor], blade_points])
     if args.conformal_blades:
         print(f"conformal blades: {blade_points.shape[0]:,} blade particles in {args.thin_layers} layer(s), "
