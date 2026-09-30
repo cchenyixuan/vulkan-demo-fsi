@@ -117,6 +117,8 @@ SPEC_ID_BACKGROUND_PRESSURE                 = 34
 SPEC_ID_SOLID_PRESSURE_MODE                 = 35
 SPEC_ID_SOLID_DENSITY_FLOOR                 = 73
 SPEC_ID_SHIFT_TRANSPORT_MODE                = 76
+SPEC_ID_USE_MOMENTUM_SGS                    = 77
+SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
 SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM = 38
@@ -357,7 +359,7 @@ class SphSimulatorV1:
         n_materials = len(case.materials)
         scalar_vec4 = case.scalar_vec4_count
         scalar_bytes = 16 * scalar_vec4 * pool_capacity if scalar_vec4 > 0 else 16
-        sgs_on = case.scalars is not None and case.scalars.sgs.enabled
+        sgs_on = (case.scalars is not None and case.scalars.sgs.enabled) or case.numerics.momentum_sgs
         turbulent_bytes = 4 * pool_capacity if sgs_on else 16
         correction_bytes = 32 * pool_capacity
         thin_plate_bytes = (MAX_THIN_PLATE_GROUPS * THIN_PLATE_GROUP_BYTES
@@ -929,6 +931,8 @@ class SphSimulatorV1:
             (SPEC_ID_USE_SOLID_REACTION_FORCE,     1 if numerics.solid_reaction_force else 0, 'I'),
             (SPEC_ID_SOLID_DENSITY_FLOOR,          1 if numerics.solid_density_floor else 0,  'I'),
             (SPEC_ID_SHIFT_TRANSPORT_MODE,         SHIFT_TRANSPORT_MODES[numerics.shift_transport], 'I'),
+            (SPEC_ID_USE_MOMENTUM_SGS,             1 if numerics.momentum_sgs else 0,           'I'),
+            (SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED,  float(case.momentum_sgs_length_squared),   'f'),
             (SPEC_ID_SOLID_PRESSURE_OFFSET,        float(numerics.solid_pressure_offset),     'f'),
             (SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM, 1 if numerics.density_diffusion_gradient_term else 0, 'I'),
             (SPEC_ID_PST_NEAR_SOLID_MODE,          int(PST_NEAR_SOLID_MODES[numerics.pst_near_solid]), 'I'),
@@ -1056,7 +1060,7 @@ class SphSimulatorV1:
             0, 1, [barrier], 0, None, 0, None)
 
     def _record_density_scratch_to_primary_copy(self, cmd) -> None:
-        if self.case.scalars is not None and self.case.scalars.sgs.enabled:
+        if (self.case.scalars is not None and self.case.scalars.sgs.enabled) or self.case.numerics.momentum_sgs:
             # density.comp also wrote turbulent_viscosity (2026-09-27), which
             # force.comp reads; the compute→transfer→compute chain below only
             # names the transfer accesses, so add an explicit compute→compute
@@ -1760,8 +1764,8 @@ class SphSimulatorV1:
         return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4 * self.case.scalar_vec4_count)
 
     def readback_turbulent_viscosity(self) -> np.ndarray:
-        if self.case.scalars is None or not self.case.scalars.sgs.enabled:
-            raise RuntimeError("case has no scalar SGS (scalars.sgs.enabled)")
+        if (self.case.scalars is None or not self.case.scalars.sgs.enabled) and not self.case.numerics.momentum_sgs:
+            raise RuntimeError("case has no SGS (scalars.sgs.enabled or numerics.momentum_sgs)")
         raw = self._readback_buffer(self.buffers["turbulent_viscosity"])
         return np.frombuffer(raw, dtype=np.float32)
 

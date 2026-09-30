@@ -272,7 +272,7 @@ void main() {
             // outerProduct(c, r) = c r^T, so velocity_gradient[b][a] = sum of
             // (v_j - v_i)_a (grad W)_b in GLSL's column-major indexing, i.e. the
             // usual (d v_a / d x_b) layout once multiplied by M^-1 below.
-            if (USE_SCALAR_SGS && self_is_fluid) {
+            if ((USE_SCALAR_SGS || USE_MOMENTUM_SGS) && self_is_fluid) {
                 velocity_gradient += neighbor_volume
                     * outerProduct(neighbor_velocity - self_velocity, raw_gradient);
             }
@@ -422,7 +422,7 @@ void main() {
     //     nu_t = (C_s Delta)^2 |S|        (SGS_LENGTH_SQUARED = (C_s Delta)^2)
     // Read by force.comp later in this step (scalar diffusion only).
     // ========================================================================
-    if (USE_SCALAR_SGS && self_is_fluid) {
+    if ((USE_SCALAR_SGS || USE_MOMENTUM_SGS) && self_is_fluid) {
         if (USE_KCG_CORRECTION) {
             velocity_gradient = velocity_gradient * self_correction_matrix;
         }
@@ -430,7 +430,8 @@ void main() {
         float strain_rate_contracted = dot(strain_rate[0], strain_rate[0])
                                      + dot(strain_rate[1], strain_rate[1])
                                      + dot(strain_rate[2], strain_rate[2]);   // S:S
+        // momentum SGS (2026-10-01): its own (C_s Delta)^2, see USE_MOMENTUM_SGS
         turbulent_viscosity[self_particle_id] =
-            SGS_LENGTH_SQUARED * sqrt(2.0 * strain_rate_contracted);
+            (USE_MOMENTUM_SGS ? MOMENTUM_SGS_LENGTH_SQUARED : SGS_LENGTH_SQUARED) * sqrt(2.0 * strain_rate_contracted);
     }
 }

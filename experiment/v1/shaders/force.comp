@@ -373,6 +373,9 @@ void main() {
     //   W_Δx  = evaluate_kernel(Δx_ij)     (per-pair)
     // ========================================================================
     float morris_coefficient  = 2.0 * (float(DIMENSION) + 2.0);  // 8 (2D), 10 (3D)
+    // momentum SGS (2026-10-01): nu_t of this particle, written by density.comp this step (0 for solids)
+    float self_turbulent_viscosity_momentum =
+        (USE_MOMENTUM_SGS && self_params.kind == MATERIAL_FLUID) ? turbulent_viscosity[self_particle_id] : 0.0;
     float pst_base_factor     = CFL_NUMBER * PST_MAIN_SHIFT_COEFFICIENT * 2.0 * (SMOOTHING_LENGTH * SMOOTHING_LENGTH);
 
     // V0-uniform pair quantities
@@ -477,15 +480,21 @@ void main() {
             vec3  kernel_gradient_neighbor = kernel_gradient_corrected;   // B_j grad W
             float pair_volume_viscous      = neighbor_volume_dynamic;
             bool  pair_is_corrected        = false;
+            float pair_viscosity           = viscosity_uniform;   // momentum SGS adds nu_t on FLUID-FLUID pairs
 #if WITH_THIN_PLATES
-            if (PAIR_CORRECTION_MODE != 0u && USE_KCG_CORRECTION && self_params.kind == MATERIAL_FLUID
+            if ((PAIR_CORRECTION_MODE != 0u || USE_MOMENTUM_SGS) && USE_KCG_CORRECTION && self_params.kind == MATERIAL_FLUID
                     && !neighbor_is_wall_dummy) {
 #else
-            if (PAIR_CORRECTION_MODE != 0u && USE_KCG_CORRECTION && self_params.kind == MATERIAL_FLUID) {
+            if ((PAIR_CORRECTION_MODE != 0u || USE_MOMENTUM_SGS) && USE_KCG_CORRECTION && self_params.kind == MATERIAL_FLUID) {
 #endif
                 vec4 neighbor_matrix_a = correction_inverse[neighbor_particle_id * 2u];
                 vec4 neighbor_matrix_b = correction_inverse[neighbor_particle_id * 2u + 1u];
-                if (neighbor_matrix_b.w > 0.5) {
+                if (neighbor_matrix_b.w > 0.5 && USE_MOMENTUM_SGS) {
+                    // FLUID neighbour (flag next to its matrix): Smagorinsky viscosity of the pair,
+                    // nu_t of both particles written by density.comp this step (see USE_MOMENTUM_SGS)
+                    pair_viscosity += 0.5 * (self_turbulent_viscosity_momentum + turbulent_viscosity[neighbor_particle_id]);
+                }
+                if (neighbor_matrix_b.w > 0.5 && PAIR_CORRECTION_MODE != 0u) {
                     mat3 neighbor_correction_matrix = mat3(
                         vec3(neighbor_matrix_a.x, neighbor_matrix_a.w, neighbor_matrix_b.x),
                         vec3(neighbor_matrix_a.w, neighbor_matrix_a.y, neighbor_matrix_b.y),
@@ -554,7 +563,7 @@ void main() {
             if (!neighbor_is_wall_dummy || USE_THIN_PLATE_VISCOSITY)
 #endif
             a_viscosity +=
-                morris_coefficient * viscosity_uniform * pair_volume_viscous
+                morris_coefficient * pair_viscosity * pair_volume_viscous
                 * dot(self_velocity - neighbor_velocity,
                       position_difference_neighbor_to_self)
                 / (distance * distance + EPS_H_SQUARED)

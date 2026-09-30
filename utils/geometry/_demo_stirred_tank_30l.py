@@ -713,6 +713,10 @@ def main() -> int:
                              "pressure behind the blades positive. About rho * U_tip^2 = 1000 Pa. 0 = off")
     parser.add_argument("--symmetric-pair-correction", action="store_true",
                         help="older spelling of --pair-correction mean (writes symmetric_pair_correction: true)")
+    parser.add_argument("--momentum-sgs", type=float, default=None, metavar="CS",
+                        help="numerics.momentum_sgs with Smagorinsky C_s (2026-10-01); see --momentum-sgs-width")
+    parser.add_argument("--momentum-sgs-width", default="dx",
+                        help="filter width of the momentum SGS: 'dx', '2dx', 'h' or metres (default dx)")
     parser.add_argument("--shift-transport", choices=("none", "density", "momentum", "both"), default="none",
                         help="numerics.shift_transport: transport terms of the particle shift in the continuity "
                              "and momentum equations (2026-09-30)")
@@ -939,6 +943,14 @@ def main() -> int:
     if args.symmetric_pair_correction:
         assert case_text.count("  use_pst: true") == 1
         case_text = case_text.replace("  use_pst: true", "  symmetric_pair_correction: true\n  use_pst: true")
+    if args.momentum_sgs is not None:
+        width_text = args.momentum_sgs_width
+        width = {"dx": args.dx, "2dx": 2.0 * args.dx, "h": args.hdx * args.dx}.get(width_text)
+        if width is None:
+            width = float(width_text)
+        case_text = case_text.replace(
+            "  use_pst: true",
+            f"  momentum_sgs: true\n  momentum_sgs_cs: {args.momentum_sgs:g}\n  momentum_sgs_filter_width: {width:.6g}\n  use_pst: true")
     if args.shift_transport != "none":
         case_text = case_text.replace("  use_pst: true", f"  shift_transport: {args.shift_transport}\n  use_pst: true")
     if args.no_solid_density_floor:

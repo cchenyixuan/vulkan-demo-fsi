@@ -168,6 +168,17 @@ layout(constant_id = 73) const bool SOLID_DENSITY_FLOOR = true;
 // evaluated in density.comp, which reads the neighbours' shift before
 // force.comp overwrites it. Solid neighbours and plate dummies have no shift.
 layout(constant_id = 76) const uint SHIFT_TRANSPORT_MODE = 0u;
+// Momentum SGS (numerics.momentum_sgs, 2026-10-01): the Smagorinsky nu_t that
+// density.comp computes for the scalars (USE_SCALAR_SGS) also enters the
+// viscous force of FLUID-FLUID pairs,
+//     nu_pair = nu + 1/2 (nu_t,i + nu_t,j),      nu_t = (C_s Delta)^2 |S|,
+// with its own (C_s Delta)^2 (MOMENTUM_SGS_LENGTH_SQUARED, numerics.momentum_sgs_cs
+// and momentum_sgs_filter_width, default width = dx). Fluid-solid pairs keep the
+// molecular viscosity (a crude near-wall damping). When both SGS options are on
+// the momentum width is used for the stored nu_t (the scalars see the same
+// value). The original code has no SGS term in the momentum equation.
+layout(constant_id = 77) const bool  USE_MOMENTUM_SGS = false;
+layout(constant_id = 78) const float MOMENTUM_SGS_LENGTH_SQUARED = 0.0;
 // SOLID_PRESSURE_OFFSET p_w (numerics.solid_pressure_offset, Pa; mirror modes
 // only): constant added to the mirrored solid pressure,
 //     P_j = P_i + rho_i (g - a_j) . (x_j - x_i) + p_w,

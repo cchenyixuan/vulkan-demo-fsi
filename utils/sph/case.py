@@ -401,6 +401,12 @@ class NumericsConfig:
     # "none" (the original code: the shift moves particles without a term in the continuity
     # or momentum equation), "density", "momentum", "both".
     shift_transport: str = "none"
+    # Momentum SGS (2026-10-01, USE_MOMENTUM_SGS in common.glsl): Smagorinsky nu_t = (C_s Delta)^2 |S|
+    # added to the viscosity of fluid-fluid pairs; Delta = momentum_sgs_filter_width (m) or the particle
+    # spacing when None. The original code has no SGS term in the momentum equation.
+    momentum_sgs: bool = False
+    momentum_sgs_cs: float = 0.1
+    momentum_sgs_filter_width: Optional[float] = None
     # Mirror modes: constant p_w (Pa) added to the mirrored solid pressure, a
     # repulsive layer on fluid-solid pairs only (see common.glsl).
     solid_pressure_offset: float = 0.0
@@ -415,6 +421,10 @@ class NumericsConfig:
     def __post_init__(self):
         if self.thin_plate_dashpot < 0:
             raise ValueError(f"numerics.thin_plate_dashpot must be >= 0, got {self.thin_plate_dashpot}")
+        self.momentum_sgs = bool(self.momentum_sgs)
+        self.momentum_sgs_cs = float(self.momentum_sgs_cs)
+        if self.momentum_sgs_filter_width is not None:
+            self.momentum_sgs_filter_width = float(self.momentum_sgs_filter_width)
         if self.shift_transport not in SHIFT_TRANSPORT_MODES:
             raise ValueError(f"numerics.shift_transport must be one of {list(SHIFT_TRANSPORT_MODES)}, "
                              f"got {self.shift_transport!r}")
@@ -955,6 +965,16 @@ class Case:
         return 0 if self.scalars is None else self.scalars.vec4_count
 
     @property
+    def momentum_sgs_length_squared(self) -> float:
+        """(C_s Delta)^2 of the momentum SGS (0 when off); Delta defaults to the particle spacing."""
+        if not self.numerics.momentum_sgs:
+            return 0.0
+        width = self.numerics.momentum_sgs_filter_width
+        if width is None:
+            width = self.physics.particle_diameter
+        return (self.numerics.momentum_sgs_cs * width) ** 2
+
+    @property
     def sgs_length_squared(self) -> float:
         """(C_s Delta)^2 for the Smagorinsky nu_t (0 when the SGS is off);
         Delta defaults to the particle spacing dx."""
@@ -1151,6 +1171,8 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (36,  lambda case: 1 if case.numerics.solid_reaction_force else 0, 'I'),  # USE_SOLID_REACTION_FORCE
     (73,  lambda case: 1 if case.numerics.solid_density_floor else 0, 'I'),  # SOLID_DENSITY_FLOOR
     (76,  lambda case: SHIFT_TRANSPORT_MODES[case.numerics.shift_transport], 'I'),  # SHIFT_TRANSPORT_MODE
+    (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
+    (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
     (38,  lambda case: 1 if case.numerics.density_diffusion_gradient_term else 0, 'I'),
     (39,  lambda case: PST_NEAR_SOLID_MODES[case.numerics.pst_near_solid], 'I'),  # PST_NEAR_SOLID_MODE
