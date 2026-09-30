@@ -306,6 +306,7 @@ THIN_PLATE_SHAPES = {"rectangle": 0, "annulus": 1}
 THIN_PLATE_FRAMES = {"static": 0, "rotor": 1}
 MAX_THIN_PLATE_GROUPS = 8          # common.glsl MAX_THIN_PLATE_GROUPS
 SOLID_PRESSURE_MODES = {"increment": 0, "mirror": 1, "mirror_tic": 2, "accumulate": 3, "extrapolate": 4}
+SHIFT_TRANSPORT_MODES = {"none": 0, "density": 1, "momentum": 2, "both": 3}
 PST_NEAR_SOLID_MODES = {"full": 0, "tangential": 1}
 
 
@@ -396,6 +397,10 @@ class NumericsConfig:
     # pressure; with True the top fluid layers are not held and the column drifts down
     # (2026-09-30, log/2026-09-30_tank-2mm-onset-diagnosis.md).
     solid_density_floor: bool = True
+    # Transport terms of the particle shift (2026-09-30, SHIFT_TRANSPORT_MODE in common.glsl):
+    # "none" (the original code: the shift moves particles without a term in the continuity
+    # or momentum equation), "density", "momentum", "both".
+    shift_transport: str = "none"
     # Mirror modes: constant p_w (Pa) added to the mirrored solid pressure, a
     # repulsive layer on fluid-solid pairs only (see common.glsl).
     solid_pressure_offset: float = 0.0
@@ -410,6 +415,9 @@ class NumericsConfig:
     def __post_init__(self):
         if self.thin_plate_dashpot < 0:
             raise ValueError(f"numerics.thin_plate_dashpot must be >= 0, got {self.thin_plate_dashpot}")
+        if self.shift_transport not in SHIFT_TRANSPORT_MODES:
+            raise ValueError(f"numerics.shift_transport must be one of {list(SHIFT_TRANSPORT_MODES)}, "
+                             f"got {self.shift_transport!r}")
         if self.solid_pressure not in SOLID_PRESSURE_MODES:
             raise ValueError(f"numerics.solid_pressure must be one of {list(SOLID_PRESSURE_MODES)}, "
                              f"got {self.solid_pressure!r}")
@@ -1142,6 +1150,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (35,  lambda case: SOLID_PRESSURE_MODES[case.numerics.solid_pressure], 'I'),  # SOLID_PRESSURE_MODE
     (36,  lambda case: 1 if case.numerics.solid_reaction_force else 0, 'I'),  # USE_SOLID_REACTION_FORCE
     (73,  lambda case: 1 if case.numerics.solid_density_floor else 0, 'I'),  # SOLID_DENSITY_FLOOR
+    (76,  lambda case: SHIFT_TRANSPORT_MODES[case.numerics.shift_transport], 'I'),  # SHIFT_TRANSPORT_MODE
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
     (38,  lambda case: 1 if case.numerics.density_diffusion_gradient_term else 0, 'I'),
     (39,  lambda case: PST_NEAR_SOLID_MODES[case.numerics.pst_near_solid], 'I'),  # PST_NEAR_SOLID_MODE

@@ -713,6 +713,9 @@ def main() -> int:
                              "pressure behind the blades positive. About rho * U_tip^2 = 1000 Pa. 0 = off")
     parser.add_argument("--symmetric-pair-correction", action="store_true",
                         help="older spelling of --pair-correction mean (writes symmetric_pair_correction: true)")
+    parser.add_argument("--shift-transport", choices=("none", "density", "momentum", "both"), default="none",
+                        help="numerics.shift_transport: transport terms of the particle shift in the continuity "
+                             "and momentum equations (2026-09-30)")
     parser.add_argument("--no-solid-density-floor", action="store_true",
                         help="numerics.solid_density_floor: false (accumulate walls may fall below rho0; needed "
                              "with --gravity --hydrostatic so that the lid holds the top fluid layers, 2026-09-30)")
@@ -936,6 +939,8 @@ def main() -> int:
     if args.symmetric_pair_correction:
         assert case_text.count("  use_pst: true") == 1
         case_text = case_text.replace("  use_pst: true", "  symmetric_pair_correction: true\n  use_pst: true")
+    if args.shift_transport != "none":
+        case_text = case_text.replace("  use_pst: true", f"  shift_transport: {args.shift_transport}\n  use_pst: true")
     if args.no_solid_density_floor:
         case_text = case_text.replace("  use_pst: true", "  solid_density_floor: false\n  use_pst: true")
     if args.pair_correction != "own":

@@ -150,6 +150,21 @@ layout(constant_id = 36) const bool USE_SOLID_REACTION_FORCE = false;
 // downward drift velocity that empties the layers below the lid
 // (log/2026-09-30_tank-2mm-onset-diagnosis.md).
 layout(constant_id = 73) const bool SOLID_DENSITY_FLOOR = true;
+// SHIFT_TRANSPORT_MODE (numerics.shift_transport, 2026-09-30): the particle
+// shift delta_x of the PST moves a particle without any term in the continuity
+// or momentum equation (the collaborator's code, mode 0). The consistent form
+// treats it as a transport displacement (Sun et al. 2019, Adami et al. 2013):
+//   density  (mode 1, 3): rho_i += -rho_i sum_j V_j (dx_j - dx_i) . gradW~_ij
+//                         (the divergence of the applied displacement, so that
+//                         the density follows the particle spacing)
+//   momentum (mode 2, 3): v_i += sum_j V_j (v_j - v_i) (1/2 (dx_i + dx_j) . gradW~_ij)
+//                         (the velocity field is carried with the displaced
+//                         particle, same form as the shift correction of the
+//                         scalars), applied by force.comp as an acceleration.
+// Both use the shift of the step just applied by predict (shift_n) and are
+// evaluated in density.comp, which reads the neighbours' shift before
+// force.comp overwrites it. Solid neighbours and plate dummies have no shift.
+layout(constant_id = 76) const uint SHIFT_TRANSPORT_MODE = 0u;
 // SOLID_PRESSURE_OFFSET p_w (numerics.solid_pressure_offset, Pa; mirror modes
 // only): constant added to the mirrored solid pressure,
 //     P_j = P_i + rho_i (g - a_j) . (x_j - x_i) + p_w,

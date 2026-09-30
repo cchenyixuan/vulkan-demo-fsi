@@ -304,6 +304,8 @@ compile `_test_common.comp` by hand as a regression check after
 48       : PAIR_CORRECTION_MODE (2026-09-30; fluid-fluid pairs: 0 own KCG matrix, 1 mean of the two, 2 reverse)
 73       : SOLID_DENSITY_FLOOR (2026-09-30; accumulate walls: 1 = density never below rho0 (original), 0 = no bound;
            0 lets the lid hold the top fluid layers under gravity, log/2026-09-30_gravity-drift-root-cause.md)
+76       : SHIFT_TRANSPORT_MODE (2026-09-30; transport terms of the particle shift: 0 none (original), 1 density,
+           2 momentum, 3 both; density.comp accumulates both, log/2026-09-30_shift-transport.md)
 49       : THIN_PLATE_COUNT (2026-09-30, plates builds only)
 40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, toggles, ...)
 50 - 53  : capacities + workgroup size + POOL_SIZE

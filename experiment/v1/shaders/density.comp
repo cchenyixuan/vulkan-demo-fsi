@@ -87,6 +87,11 @@ void main() {
 
     vec3  self_velocity = velocity_mass[self_particle_id].xyz;
     float self_density  = density_pressure[self_particle_id].x;   // ρ_n
+    // shift transport (SHIFT_TRANSPORT_MODE, common.glsl): shift_n, the
+    // displacement predict.comp applied in this step
+    vec3  self_shift    = (SHIFT_TRANSPORT_MODE != 0u) ? shift[self_particle_id].xyz : vec3(0.0);
+    float density_shift_transport   = 0.0;     // -rho_i sum_j V_j (dx_j - dx_i) . gradW~
+    vec3  velocity_shift_transport  = vec3(0.0); // sum_j V_j (v_j - v_i) (dx_ij . gradW~)
 
 #if WITH_THIN_PLATES
     // Thin plates (2026-09-30): a plate particle keeps rho0 and its marker.
@@ -327,6 +332,17 @@ void main() {
 
             // --- Drift: -ρ_i · V_j · (v_j - v_i) · ∇W̃_ij -----------
             density_drift += -self_density * neighbor_volume * dot(neighbor_velocity - self_velocity, corrected_gradient);
+
+            // --- Shift transport (2026-09-30, see SHIFT_TRANSPORT_MODE) ---
+            if (SHIFT_TRANSPORT_MODE != 0u && !self_is_solid) {
+                vec3 neighbor_shift = shift[neighbor_particle_id].xyz;   // 0 for solids (force.comp writes 0)
+#if WITH_THIN_PLATES
+                if (neighbor_is_wall_dummy) neighbor_shift = vec3(0.0);
+#endif
+                density_shift_transport  += -self_density * neighbor_volume * dot(neighbor_shift - self_shift, corrected_gradient);
+                velocity_shift_transport += neighbor_volume * (neighbor_velocity - self_velocity)
+                                          * dot(0.5 * (self_shift + neighbor_shift), corrected_gradient);
+            }
         }
     }
 
@@ -334,6 +350,15 @@ void main() {
     // Forward integration (full dt; leapfrog only staggers v, not ρ).
     // ========================================================================
     float new_density = self_density + TIMESTEP * (density_drift + density_diffusion);
+    if ((SHIFT_TRANSPORT_MODE & 1u) != 0u && !self_is_solid) {
+        new_density += density_shift_transport;          // a displacement, not a rate: no dt
+    }
+    if ((SHIFT_TRANSPORT_MODE & 2u) != 0u && !self_is_solid) {
+        // handed to force.comp as an acceleration dv / dt in the slot force.comp
+        // overwrites at its end (predict.comp has already consumed a_n of this
+        // slot; each kernel writes its own slot only, so there is no race)
+        acceleration[self_particle_id] = vec4(velocity_shift_transport / TIMESTEP, 0.0);
+    }
 
     // ========================================================================
     // Tait EOS: P = eos_constant · ((ρ/ρ₀)^γ - 1) + p_b

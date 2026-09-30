@@ -43,7 +43,7 @@ from vulkan import *
 from vulkan._vulkancache import ffi
 
 from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, MAX_THIN_PLATE_GROUPS,
-                            PAIR_CORRECTION_MODES, PST_NEAR_SOLID_MODES, SOLID_PRESSURE_MODES,
+                            PAIR_CORRECTION_MODES, PST_NEAR_SOLID_MODES, SHIFT_TRANSPORT_MODES, SOLID_PRESSURE_MODES,
                             THIN_PLATE_FRAMES, THIN_PLATE_SHAPES)
 from utils.sph.vulkan_context import VulkanContext
 
@@ -116,6 +116,7 @@ SPEC_ID_KERNEL_GRADIENT_COEFFICIENT         = 33
 SPEC_ID_BACKGROUND_PRESSURE                 = 34
 SPEC_ID_SOLID_PRESSURE_MODE                 = 35
 SPEC_ID_SOLID_DENSITY_FLOOR                 = 73
+SPEC_ID_SHIFT_TRANSPORT_MODE                = 76
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
 SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM = 38
@@ -927,6 +928,7 @@ class SphSimulatorV1:
             (SPEC_ID_SOLID_PRESSURE_MODE,          int(SOLID_PRESSURE_MODES[numerics.solid_pressure]), 'I'),
             (SPEC_ID_USE_SOLID_REACTION_FORCE,     1 if numerics.solid_reaction_force else 0, 'I'),
             (SPEC_ID_SOLID_DENSITY_FLOOR,          1 if numerics.solid_density_floor else 0,  'I'),
+            (SPEC_ID_SHIFT_TRANSPORT_MODE,         SHIFT_TRANSPORT_MODES[numerics.shift_transport], 'I'),
             (SPEC_ID_SOLID_PRESSURE_OFFSET,        float(numerics.solid_pressure_offset),     'f'),
             (SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM, 1 if numerics.density_diffusion_gradient_term else 0, 'I'),
             (SPEC_ID_PST_NEAR_SOLID_MODE,          int(PST_NEAR_SOLID_MODES[numerics.pst_near_solid]), 'I'),

@@ -669,6 +669,11 @@ void main() {
     // ========================================================================
     vec3 gravity_vector = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z);
     vec3 total_acceleration = a_pressure + a_viscosity + gravity_vector;
+    if ((SHIFT_TRANSPORT_MODE & 2u) != 0u) {
+        // momentum transport of the particle shift, computed by density.comp
+        // (see SHIFT_TRANSPORT_MODE in common.glsl)
+        total_acceleration += acceleration[self_particle_id].xyz;
+    }
 
     // ========================================================================
     // Blend PST shift by kernel_sum: interior → main, surface → anti
