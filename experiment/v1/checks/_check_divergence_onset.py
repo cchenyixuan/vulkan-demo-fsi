@@ -11,12 +11,14 @@ blade run hold only the extremes of the whole tank. This script runs a case and
     particles to DIR/onset_NNN.npz (position, velocity, density, pressure, material, uid, acceleration,
     shift), `--dumps` times, and stops.
 
-Before the trigger the density limits are those of a healthy run: the hydrostatic density at the
-bottom is the largest, the rest density minus the noise the smallest.
+The extremes are those of the fluid particles unless `--all-kinds` is given. The limits must lie outside
+the range of a healthy run. 2 mm tank, 1 g, c0 = 20.57 m/s: fluid 997.3 to about 1012, floor particles
+below the rotor bell up to 1020 during the start (run of 2026-09-30 that triggered at step 15,000
+because of them).
 
 Usage (repo root, solver env):
     python experiment/v1/checks/_check_divergence_onset.py CASE.yaml --max-steps 100000 \
-        --check-every 500 --check-start 50000 --density-low 990 --density-high 1020 --out DIR
+        --check-every 500 --check-start 50000 --density-low 993 --density-high 1030 --out DIR
 """
 import argparse
 import pathlib
@@ -38,7 +40,11 @@ def main():
     parser.add_argument("--check-every", type=int, default=500)
     parser.add_argument("--check-start", type=int, default=0, help="first step at which the densities are checked")
     parser.add_argument("--density-low", type=float, default=990.0)
-    parser.add_argument("--density-high", type=float, default=1020.0)
+    parser.add_argument("--density-high", type=float, default=1030.0)
+    parser.add_argument("--all-kinds", action="store_true",
+                        help="extremes over all particles; default: fluid particles only (the density of a solid "
+                             "particle follows from its extrapolated pressure, 1020 kg/m^3 on the floor below the "
+                             "rotor bell of the tank is the healthy state)")
     parser.add_argument("--dump-every", type=int, default=250)
     parser.add_argument("--dumps", type=int, default=8)
     parser.add_argument("--radius", type=float, default=6.0, help="radius of the dumped balls in kernel radii")
@@ -84,6 +90,8 @@ def main():
                 status = simulator.readback_global_status()
                 # plate particles of the thin plate treatment carry a marker in the pressure slot
                 ordinary = live & (density_pressure[:, 1] > -1.0e8)
+                if not arguments.all_kinds:
+                    ordinary &= kind_of_group[material] == 0
                 density = np.where(ordinary, density_pressure[:, 0], np.nan)
                 if not np.isfinite(density[ordinary]).all():
                     print(f"   {step:6d} {simulator.simulation_time:8.4f}  non-finite densities: "
