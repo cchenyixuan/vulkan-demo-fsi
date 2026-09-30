@@ -115,6 +115,7 @@ SPEC_ID_KERNEL_COEFFICIENT                  = 32
 SPEC_ID_KERNEL_GRADIENT_COEFFICIENT         = 33
 SPEC_ID_BACKGROUND_PRESSURE                 = 34
 SPEC_ID_SOLID_PRESSURE_MODE                 = 35
+SPEC_ID_SOLID_DENSITY_FLOOR                 = 73
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
 SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM = 38
@@ -558,12 +559,25 @@ class SphSimulatorV1:
             material = case.materials[source.material_group_id]
             density_pressure[cursor:cursor + n, 0] = material.rest_density
             reference = case.physics.hydrostatic_reference
-            if reference is not None and material.kind == KIND_FLUID:
-                # hydrostatic initial density (2026-09-29): p = rho0 g . (x - reference)
+            # hydrostatic initial density (2026-09-29): p = rho0 g . (x - reference). Since 2026-09-30
+            # also for the solids of the accumulate wall model (they integrate their density from this
+            # value): a solid that starts at rho0 has p = 0 next to fluid at the hydrostatic pressure,
+            # and the fluid layer at the floor is pulled into the wall with -335 m/s^2 in the first
+            # step (30 L tank, 1 g); the kick leaves the column with a downward drift velocity that is
+            # never damped (log/2026-09-30_tank-2mm-onset-diagnosis.md). The other wall models reset the
+            # solid density every step, so the initial value does not matter for them.
+            hydrostatic_kinds = ((KIND_FLUID,) if case.numerics.solid_pressure != "accumulate"
+                                 else (KIND_FLUID, KIND_BOUNDARY, KIND_ROTOR))
+            if reference is not None and material.kind in hydrostatic_kinds:
                 offset = np.asarray(source.vertices, dtype=np.float64)[:, :3] - np.asarray(reference)
                 hydrostatic = material.rest_density * (offset @ np.asarray(case.physics.gravity, dtype=np.float64))
-                ratio = np.maximum(1.0 + hydrostatic / float(material.eos_constant), 0.5)
-                density_pressure[cursor:cursor + n, 0] = material.rest_density * ratio ** (1.0 / float(case.physics.power))
+                # exact hydrostatic profile of the Tait fluid (2026-09-30): dp/dd = rho(p) g with
+                # p = B ((rho/rho0)^gamma - 1) gives rho = rho0 (1 + (gamma - 1)/gamma * rho0 g d / B)^(1/(gamma - 1));
+                # the earlier p = rho0 g d underestimated the pressure gradient by rho/rho0 - 1 (1 % at the
+                # floor of the 30 L tank) and kicked the column at the start.
+                gamma = float(case.physics.power)
+                ratio = np.maximum(1.0 + (gamma - 1.0) / gamma * hydrostatic / float(material.eos_constant), 0.5)
+                density_pressure[cursor:cursor + n, 0] = material.rest_density * ratio ** (1.0 / (gamma - 1.0))
             if source.thin_plate_name is not None:
                 # thin plate particle (2026-09-30): rho0 and, in the pressure slot, the
                 # marker -(plate index + 1) * THIN_PLATE_MARKER
@@ -912,6 +926,7 @@ class SphSimulatorV1:
             (SPEC_ID_BACKGROUND_PRESSURE,          float(physics.background_pressure),        'f'),
             (SPEC_ID_SOLID_PRESSURE_MODE,          int(SOLID_PRESSURE_MODES[numerics.solid_pressure]), 'I'),
             (SPEC_ID_USE_SOLID_REACTION_FORCE,     1 if numerics.solid_reaction_force else 0, 'I'),
+            (SPEC_ID_SOLID_DENSITY_FLOOR,          1 if numerics.solid_density_floor else 0,  'I'),
             (SPEC_ID_SOLID_PRESSURE_OFFSET,        float(numerics.solid_pressure_offset),     'f'),
             (SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM, 1 if numerics.density_diffusion_gradient_term else 0, 'I'),
             (SPEC_ID_PST_NEAR_SOLID_MODE,          int(PST_NEAR_SOLID_MODES[numerics.pst_near_solid]), 'I'),

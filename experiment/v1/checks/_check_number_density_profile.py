@@ -69,7 +69,7 @@ def main():
             reference_density = None
             print(f"{'step':>7s} {'t, s':>7s} | count % of step 0: " + " ".join(f"{name:>6s}" for name, _, _ in bands)
                   + " | density % of step 0: " + " ".join(f"{name:>6s}" for name, _, _ in bands)
-                  + f" | {'rho min':>8s} {'rho max':>8s} {'|v| max':>7s} {'fallbk':>6s} | mean dy per step, 1e-3 dx: v dt / shift per slab",
+                  + f" | {'rho min':>8s} {'rho max':>8s} {'|v| max':>7s} {'fallbk':>6s} | mean dy per step, 1e-3 dx: v dt / shift per slab | mean a_y - g_y per slab, m/s^2",
                   flush=True)
 
             def report():
@@ -83,6 +83,8 @@ def main():
                 velocity = simulator.readback_velocity_mass()[:, :3].astype(np.float64)
                 speed = np.linalg.norm(velocity[fluid], axis=1)
                 shift = simulator.readback_shift()[:, :3].astype(np.float64)
+                acceleration = simulator.readback_acceleration()[:, :3].astype(np.float64)
+                gravity_y = float(case.physics.gravity[1])
                 timestep = float(simulator.simulation_time / max(simulator.step_count, 1)) if simulator.step_count else 0.0
                 status = simulator.readback_global_status()
                 counts, densities, drifts = [], [], []
@@ -91,8 +93,9 @@ def main():
                     counts.append(int(inside.sum()))
                     densities.append(float(density_pressure[inside, 0].mean()) if inside.any() else float("nan"))
                     # mean vertical displacement per step of the slab's particles, in 1e-3 dx: by the velocity and by the shift
-                    drifts.append((1e3 * velocity[inside, 1].mean() * timestep / dx, 1e3 * shift[inside, 1].mean() / dx)
-                                  if inside.any() else (float("nan"), float("nan")))
+                    drifts.append((1e3 * velocity[inside, 1].mean() * timestep / dx, 1e3 * shift[inside, 1].mean() / dx,
+                                   acceleration[inside, 1].mean() - gravity_y)
+                                  if inside.any() else (float("nan"), float("nan"), float("nan")))
                 if reference_count is None:
                     reference_count, reference_density = counts, densities
                 print(f"{simulator.step_count:7d} {simulator.simulation_time:7.3f} | "
@@ -100,7 +103,8 @@ def main():
                       + " |                     " + " ".join(f"{100.0 * d / r:6.2f}" for d, r in zip(densities, reference_density))
                       + f" | {density_pressure[fluid, 0].min():8.2f} {density_pressure[fluid, 0].max():8.2f} "
                       f"{speed.max():7.3f} {status['correction_fallback_count']:6d} | "
-                      + " ".join(f"{a:6.2f}/{b:5.2f}" for a, b in drifts), flush=True)
+                      + " ".join(f"{a:6.2f}/{b:5.2f}" for a, b, _ in drifts)
+                      + " | " + " ".join(f"{c:7.4f}" for _, _, c in drifts), flush=True)
                 simulator.end_readback_cache()
                 return np.isfinite(density_pressure[fluid, 0]).all()
 
@@ -120,7 +124,10 @@ def main():
                                     material=simulator.readback_material(),
                                     density_pressure=simulator.readback_density_pressure(),
                                     velocity_mass=simulator.readback_velocity_mass(),
-                                    step=simulator.step_count, time=simulator.simulation_time)
+                                    acceleration=simulator.readback_acceleration(),
+                                    shift=simulator.readback_shift(), uid=simulator.readback_particle_uid(),
+                                    step=simulator.step_count, time=simulator.simulation_time,
+                                    smoothing_length=float(case.physics.h), spacing=dx)
         finally:
             simulator.destroy()
     return 0

@@ -391,6 +391,11 @@ class NumericsConfig:
     # fluid (exactly minus what the fluid receives). Forced on by the mirror
     # modes, where a solid particle has no pressure of its own.
     solid_reaction_force: bool = False
+    # accumulate mode: keep the solid density at or above rho0 (the original code). False lets
+    # the lid of a closed tank under gravity carry the negative continuation of the hydrostatic
+    # pressure; with True the top fluid layers are not held and the column drifts down
+    # (2026-09-30, log/2026-09-30_tank-2mm-onset-diagnosis.md).
+    solid_density_floor: bool = True
     # Mirror modes: constant p_w (Pa) added to the mirrored solid pressure, a
     # repulsive layer on fluid-solid pairs only (see common.glsl).
     solid_pressure_offset: float = 0.0
@@ -1136,6 +1141,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (34,  lambda case: case.physics.background_pressure,               'f'),  # BACKGROUND_PRESSURE
     (35,  lambda case: SOLID_PRESSURE_MODES[case.numerics.solid_pressure], 'I'),  # SOLID_PRESSURE_MODE
     (36,  lambda case: 1 if case.numerics.solid_reaction_force else 0, 'I'),  # USE_SOLID_REACTION_FORCE
+    (73,  lambda case: 1 if case.numerics.solid_density_floor else 0, 'I'),  # SOLID_DENSITY_FLOOR
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
     (38,  lambda case: 1 if case.numerics.density_diffusion_gradient_term else 0, 'I'),
     (39,  lambda case: PST_NEAR_SOLID_MODES[case.numerics.pst_near_solid], 'I'),  # PST_NEAR_SOLID_MODE

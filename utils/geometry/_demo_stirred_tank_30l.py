@@ -713,6 +713,9 @@ def main() -> int:
                              "pressure behind the blades positive. About rho * U_tip^2 = 1000 Pa. 0 = off")
     parser.add_argument("--symmetric-pair-correction", action="store_true",
                         help="older spelling of --pair-correction mean (writes symmetric_pair_correction: true)")
+    parser.add_argument("--no-solid-density-floor", action="store_true",
+                        help="numerics.solid_density_floor: false (accumulate walls may fall below rho0; needed "
+                             "with --gravity --hydrostatic so that the lid holds the top fluid layers, 2026-09-30)")
     parser.add_argument("--pair-correction", choices=("own", "mean", "reverse"), default="own",
                         help="numerics.pair_correction, KCG matrices of fluid-fluid pairs: own (original), "
                              "mean of the two, or reverse (P_i B_j + P_j B_i, Zhang, Adams, Hu 2025)")
@@ -933,6 +936,8 @@ def main() -> int:
     if args.symmetric_pair_correction:
         assert case_text.count("  use_pst: true") == 1
         case_text = case_text.replace("  use_pst: true", "  symmetric_pair_correction: true\n  use_pst: true")
+    if args.no_solid_density_floor:
+        case_text = case_text.replace("  use_pst: true", "  solid_density_floor: false\n  use_pst: true")
     if args.pair_correction != "own":
         assert not args.symmetric_pair_correction, "use --pair-correction alone"
         assert case_text.count("  use_pst: true") == 1

@@ -141,6 +141,15 @@ layout(constant_id = 34) const float BACKGROUND_PRESSURE = 0.0;
 // force read back on a solid is exactly minus the force on the fluid.
 layout(constant_id = 35) const uint SOLID_PRESSURE_MODE = 0u;
 layout(constant_id = 36) const bool USE_SOLID_REACTION_FORCE = false;
+// SOLID_DENSITY_FLOOR (numerics.solid_density_floor, accumulate mode only,
+// 2026-09-30): true = the solid density never falls below rho0 (the original
+// code, no negative solid pressure); false = no bound. Under gravity with the
+// hydrostatic zero at the lid the lid particles need the negative continuation
+// of the hydrostatic pressure to hold the top fluid layers; with the bound the
+// top layers sink, the particle shift lifts them back and the column keeps a
+// downward drift velocity that empties the layers below the lid
+// (log/2026-09-30_tank-2mm-onset-diagnosis.md).
+layout(constant_id = 73) const bool SOLID_DENSITY_FLOOR = true;
 // SOLID_PRESSURE_OFFSET p_w (numerics.solid_pressure_offset, Pa; mirror modes
 // only): constant added to the mirrored solid pressure,
 //     P_j = P_i + rho_i (g - a_j) . (x_j - x_i) + p_w,

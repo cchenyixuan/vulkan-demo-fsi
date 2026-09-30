@@ -338,8 +338,8 @@ void main() {
     // ========================================================================
     // Tait EOS: P = eos_constant · ((ρ/ρ₀)^γ - 1) + p_b
     // ========================================================================
-    if (self_is_solid && SOLID_PRESSURE_MODE == 3u) {
-        // accumulate: the solid keeps its density, never below rho0
+    if (self_is_solid && SOLID_PRESSURE_MODE == 3u && SOLID_DENSITY_FLOOR) {
+        // accumulate: the solid keeps its density, never below rho0 (see SOLID_DENSITY_FLOOR)
         new_density = max(new_density, self_params.rest_density);
     }
     float density_ratio = new_density / self_params.rest_density;
