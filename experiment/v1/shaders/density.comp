@@ -91,7 +91,7 @@ void main() {
     // displacement predict.comp applied in this step
     vec3  self_shift    = (SHIFT_TRANSPORT_MODE != 0u) ? shift[self_particle_id].xyz : vec3(0.0);
     float density_shift_transport   = 0.0;     // -rho_i sum_j V_j (dx_j - dx_i) . gradW~
-    vec3  velocity_shift_transport  = vec3(0.0); // sum_j V_j (v_j - v_i) (dx_ij . gradW~)
+    vec3  velocity_shift_transport  = vec3(0.0); // (1/rho_i) sum_j V_j (rho_i v_i + rho_j v_j)(dx_ij . gradW), pair form
 
 #if WITH_THIN_PLATES
     // Thin plates (2026-09-30): a plate particle keeps rho0 and its marker.
@@ -340,8 +340,12 @@ void main() {
                 if (neighbor_is_wall_dummy) neighbor_shift = vec3(0.0);
 #endif
                 density_shift_transport  += -self_density * neighbor_volume * dot(neighbor_shift - self_shift, corrected_gradient);
-                velocity_shift_transport += neighbor_volume * (neighbor_velocity - self_velocity)
-                                          * dot(0.5 * (self_shift + neighbor_shift), corrected_gradient);
+                // pair form F_ij = V_i V_j (rho_i v_i + rho_j v_j)(dx_ij . gradW_ij) = -F_ji: linear momentum
+                // is conserved exactly (raw gradient, exactly antisymmetric); in the interior it equals
+                // (dx . grad) v. The advective form sum V_j (v_j - v_i)(dx_ij . gradW~) is not a pair force
+                // and removed 25 % of the rotor's angular momentum input (3 mm tank, 2026-09-30).
+                velocity_shift_transport += neighbor_volume * (neighbor_density * neighbor_velocity + self_density * self_velocity)
+                                          / self_density * dot(0.5 * (self_shift + neighbor_shift), raw_gradient);
             }
         }
     }
