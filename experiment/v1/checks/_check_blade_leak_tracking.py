@@ -140,6 +140,9 @@ def run(arguments):
             while simulator.step_count < end:
                 simulator.step()
                 step = simulator.step_count
+                if step % 1000 == 0:
+                    # the reports below read the same buffers many times: once is enough
+                    simulator.begin_readback_cache()
                 if slice_directory is not None and simulator.simulation_time >= slice_index * arguments.slice_interval:
                     positions = simulator.readback_positions()
                     fluid = simulator.live_slot_mask(positions) & (simulator.readback_material() == 0)
@@ -227,6 +230,7 @@ def run(arguments):
                     frames[f"uid_{index}"] = simulator.readback_particle_uid()[near]
                     frames[f"pos_{index}"] = positions[near, :3].copy()
                     times.append(simulator.simulation_time); angles.append(simulator.rotor_angle); steps.append(step)
+                simulator.end_readback_cache()
             status = simulator.readback_global_status()
             mass = float(simulator.readback_velocity_mass()[1, 3])
             if torque_log is not None:

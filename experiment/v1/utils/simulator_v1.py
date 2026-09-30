@@ -239,6 +239,7 @@ class SphSimulatorV1:
         self.simulation_time = 0.0
         self.step_count = 0
         self.rotor_angle = 0.0          # theta written for the most recent step (rad)
+        self._readback_cache = None     # see begin_readback_cache()
 
         # ---- Pre-flight + setup pipeline -------------------------------------
         self._check_workgroup_limit()
@@ -654,6 +655,7 @@ class SphSimulatorV1:
         return data
 
     def _staging_upload(self, dest: Buffer, payload: bytes) -> None:
+        self._readback_cache = None
         if len(payload) > dest.size:
             raise ValueError(
                 f"upload payload ({len(payload)} B) > dest buffer ({dest.size} B)")
@@ -1349,6 +1351,7 @@ class SphSimulatorV1:
         self.rotor_angle = theta
 
     def step(self, *, wait: bool = True) -> None:
+        self._readback_cache = None
         cmd = self.step_cmd
         if self.case.rotor is not None or self._injection_staging is not None:
             if not wait:
@@ -1408,7 +1411,28 @@ class SphSimulatorV1:
     # Section 8: Readback + render hook
     # ==================================================================
 
+    def begin_readback_cache(self) -> None:
+        """From here to end_readback_cache() (or the next step or upload) every
+        buffer is read back at most once (2026-09-30). The reports of the check
+        scripts read the same buffers many times: on the 2 mm tank (4.3 M
+        particles) one report of the blade run made about 30 read backs of
+        80 MB each and took 15 to 66 s, against 30 to 37 s for the 1000 steps
+        between two reports. The state must not change while the cache is on."""
+        self._readback_cache = {}
+
+    def end_readback_cache(self) -> None:
+        self._readback_cache = None
+
     def _readback_buffer(self, buffer: Buffer) -> bytes:
+        cache = self._readback_cache
+        if cache is not None and id(buffer) in cache:
+            return cache[id(buffer)]
+        data = self._readback_buffer_uncached(buffer)
+        if cache is not None:
+            cache[id(buffer)] = data
+        return data
+
+    def _readback_buffer_uncached(self, buffer: Buffer) -> bytes:
         staging = self._allocate_buffer(
             size=buffer.size,
             usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT,
