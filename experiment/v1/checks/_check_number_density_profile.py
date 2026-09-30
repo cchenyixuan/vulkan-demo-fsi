@@ -63,6 +63,11 @@ def main():
                      ("3/4", y_low + 0.75 * height - 0.5 * thickness, y_low + 0.75 * height + 0.5 * thickness),
                      ("lid-1", y_high - 2.0 * thickness, y_high - thickness),
                      ("lid", y_high - thickness, y_high)]
+            # slab edges snapped to the lattice mid-planes (y_low + k dx): an edge on a lattice layer
+            # counts that layer at step 0 (float rounding) and loses it as soon as the layer moves,
+            # which showed as a spurious 67 % in the mid-height slab of the 4 mm tank (2026-09-30)
+            bands = [(name, y_low + round((y0 - y_low) / dx) * dx, y_low + round((y1 - y_low) / dx) * dx)
+                     for name, y0, y1 in bands]
             print(f"fluid {int(fluid.sum()):,} particles, y {y_low:.4f} .. {y_high:.4f} m, slabs {thickness * 1e3:.1f} mm: "
                   + ", ".join(f"{name} {y0 * 1e3:.0f}..{y1 * 1e3:.0f}" for name, y0, y1 in bands))
             reference_count = None
