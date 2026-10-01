@@ -24,6 +24,11 @@ Options:
     --scalar-snapshot-times T [T ...]
                          scalar cases: save FLUID positions, uid and fields at the first step
                          with t >= T (--scalar-snapshot-dir, --scalar-snapshot-fields)
+    --lifeline-dir DIR   lifelines (2026-10-01): record a fixed random sample of FLUID particles
+                         (persistent uid) every --lifeline-every steps from --lifeline-start on:
+                         positions, optionally --lifeline-fields, and with --lifeline-aux the
+                         velocity and shift every --lifeline-aux-every records
+                         (experiment/v1/utils/lifeline_recorder.py)
 
 Note: the solver is not bit-reproducible run to run (voxel incoming lists are
 filled by atomics), so compare dumps against the run-to-run noise of an
@@ -47,6 +52,7 @@ from utils.sph.vulkan_context import VulkanContext
 
 from experiment.v1 import compile_shaders_v1
 from experiment.v1.utils.simulator_v1 import SphSimulatorV1
+from experiment.v1.utils.lifeline_recorder import LifelineRecorder
 
 
 DEFAULT_CASE = "cases/lid_driven_cavity_2d/case.yaml"
@@ -89,6 +95,25 @@ def parse_args() -> argparse.Namespace:
                         help="output directory of --scalar-snapshot-times (snapshot_<step>.npz)")
     parser.add_argument("--scalar-snapshot-fields", type=str, nargs="+", default=None, metavar="FIELD",
                         help="fields stored in the snapshots (default: all)")
+    parser.add_argument("--lifeline-dir", type=str, default=None, metavar="DIR",
+                        help="record lifelines of a sample of FLUID particles into DIR (2026-10-01)")
+    parser.add_argument("--lifeline-count", type=int, default=10000, metavar="K",
+                        help="number of sampled fluid particles (default 10000)")
+    parser.add_argument("--lifeline-every", type=int, default=0, metavar="N",
+                        help="record every N steps (default: the step count closest to 0.03 s)")
+    parser.add_argument("--lifeline-start", type=float, default=0.0, metavar="T",
+                        help="first record at simulation time >= T (s); the sample is drawn then")
+    parser.add_argument("--lifeline-seed", type=int, default=1, help="seed of the random sample")
+    parser.add_argument("--lifeline-chunk-seconds", type=float, default=10.0,
+                        help="flow time per output file (default 10 s)")
+    parser.add_argument("--lifeline-fields", type=str, nargs="+", default=None, metavar="FIELD",
+                        help="scalar fields recorded along the lifelines (default: none)")
+    parser.add_argument("--lifeline-aux", action="store_true",
+                        help="also record velocity and particle shift every --lifeline-aux-every records")
+    parser.add_argument("--lifeline-aux-every", type=int, default=10, metavar="M")
+    parser.add_argument("--lifeline-release-sphere", type=float, nargs=4, default=None,
+                        metavar=("X", "Y", "Z", "R"),
+                        help="draw the sample only from fluid particles inside this sphere (m) at the start")
     return parser.parse_args()
 
 
@@ -134,7 +159,17 @@ def main() -> None:
         try:
             sim.bootstrap()
             start = time.perf_counter()
-            sampling = args.torque_every > 0 or args.probe_every > 0 or bool(args.scalar_snapshot_times)
+            sampling = (args.torque_every > 0 or args.probe_every > 0 or bool(args.scalar_snapshot_times)
+                        or args.lifeline_dir is not None)
+            recorder = None
+            if args.lifeline_dir is not None:
+                every = args.lifeline_every if args.lifeline_every > 0 else max(1, round(0.03 / case.timestep))
+                recorder = LifelineRecorder(
+                    sim, args.lifeline_dir, count=args.lifeline_count, every=every,
+                    start_time=args.lifeline_start, seed=args.lifeline_seed,
+                    chunk_records=max(1, round(args.lifeline_chunk_seconds / (every * case.timestep))),
+                    fields=args.lifeline_fields, aux=args.lifeline_aux, aux_every=args.lifeline_aux_every,
+                    release_sphere=args.lifeline_release_sphere)
             if args.torque_every > 0 and case.rotor is None:
                 raise SystemExit("--torque-every needs a case with a rotor")
             if args.probe_every > 0 and (case.scalars is None or case.scalars.probes is None):
@@ -239,6 +274,10 @@ def main() -> None:
                           f"scalar snapshot -> {snapshot_path}")
                     while snapshot_times and sim.simulation_time >= snapshot_times[0] - half_step:
                         snapshot_times.pop(0)
+                if recorder is not None and recorder.due():
+                    recorder.record()
+            if recorder is not None:
+                recorder.close()
             for handle in (torque_log, probe_log):
                 if handle is not None:
                     handle.close()
