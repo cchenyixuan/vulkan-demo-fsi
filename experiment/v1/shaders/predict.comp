@@ -178,6 +178,40 @@ void main() {
             uint index = scalar_index(self_particle_id, vec4_index);
             vec4 delta = scalar_delta[index];
             precise vec4 value = scalar[index];
+            // Continuous sources (2026-10-01): every FLUID particle inside the sphere at x_{n+1}
+            // gains value.x; the recording field (value.y - 1) gains the same amount.
+            if (USE_SCALAR_INJECTION) {
+                for (uint slot_index = 0u; slot_index < MAX_INJECTION_SLOTS; slot_index++) {
+                    ScalarInjectionSlot slot = scalar_injection[slot_index];
+                    if (slot.target.x == 0u || slot.target.y != vec4_index || slot.target.w != 1u) continue;
+                    vec3 offset = new_position - slot.center_radius_squared.xyz;
+                    if (dot(offset, offset) < slot.center_radius_squared.w) {
+                        delta[min(slot.target.z, 3u)] += slot.value.x;
+                        uint record = uint(max(slot.value.y, 0.0) + 0.5);
+                        if (record > 0u) {
+                            delta[min(record - 1u, 3u)] += slot.value.x;
+                        }
+                    }
+                }
+            }
+            // Monod uptake (2026-10-01, see REACTION_MODE in common.glsl), on the substrate after
+            // the transport increment and the source; folded into the compensated increment.
+            if (REACTION_MODE == 1u && vec4_index == (REACTION_LAYOUT & 15u)) {
+                uint substrate_component = (REACTION_LAYOUT >> 4u) & 15u;
+                uint biomass_component   = (REACTION_LAYOUT >> 8u) & 15u;
+                uint uptake_component    = (REACTION_LAYOUT >> 12u) & 15u;
+                float substrate = max(value[min(substrate_component, 3u)] + delta[min(substrate_component, 3u)], 0.0);
+                float biomass   = max(value[min(biomass_component, 3u)] + delta[min(biomass_component, 3u)], 0.0);
+                float rate_factor = REACTION_Q_MAX * biomass * TIMESTEP / (REACTION_HALF_SATURATION + substrate);
+                float uptake = substrate * rate_factor / (1.0 + rate_factor);
+                delta[min(substrate_component, 3u)] -= uptake;
+                if (uptake_component < 4u) {
+                    delta[uptake_component] += uptake;
+                }
+                if (REACTION_YIELD != 0.0) {
+                    delta[min(biomass_component, 3u)] += REACTION_YIELD * uptake;
+                }
+            }
             precise vec4 compensation = vec4(0.0);
             if (USE_SCALAR_COMPENSATED_SUM) {
                 // Kahan (1965): value holds the running sum, compensation the
@@ -195,7 +229,7 @@ void main() {
             if (USE_SCALAR_INJECTION) {
                 for (uint slot_index = 0u; slot_index < MAX_INJECTION_SLOTS; slot_index++) {
                     ScalarInjectionSlot slot = scalar_injection[slot_index];
-                    if (slot.target.x == 0u || slot.target.y != vec4_index) continue;
+                    if (slot.target.x == 0u || slot.target.y != vec4_index || slot.target.w != 0u) continue;
                     vec3 offset = new_position - slot.center_radius_squared.xyz;
                     if (dot(offset, offset) < slot.center_radius_squared.w) {
                         value[slot.target.z] = slot.value.x;

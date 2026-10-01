@@ -118,6 +118,11 @@ SPEC_ID_SOLID_PRESSURE_MODE                 = 35
 SPEC_ID_SOLID_DENSITY_FLOOR                 = 73
 SPEC_ID_SHIFT_TRANSPORT_MODE                = 76
 SPEC_ID_USE_MOMENTUM_SGS                    = 77
+SPEC_ID_REACTION_MODE                       = 79
+SPEC_ID_REACTION_LAYOUT                     = 89
+SPEC_ID_REACTION_Q_MAX                      = 90
+SPEC_ID_REACTION_HALF_SATURATION            = 91
+SPEC_ID_REACTION_YIELD                      = 92
 SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
@@ -257,7 +262,7 @@ class SphSimulatorV1:
         # copied into the device-local scalar_injection buffer by the step cmd).
         self._injection_staging: Optional[Buffer] = None
         self._injection_staging_mapped = None
-        if self.case.scalars is not None and self.case.scalars.injections:
+        if self.case.scalars is not None and (self.case.scalars.injections or self.case.scalars.sources):
             self._injection_staging = self._allocate_buffer(
                 size=MAX_INJECTION_SLOTS * INJECTION_SLOT_BYTES,
                 usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -972,7 +977,12 @@ class SphSimulatorV1:
                                                          if case.scalars is not None else 1.0), 'f'),
             (SPEC_ID_USE_SCALAR_SHIFT_CORRECTION,  1 if case.scalars is not None and case.scalars.shift_correction else 0, 'I'),
             (SPEC_ID_USE_SCALAR_COMPENSATED_SUM,   1 if case.scalars is None or case.scalars.compensated_sum else 0, 'I'),
-            (SPEC_ID_USE_SCALAR_INJECTION,         1 if case.scalars is not None and case.scalars.injections else 0, 'I'),
+            (SPEC_ID_USE_SCALAR_INJECTION,         1 if case.scalars is not None and (case.scalars.injections or case.scalars.sources) else 0, 'I'),
+            (SPEC_ID_REACTION_MODE,                1 if case.scalars is not None and case.scalars.reactions else 0, 'I'),
+            (SPEC_ID_REACTION_LAYOUT,              case.scalars.reaction_layout() if case.scalars is not None else 0, 'I'),
+            (SPEC_ID_REACTION_Q_MAX,               float(case.scalars.reactions[0].q_max) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_REACTION_HALF_SATURATION,     float(case.scalars.reactions[0].k_s) if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
+            (SPEC_ID_REACTION_YIELD,               float(case.scalars.reactions[0].growth_yield) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_USE_SCALAR_BOUNDS_LIMITER,    1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
             (SPEC_ID_SCALAR_FIELD_COUNT,           0 if case.scalars is None else len(case.scalars.fields), 'I'),
             (SPEC_ID_LEADING_GHOST_VOXEL_COUNT,    0,                                         'I'),
@@ -1719,25 +1729,46 @@ class SphSimulatorV1:
         return [injection for injection in self.case.scalars.injections
                 if injection.start <= time_next < injection.start + injection.duration]
 
+    def active_sources(self, time_next: float) -> list:
+        """Continuous sources active for the step that ends at time_next (2026-10-01)."""
+        if self.case.scalars is None:
+            return []
+        return [source for source in self.case.scalars.sources if source.start <= time_next < source.end]
+
+    def source_increment(self, source) -> float:
+        """Amount added per step to every fluid particle inside the source sphere:
+        rate dt / (rho0 V), V = 4/3 pi R^3, rho0 of the first fluid material."""
+        fluid = [m for m in self.case.materials if m.kind == KIND_FLUID]
+        rest_density = float(fluid[0].rest_density)
+        volume = 4.0 / 3.0 * np.pi * source.radius ** 3
+        return source.rate * self.case.timestep / (rest_density * volume)
+
     def _injection_write_state(self, time_next: float) -> None:
         """Fill the host-visible injection staging buffer for the step
         that ends at time_next (layout = ScalarInjectionSlot in common.glsl:
-        vec4 centre + r^2, vec4 value, uvec4 active / vec4 index / component)."""
-        active = self.active_injections(time_next)
+        vec4 centre + r^2, vec4 value, uvec4 active / vec4 index / component / mode).
+        Mode 0 = tracer pulse, mode 1 = continuous source (2026-10-01)."""
+        active = [(injection, 0) for injection in self.active_injections(time_next)]
+        active += [(source, 1) for source in self.active_sources(time_next)]
         if len(active) > MAX_INJECTION_SLOTS:
             raise RuntimeError(
-                f"{len(active)} injections active at t={time_next:.6f} s, "
+                f"{len(active)} injections / sources active at t={time_next:.6f} s, "
                 f"more than MAX_INJECTION_SLOTS={MAX_INJECTION_SLOTS}")
         blob = bytearray()
         for slot in range(MAX_INJECTION_SLOTS):
             if slot < len(active):
-                injection = active[slot]
-                vec4_index, component = self.case.scalars.field_location(injection.field)
+                item, mode = active[slot]
+                vec4_index, component = self.case.scalars.field_location(item.field)
+                if mode == 0:
+                    value, record = item.value, 0.0
+                else:
+                    value = self.source_increment(item)
+                    record = 0.0 if item.record is None else float(self.case.scalars.field_location(item.record)[1] + 1)
                 blob += struct.pack("4f4f4I",
-                                    injection.center[0], injection.center[1], injection.center[2],
-                                    injection.radius * injection.radius,
-                                    injection.value, 0.0, 0.0, 0.0,
-                                    1, vec4_index, component, 0)
+                                    item.center[0], item.center[1], item.center[2],
+                                    item.radius * item.radius,
+                                    value, record, 0.0, 0.0,
+                                    1, vec4_index, component, mode)
             else:
                 blob += b"\x00" * INJECTION_SLOT_BYTES
         self._injection_staging_mapped[:len(blob)] = bytes(blob)

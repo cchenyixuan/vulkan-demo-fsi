@@ -412,6 +412,19 @@ layout(constant_id = 70) const bool  USE_SCALAR_BOUNDS_LIMITER = true;
 // the last vec4 are compile-time zeros after specialization and their
 // arithmetic and registers disappear (7 % of force's time with one field).
 layout(constant_id = 71) const uint  SCALAR_FIELD_COUNT = 0u;
+// Monod uptake by the biomass carried on the FLUID particles (scalars.reactions,
+// 2026-10-01, stage 3 of the lifeline study). Per particle and step, applied by
+// predict.comp to the substrate C after the transport increment:
+//     a  = q_max X dt / (K_s + C),   dC = C a / (1 + a)     (linearised implicit, C >= 0)
+//     C -= dC,   U += dC (cumulative uptake),   X += Y dC (growth, Y = 0: off)
+// The three fields share one vec4. REACTION_LAYOUT packs
+//     vec4 index | substrate component << 4 | biomass << 8 | uptake << 12
+// (component 4 = no uptake field). REACTION_MODE 0 compiles it out.
+layout(constant_id = 79) const uint  REACTION_MODE = 0u;
+layout(constant_id = 89) const uint  REACTION_LAYOUT = 0u;
+layout(constant_id = 90) const float REACTION_Q_MAX = 0.0;            // [substrate] / ([biomass] s)
+layout(constant_id = 91) const float REACTION_HALF_SATURATION = 1.0;  // K_s, [substrate]
+layout(constant_id = 92) const float REACTION_YIELD = 0.0;            // [biomass] / [substrate]
 
 // --- Multi-GPU ghost (V1 merged-buffer scheme) ---
 // V1 partitions along X. The voxel_id encoding (helpers.glsl) is "x-slowest"
@@ -926,8 +939,12 @@ layout(std430, set = 3, binding = 10) buffer ScalarParametersBuffer {
 // ----------------------------------------------------------------------------
 struct ScalarInjectionSlot {
     vec4  center_radius_squared;   // xyz = centre (m), w = radius^2 (m^2)
-    vec4  value;                   // x = value imposed inside the sphere
-    uvec4 target;                  // x = active (0 / 1), y = vec4 index v, z = component c
+    vec4  value;                   // x = value imposed (pulse) or added per step (source)
+                                   // y = source only: component + 1 of the field that records the
+                                   //     added amount (same vec4), 0 = none
+    uvec4 target;                  // x = active (0 / 1), y = vec4 index v, z = component c,
+                                   // w = mode: 0 pulse (set to value.x), 1 continuous source
+                                   //     (add value.x every step, 2026-10-01)
 };  // 48 B
 
 layout(std430, set = 3, binding = 11) buffer ScalarInjectionBuffer {

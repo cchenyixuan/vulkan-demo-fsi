@@ -637,18 +637,50 @@ def write_preview(path, fluid, wall, rotor, dx):
     plt.close(fig)
 
 
+# Monod kinetics of Haringa (2023, Eng. Life Sci. 23:e2100159; P. chrysogenum, 54 m3):
+# q_max = 1600 umol / (g h), K_s = 7.8 umol / kg, C_x = 55 g / kg, initial C_s = 10 K_s.
+HARINGA_Q_MAX_UMOL_PER_G_H = 1600.0
+HARINGA_K_S = 7.8e-6
+HARINGA_BIOMASS = 55.0
+
+
 def scalars_block(args, h) -> str:
-    """`scalars:` block for the mixing-time runs (2026-09-27): one tracer field
-    per pulse (so the pulses do not contaminate each other's t95), injection at
-    the paper's point, the two measurement points as probes (Shepard radius = h)."""
+    """`scalars:` block (2026-09-27, extended 2026-10-01).
+    Substrate setup (--substrate): fields substrate, biomass, uptake, feed (one vec4; mol/kg, g/kg),
+    Monod uptake unless --no-uptake, a continuous feed sphere (default: the paper's injection point).
+    Mixing-time runs (--tracers N): one tracer field per pulse (so the pulses do not contaminate
+    each other's t95), injection at the paper's point. Probes at the paper's two measurement
+    points (Shepard radius = h)."""
     lines = ["", "# Scalar transport (2026-09-27): tracer pulses at the injection point of",
              "# Rautenbach et al. (2026) Table 1, probes at its two measurement points.",
+             "# Substrate setup (2026-10-01, stage 3): Monod uptake by biomass on the fluid particles,",
+             "# continuous feed (log/2026-10-01_reaction-and-feed.md).",
              "scalars:", "  fields:"]
+    sgs_flag = "true" if args.sgs else "false"
+    if args.substrate:
+        initial = args.substrate_initial if args.substrate_initial is not None else 10.0 * args.k_s
+        lines.append(f"    - {{name: substrate, diffusivity: {args.substrate_diffusivity:.3e}, turbulent: true, "
+                     f"initial: {initial:.6e}}}")
+        lines.append(f"    - {{name: biomass, diffusivity: 0.0, turbulent: false, initial: {args.biomass:.6e}}}")
+        lines.append("    - {name: uptake, diffusivity: 0.0, turbulent: false, initial: 0.0}")
+        lines.append("    - {name: feed, diffusivity: 0.0, turbulent: false, initial: 0.0}")
     for index in range(args.tracers):
         lines.append(f"    - {{name: tracer_{index + 1:02d}, diffusivity: {args.tracer_diffusivity:.3e}, "
                      f"turbulent: true, initial: 0.0}}")
-    lines += ["  sgs:", f"    enabled: {'true' if args.sgs else 'false'}", "    smagorinsky_cs: 0.1",
-              "    turbulent_schmidt: 0.7", "  injections:"]
+    lines += ["  sgs:", f"    enabled: {sgs_flag}", "    smagorinsky_cs: 0.1",
+              "    turbulent_schmidt: 0.7"]
+    if args.substrate:
+        q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
+        if not args.no_uptake:
+            lines += ["  reactions:",
+                      f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
+                      f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: {args.growth_yield:.6e}}}"]
+        center = args.feed_center if args.feed_center is not None else INJECTION_POINT
+        stop = "" if args.feed_stop is None else f", stop: {args.feed_stop:.4f}"
+        lines += ["  sources:",
+                  f"    - {{field: substrate, center: [{center[0]}, {center[1]}, {center[2]}], radius: {args.feed_radius:.4f}, "
+                  f"rate: {args.feed_rate:.6e}, start: {args.feed_start:.4f}{stop}, record: feed}}"]
+    lines.append("  injections:" if args.tracers > 0 else "  injections: []")
     for index in range(args.tracers):
         start = args.injection_start + index * args.injection_interval
         lines.append(f"    - {{field: tracer_{index + 1:02d}, center: [{INJECTION_POINT[0]}, {INJECTION_POINT[1]}, "
@@ -765,6 +797,23 @@ def main() -> int:
     parser.add_argument("--shift-correction", action="store_true",
                         help="interpolate the tracers along the particle shift (scalars.shift_correction; "
                              "default off: the tracers move with the particles)")
+    parser.add_argument("--substrate", action="store_true",
+                        help="stage 3 (2026-10-01): fields substrate, biomass, uptake, feed with Monod uptake and a "
+                             "continuous feed sphere (see the --q-max ... --feed-* options)")
+    parser.add_argument("--q-max-umol-per-g-h", type=float, default=HARINGA_Q_MAX_UMOL_PER_G_H,
+                        help="Monod maximum uptake rate, umol / (g h) (default Haringa 2023: 1600)")
+    parser.add_argument("--k-s", type=float, default=HARINGA_K_S, help="Monod half-saturation, mol / kg (7.8e-6)")
+    parser.add_argument("--biomass", type=float, default=HARINGA_BIOMASS, help="biomass, g / kg (55)")
+    parser.add_argument("--growth-yield", type=float, default=0.0, help="g biomass / mol substrate (0: no growth)")
+    parser.add_argument("--substrate-initial", type=float, default=None, help="initial substrate, mol / kg (10 K_s)")
+    parser.add_argument("--substrate-diffusivity", type=float, default=6.0e-10, help="m^2 / s (glucose in water)")
+    parser.add_argument("--no-uptake", action="store_true", help="substrate setup without the Monod sink (pure tracer feed)")
+    parser.add_argument("--feed-rate", type=float, default=2.0e-4,
+                        help="feed, mol / s (default 2.0e-4: mean q / q_max about 0.28 in 29.5 L, as in Haringa 2023)")
+    parser.add_argument("--feed-center", type=float, nargs=3, default=None, help="feed sphere centre (default: injection point)")
+    parser.add_argument("--feed-radius", type=float, default=0.02, help="feed sphere radius, m (0.02)")
+    parser.add_argument("--feed-start", type=float, default=0.0, help="feed start, s")
+    parser.add_argument("--feed-stop", type=float, default=None, help="feed stop, s (default: never)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
@@ -985,11 +1034,17 @@ def main() -> int:
                                           f"  thin_plate_dashpot: {args.thin_plate_dashpot:g}\n  use_pst: true")
     (out / "case.yaml").write_text(case_text, encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity), encoding="utf-8")
-    if args.tracers > 0:
+    if args.tracers > 0 or args.substrate:
+        if args.tracers + (4 if args.substrate else 0) > 12:
+            parser.error("at most 12 scalar fields: --substrate uses 4, so --tracers <= 8")
         with open(out / "case.yaml", "a", encoding="utf-8") as handle:
             handle.write(scalars_block(args, h))
         print(f"scalars: {args.tracers} tracer(s), pulses from t = {args.injection_start} s every "
               f"{args.injection_interval} s, radius {args.injection_radius:.4f} m, sgs={'on' if args.sgs else 'off'}")
+        if args.substrate:
+            print(f"substrate: Monod q_max {args.q_max_umol_per_g_h:g} umol/(g h), K_s {args.k_s:.2e} mol/kg, "
+                  f"X {args.biomass:g} g/kg, uptake {'off' if args.no_uptake else 'on'}; feed {args.feed_rate:.3e} mol/s "
+                  f"from t = {args.feed_start:g} s, sphere r = {args.feed_radius:g} m")
     print(f"wrote fluid.obj wall.obj rotor.obj frame.obj case.yaml materials.yaml -> {out}")
     if not args.no_preview:
         write_preview(out / "split_preview.png", fluid, wall, rotor, dx)

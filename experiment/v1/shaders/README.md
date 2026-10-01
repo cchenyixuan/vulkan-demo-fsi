@@ -306,6 +306,8 @@ compile `_test_common.comp` by hand as a regression check after
            0 lets the lid hold the top fluid layers under gravity, log/2026-09-30_gravity-drift-root-cause.md)
 76       : SHIFT_TRANSPORT_MODE (2026-09-30; transport terms of the particle shift: 0 none (original), 1 density,
            2 momentum, 3 both; density.comp accumulates both, log/2026-09-30_shift-transport.md)
+79, 89-92: REACTION_MODE, REACTION_LAYOUT, REACTION_Q_MAX, REACTION_HALF_SATURATION, REACTION_YIELD
+           (2026-10-01; Monod uptake in predict.comp, log/2026-10-01_reaction-and-feed.md)
 77, 78   : USE_MOMENTUM_SGS, MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01; Smagorinsky nu_t added to the viscosity of
            fluid-fluid pairs in force.comp, nu_t from density.comp; log/2026-10-01_momentum-sgs.md)
 49       : THIN_PLATE_COUNT (2026-09-30, plates builds only)

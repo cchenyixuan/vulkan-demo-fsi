@@ -31,7 +31,7 @@ V0 scope:
 import math
 import pathlib
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import Callable, NamedTuple, Optional
 
 import numpy as np
@@ -687,6 +687,67 @@ class ScalarProbesConfig:
                 raise ValueError(f"scalars.probes.radius must be > 0, got {self.radius}")
 
 
+@dataclass
+class ScalarReactionConfig:
+    """Monod uptake by biomass carried on the FLUID particles (``scalars.reactions`` entry,
+    2026-10-01, stage 3; REACTION_MODE in common.glsl). Per particle and step, with the substrate C
+    after the transport increment:
+        a = q_max X dt / (k_s + C),   dC = C a / (1 + a)   (linearised implicit: C stays >= 0)
+        C -= dC,   uptake += dC,   X += yield dC
+    ``q_max`` in [substrate] / ([biomass] s), ``k_s`` in [substrate], ``yield`` (case.yaml key) in
+    [biomass] / [substrate], 0 = no growth. substrate, biomass and uptake must share one vec4
+    (fields are packed four per vec4 in declaration order)."""
+    type: str
+    substrate: str
+    biomass: str
+    q_max: float
+    k_s: float
+    uptake: Optional[str] = None
+    growth_yield: float = 0.0
+
+    def __post_init__(self):
+        if self.type != "monod":
+            raise ValueError(f"scalars.reactions: only type 'monod' is supported, got {self.type!r}")
+        self.q_max = float(self.q_max)
+        self.k_s = float(self.k_s)
+        self.growth_yield = float(self.growth_yield)
+        if self.q_max < 0.0 or self.k_s <= 0.0:
+            raise ValueError("scalars.reactions: q_max must be >= 0 and k_s > 0")
+
+
+@dataclass
+class ScalarSourceConfig:
+    """Continuous source (``scalars.sources`` entry, 2026-10-01): while start <= t < stop, every
+    FLUID particle inside the sphere gains rate dt / (rho0 V) of ``field`` per step, V = 4/3 pi R^3,
+    rho0 the rest density of the fluid; for a specific concentration (per kg) ``rate`` is the amount
+    added per second. The number of particles in the sphere fluctuates, so the amount actually added
+    differs from rate t by that fluctuation; ``record`` (a field in the same vec4) accumulates the
+    added amount per particle, which makes the budget exact."""
+    field: str
+    center: tuple[float, float, float]
+    radius: float
+    rate: float
+    start: float = 0.0
+    stop: Optional[float] = None
+    record: Optional[str] = None
+
+    def __post_init__(self):
+        center = tuple(float(component) for component in self.center)
+        if len(center) != 3:
+            raise ValueError(f"scalars.sources: center must have 3 components, got {self.center}")
+        self.center = center
+        self.radius = float(self.radius)
+        self.rate = float(self.rate)
+        self.start = float(self.start)
+        self.stop = None if self.stop is None else float(self.stop)
+        if self.radius <= 0.0:
+            raise ValueError(f"scalars.sources[{self.field}]: radius must be > 0")
+
+    @property
+    def end(self) -> float:
+        return math.inf if self.stop is None else self.stop
+
+
 MAX_SCALAR_FIELDS = 12              # 4 * MAX_SCALAR_VEC4 in common.glsl
 MAX_INJECTION_SLOTS = 4             # MAX_INJECTION_SLOTS in common.glsl
 
@@ -712,6 +773,8 @@ class ScalarsConfig:
     shift_correction: bool = False
     compensated_sum: bool = True
     bounds_limiter: bool = True
+    reactions: list = dataclass_field(default_factory=list)      # ScalarReactionConfig, at most one (2026-10-01)
+    sources: list = dataclass_field(default_factory=list)        # ScalarSourceConfig (2026-10-01)
 
     def __post_init__(self):
         if not 1 <= len(self.fields) <= MAX_SCALAR_FIELDS:
@@ -724,9 +787,27 @@ class ScalarsConfig:
             if injection.field not in names:
                 raise ValueError(
                     f"scalars.injections: unknown field {injection.field!r} (fields: {names})")
-        # At most MAX_INJECTION_SLOTS pulses may be active at the same time.
+        for source in self.sources:
+            for name in (source.field, source.record):
+                if name is not None and name not in names:
+                    raise ValueError(f"scalars.sources: unknown field {name!r} (fields: {names})")
+            if source.record is not None and names.index(source.record) // 4 != names.index(source.field) // 4:
+                raise ValueError(f"scalars.sources: record field {source.record!r} must share the vec4 of "
+                                 f"{source.field!r} (declare them among the same four consecutive fields)")
+        if len(self.reactions) > 1:
+            raise ValueError("scalars.reactions: at most one reaction is supported")
+        for reaction in self.reactions:
+            used = [reaction.substrate, reaction.biomass] + ([reaction.uptake] if reaction.uptake else [])
+            for name in used:
+                if name not in names:
+                    raise ValueError(f"scalars.reactions: unknown field {name!r} (fields: {names})")
+            if len({names.index(name) // 4 for name in used}) != 1:
+                raise ValueError("scalars.reactions: substrate, biomass and uptake must share one vec4")
+        # At most MAX_INJECTION_SLOTS pulses and sources may be active at the same time.
         events = sorted([(i.start, 1) for i in self.injections]
-                        + [(i.start + i.duration, -1) for i in self.injections],
+                        + [(i.start + i.duration, -1) for i in self.injections]
+                        + [(s.start, 1) for s in self.sources]
+                        + [(s.end, -1) for s in self.sources],
                         key=lambda event: (event[0], event[1]))
         active = 0
         for _, change in events:
@@ -751,10 +832,20 @@ class ScalarsConfig:
         field_index = self.field_names.index(name)
         return field_index // 4, field_index % 4
 
+    def reaction_layout(self) -> int:
+        """REACTION_LAYOUT spec constant (0 without a reaction)."""
+        if not self.reactions:
+            return 0
+        reaction = self.reactions[0]
+        vec4_index, substrate = self.field_location(reaction.substrate)
+        biomass = self.field_location(reaction.biomass)[1]
+        uptake = self.field_location(reaction.uptake)[1] if reaction.uptake else 4
+        return vec4_index | (substrate << 4) | (biomass << 8) | (uptake << 12)
+
 
 def _parse_scalars(data: dict, source: str) -> "ScalarsConfig":
     allowed = {"fields", "sgs", "injections", "probes", "shift_correction", "compensated_sum",
-               "bounds_limiter"}
+               "bounds_limiter", "reactions", "sources"}
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"{source}: unknown keys in `scalars:` block: {sorted(unknown)}")
@@ -773,6 +864,10 @@ def _parse_scalars(data: dict, source: str) -> "ScalarsConfig":
         shift_correction=data.get("shift_correction", False),
         compensated_sum=data.get("compensated_sum", True),
         bounds_limiter=data.get("bounds_limiter", True),
+        reactions=[ScalarReactionConfig(**{("growth_yield" if key == "yield" else key): value
+                                           for key, value in reaction.items()})
+                   for reaction in (data.get("reactions") or [])],
+        sources=[ScalarSourceConfig(**source) for source in (data.get("sources") or [])],
     )
 
 
@@ -1171,6 +1266,11 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (36,  lambda case: 1 if case.numerics.solid_reaction_force else 0, 'I'),  # USE_SOLID_REACTION_FORCE
     (73,  lambda case: 1 if case.numerics.solid_density_floor else 0, 'I'),  # SOLID_DENSITY_FLOOR
     (76,  lambda case: SHIFT_TRANSPORT_MODES[case.numerics.shift_transport], 'I'),  # SHIFT_TRANSPORT_MODE
+    (79,  lambda case: 1 if case.scalars is not None and case.scalars.reactions else 0, 'I'),  # REACTION_MODE
+    (89,  lambda case: case.scalars.reaction_layout() if case.scalars is not None else 0, 'I'),  # REACTION_LAYOUT
+    (90,  lambda case: case.scalars.reactions[0].q_max if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (91,  lambda case: case.scalars.reactions[0].k_s if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
+    (92,  lambda case: case.scalars.reactions[0].growth_yield if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
@@ -1203,7 +1303,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (66,  lambda case: (1.0 / case.scalars.sgs.turbulent_schmidt) if case.scalars is not None else 1.0, 'f'),
     (67,  lambda case: 1 if case.scalars is not None and case.scalars.shift_correction else 0, 'I'),
     (68,  lambda case: 1 if case.scalars is None or case.scalars.compensated_sum else 0, 'I'),
-    (69,  lambda case: 1 if case.scalars is not None and case.scalars.injections else 0, 'I'),
+    (69,  lambda case: 1 if case.scalars is not None and (case.scalars.injections or case.scalars.sources) else 0, 'I'),
     (70,  lambda case: 1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
     (71,  lambda case: 0 if case.scalars is None else len(case.scalars.fields), 'I'),  # SCALAR_FIELD_COUNT
     # 56-61 rotor axis / pivot (world coords); defaults when no rotor block.
