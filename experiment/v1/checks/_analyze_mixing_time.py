@@ -22,7 +22,7 @@ end of the run, as Table 2 of the paper does over 25-75 s.
 
 Usage (repo root):
   our run:  python experiment/v1/checks/_analyze_mixing_time.py PROBE_LOG.csv --case CASE.yaml
-                [--torque-log TORQUE.csv] [--snapshots DIR] [--slice-field tracer_01]
+                [--torque-log TORQUE.csv] [--mass-factor 1.2187] [--snapshots DIR] [--slice-field tracer_01]
                 [--out-dir DIR] [--label NAME]
   dataset:  python experiment/v1/checks/_analyze_mixing_time.py --mstar PROBE_1.txt PROBE_2.txt
                 (one M-Star trial of DARUS-5523, 02_simulation_results/01_mixing_time_results/
@@ -245,11 +245,15 @@ def analyze_run(arguments):
         if window.sum() > 2:
             scale = 998.0 * (200.0 / 60.0) ** 3 * 0.096 ** 5
             omega = 2.0 * math.pi * 200.0 / 60.0
-            power_number = np.abs(torque["torque_axis"][window]) * omega / scale
+            # the readback torque carries the particle mass rho0 V_p, V_p = mass_factor dx^3 (calibrated volume)
+            torque_value = np.abs(torque["torque_axis"][window]) / arguments.mass_factor
+            power_number = torque_value * omega / scale
             power = {"window_start": 20.0, "power_number": float(power_number.mean()),
-                     "power_number_std": float(power_number.std(ddof=1)), "samples": int(window.sum())}
-            print(f"  power number (t >= 20 s, readback torque): {power['power_number']:.2f} +- "
-                  f"{power['power_number_std']:.2f} ({power['samples']} samples)")
+                     "power_number_std": float(power_number.std(ddof=1)), "samples": int(window.sum()),
+                     "torque_mean": float(torque_value.mean()), "mass_factor": arguments.mass_factor}
+            print(f"  power number (t >= 20 s, readback torque / {arguments.mass_factor:g}): "
+                  f"{power['power_number']:.2f} +- {power['power_number_std']:.2f} "
+                  f"(torque {power['torque_mean'] * 1e3:.1f} mN m, {power['samples']} samples)")
 
     result = {"label": label, "probe_log": str(arguments.probe_log), "case": str(arguments.case), "pulses": rows,
               "tau95": stats, "tau95_exact": stats_exact, "global_tau95": stats_global, "mean_speed": speed,
@@ -408,6 +412,9 @@ def main():
     parser.add_argument("probe_log", nargs="?", help="probe CSV of _run_v1_headless.py (--probe-log)")
     parser.add_argument("--case", help="case.yaml of the run (pulse start times, particle spacing)")
     parser.add_argument("--torque-log", default=None, help="torque CSV of the same run (power number from 20 s)")
+    parser.add_argument("--mass-factor", type=float, default=1.2187,
+                        help="calibrated particle volume over dx^3 that the readback torque is divided by "
+                             "(1.2187 for h/dx = 3; 1 for none)")
     parser.add_argument("--snapshots", default=None, help="directory of --scalar-snapshot-times output")
     parser.add_argument("--slice-field", default="tracer_01")
     parser.add_argument("--out-dir", default="output/mixing")
