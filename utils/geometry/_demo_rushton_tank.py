@@ -44,7 +44,13 @@ no part in the density diffusion, so unlike a wall a plate does not pull the den
 Whether it runs away depends on the plate area (both faces) over the wall area: 0.17 (four baffles)
 runs away, 0.08 (two baffles, or four of half width) and 0.03 (impeller plates only) do not drift;
 the 30 L tank with all its plates (0.16) drifts by about 1 kg/m3 per second at rest, slowing down.
-Solid baffles do not drift (mean density constant to 0.03 kg/m3 over 1.8 s rotating).
+Solid baffles do not drift (mean density constant to 0.03 kg/m3 over 1.8 s rotating). The source of
+the drift is the plate's own particle grid (spacing <= dx, not aligned with the layer it replaces):
+under a uniform pressure the kernel gradient sum next to the plate is not zero, the fluid gets a
+steady push away from the plate, the particle shift moves it back without a term in the continuity
+equation, and the density grows. --plate-particles lattice gives the plates on lattice planes (the
+baffles, the disks) the lattice sites of their plane as particles: thin-plate baffles then do not
+drift, at rest or rotating (2.1 s), log/2026-10-02_haringa-h1-setup.md.
 Particles of a wall shell lying exactly on a plate's plane inside its outline have an ambiguous
 side (static tank, unshifted planes, outline continued into the shells: +-0.3 N m per baffle);
 the frame vectors of the baffles are cleaned of rounding residues (cos 90 deg = 6e-17).
@@ -434,6 +440,9 @@ def main() -> int:
     parser.add_argument("--baffle-gap", type=float, default=0.0, help="diagnostics: gap between baffle and wall (m)")
     parser.add_argument("--baffle-bottom", type=float, default=0.0, help="diagnostics: height of the baffles' lower edge (m)")
     parser.add_argument("--baffle-count", type=int, default=None, help="diagnostics: number of baffles")
+    parser.add_argument("--plate-particles", choices=("grid", "lattice"), default="grid",
+                        help="particles of the baffle and disk plates: own plane grid (spacing <= dx), or the lattice "
+                             "sites of the plane they replace (plates on lattice planes only)")
     parser.add_argument("--baffle-width", type=float, default=None, help="diagnostics: baffle width (m)")
     parser.add_argument("--baffle-offset-deg", type=float, default=0.0, help="diagnostics: rotate the baffles")
     args = parser.parse_args()
@@ -500,6 +509,19 @@ def main() -> int:
         plates = [plate for plate in plates if not plate["name"].startswith("baffle")]
     if args.only_plates:
         plates = [plate for plate in plates if args.only_plates in plate["name"]]
+    if args.plate_particles == "lattice":
+        # plates on lattice planes take the lattice sites of their plane (inside the particle outline)
+        # as their particles, so that plate plus fluid is exactly the lattice
+        for plate in plates:
+            if not (plate["name"].startswith("baffle") or plate["name"].endswith("_disk")):
+                continue
+            normal = np.asarray(plate["normal"], dtype=np.float64)
+            on_plane = np.abs((sites - np.asarray(plate["centre"], dtype=np.float64)) @ normal) < 1e-6 * dx
+            inside = plate["box"].signed_distance(sites) <= 1e-9 * dx
+            selected = sites[on_plane & inside]
+            if selected.shape[0] == 0:
+                parser.error(f"--plate-particles lattice: plate {plate['name']} is not on a lattice plane")
+            plate["points"], plate["measure"] = selected, dx * dx
     kept = np.zeros((0, 3))
     for plate in plates:
         points = plate["points"]
