@@ -76,7 +76,10 @@ def fluid_energy(simulator, rest_density, spacing):
     radius = np.hypot(x[:, 0], x[:, 2])
     safe = np.maximum(radius, 1e-12)
     u_radial = (v[:, 0] * x[:, 0] + v[:, 2] * x[:, 2]) / safe
-    u_tangential = (v[:, 2] * x[:, 0] - v[:, 0] * x[:, 2]) / safe       # +y right-hand rotation
+    # positive along the +y right-hand rotation (the rotor's sense): v = omega y x r = omega (z, 0, -x)
+    # gives v_x z - v_z x = omega r^2 (sign corrected 2026-10-03 after the overnight runs, whose CSV
+    # columns u_tangential_bulk and angular_momentum were flipped in place to match)
+    u_tangential = (v[:, 0] * x[:, 2] - v[:, 2] * x[:, 0]) / safe
     speed_squared = (v ** 2).sum(axis=1)
     zones = {"rushton": (radius < RUSHTON_BOX[0]) & (x[:, 1] > RUSHTON_BOX[1]) & (x[:, 1] < RUSHTON_BOX[2]),
              "pbt": (radius < PBT_BOX[0]) & (x[:, 1] > PBT_BOX[1]) & (x[:, 1] < PBT_BOX[2])}
@@ -106,6 +109,11 @@ def main():
     parser.add_argument("--every", type=int, default=1000)
     parser.add_argument("--rest", action="store_true", help="rotor speed 0 (tank at rest)")
     parser.add_argument("--out", required=True, help="output prefix: OUT.csv, OUT_final.npz")
+    parser.add_argument("--initial-velocity", default=None,
+                        help="(n_fluid, 3) .npy of initial fluid velocities in fluid.obj order "
+                             "(_map_fluent_velocity.py), written before bootstrap")
+    parser.add_argument("--dump-times", type=float, nargs="*", default=[],
+                        help="also write OUT_tX.XXX.npz dumps (format of the final dump) at these times, s")
     arguments = parser.parse_args()
 
     from utils.sph.case import load_case
@@ -125,12 +133,29 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     log, header = None, None
     started = time.time()
+    dump_times = sorted(arguments.dump_times)
+
+    def write_dump(simulator, path):
+        np.savez(path, positions=simulator.readback_positions(), material=simulator.readback_material(),
+                 velocity_mass=simulator.readback_velocity_mass(), particle_uid=simulator.readback_particle_uid(),
+                 status=json.dumps(simulator.readback_global_status()),
+                 density_pressure=simulator.readback_density_pressure())
+
     with VulkanContext.create(application_name="tank_energy", enable_validation=False) as context:
         simulator = SphSimulatorV1(context, case)
         try:
+            if arguments.initial_velocity:
+                initial = np.load(arguments.initial_velocity)
+                material = simulator.readback_material()
+                if not np.all(material[1:1 + initial.shape[0]] == 0):
+                    raise SystemExit("--initial-velocity: slots 1..n are not all fluid (fluid.obj must come first)")
+                simulator.write_initial_velocities(initial, first_slot=1)
+                print(f"[tank_energy] initial velocity of {initial.shape[0]:,} fluid particles from {arguments.initial_velocity}")
             simulator.bootstrap()
             while simulator.step_count < arguments.steps:
                 simulator.step()
+                if dump_times and simulator.simulation_time >= dump_times[0]:
+                    write_dump(simulator, out.parent / f"{out.name}_t{dump_times.pop(0):.3f}.npz")
                 if simulator.step_count % arguments.every:
                     continue
                 simulator.begin_readback_cache()
@@ -154,10 +179,7 @@ def main():
                                    for key in header) + "\n")
                 log.flush()
             status = simulator.readback_global_status()
-            np.savez(out.parent / (out.name + "_final.npz"), positions=simulator.readback_positions(),
-                     material=simulator.readback_material(), velocity_mass=simulator.readback_velocity_mass(),
-                     particle_uid=simulator.readback_particle_uid(), status=json.dumps(status),
-                     density_pressure=simulator.readback_density_pressure())
+            write_dump(simulator, out.parent / (out.name + "_final.npz"))
         finally:
             if log is not None:
                 log.close()

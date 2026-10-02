@@ -47,6 +47,26 @@ def journal(kind, out):
         lines.append(f'(display "MARK {label} {second}")')
         if kind == "torques":
             lines += [f"/report/forces/wall-moments no {zone} () 0 0 0 0 1 0 no" for zone in WALL_ZONES]
+        elif kind == "cells":
+            # cell centroids and velocities of all fluid cells as a Fluent interpolation file (binary:
+            # header lines, then x, y, z and the fields as "(" + n doubles + End of Binary Section), read by
+            # read_interpolation_file(); cell volumes cannot be written this way (2026-10-03)
+            target = (out.parent / f"{label}{second}.ip").resolve().as_posix()
+            lines.append(f'/file/interpolate/write-data "{target}" ({" ".join(CELL_ZONES)}) '
+                         "x-velocity y-velocity z-velocity ()")
+        elif kind == "components":
+            # kinetic energy per velocity component about the vertical axis (Fluent y), 2026-10-03
+            zones = " ".join(CELL_ZONES)
+            radius = "sqrt(x_coordinate^2+z_coordinate^2)"
+            lines += [f'/define/custom-field-functions/define "urad" "(x_velocity*x_coordinate+z_velocity*z_coordinate)/{radius}"',
+                      f'/define/custom-field-functions/define "utan" "(x_velocity*z_coordinate-z_velocity*x_coordinate)/{radius}"',
+                      '/define/custom-field-functions/define "kerad" "0.5*density*urad^2"',
+                      '/define/custom-field-functions/define "ketan" "0.5*density*utan^2"',
+                      '/define/custom-field-functions/define "keaxi" "0.5*density*y_velocity^2"',
+                      f"/report/volume-integrals/volume-integral {zones} () kerad no",
+                      f"/report/volume-integrals/volume-integral {zones} () ketan no",
+                      f"/report/volume-integrals/volume-integral {zones} () keaxi no",
+                      f"/report/volume-integrals/volume-avg {zones} () utan no"]
         else:
             zones = " ".join(CELL_ZONES)
             lines += ['/define/custom-field-functions/define "kedens" "0.5*density*velocity_magnitude^2"',
@@ -60,6 +80,21 @@ def journal(kind, out):
     lines += ["/file/stop-transcript", "/exit yes"]
     out.write_text("\n".join(lines) + "\n")
     print(f"wrote {out} ({len(lines)} lines)")
+
+
+def read_interpolation_file(path):
+    """Fluent binary interpolation file -> dict of arrays: x, y, z and the fields (names as written)."""
+    raw = pathlib.Path(path).read_bytes()
+    first = raw.index(b"(")
+    header = raw[:first].decode().split()
+    count, field_count = int(header[2]), int(header[3])
+    names = ["x", "y", "z"] + header[4:4 + field_count]
+    arrays, position = {}, first
+    for name in names:
+        position = raw.index(b"(", position)
+        arrays[name] = np.frombuffer(raw, dtype="<f8", count=count, offset=position + 1).copy()
+        position += 1 + 8 * count
+    return arrays
 
 
 def blocks(text):
@@ -122,10 +157,36 @@ def parse_zones(text):
             print(f"  {zone:13s}  {row[0] * 1e3:8.3f}   {row[1]:8.4f}     {row[2]:8.4f}  {row[3]:8.4f}  {row[4]:8.4f}")
 
 
+def parse_components(text):
+    """kinetic energy per velocity component (radial, tangential, axial) and the mean tangential velocity
+    (positive along +y right-hand rotation; the mirrored fine snapshots 26..34 s turn the other way, so
+    its magnitude is averaged)"""
+    quantities = ("ke_radial", "ke_tangential", "ke_axial", "u_tangential")
+    results = {}
+    for label, second, body in blocks(text):
+        reports = re.split(r"\n> /report/volume-integrals/", body)[1:]
+        values = {}
+        for quantity, report in zip(quantities, reports):
+            for zone in CELL_ZONES + ("Net",):
+                match = re.search(rf"^\s*{zone}\s+([-0-9.eE+]+)\s*$", report, re.M)
+                values[(quantity, zone)] = float(match.group(1)) if match else np.nan
+        results[(label, second)] = values
+    for label in SNAPSHOTS:
+        seconds = sorted(s for (l, s) in results if l == label)
+        if not seconds:
+            continue
+        print(f"\n{label} mesh, mean over {len(seconds)} snapshots ({seconds[0]}..{seconds[-1]} s)")
+        print("  zone           KE radial J   KE tangential J   KE axial J   |mean u_tangential| m/s")
+        for zone in CELL_ZONES + ("Net",):
+            row = [np.nanmean([results[(label, s)][(q, zone)] for s in seconds]) for q in quantities[:3]]
+            swirl = np.nanmean([abs(results[(label, s)][("u_tangential", zone)]) for s in seconds])
+            print(f"  {zone:13s}  {row[0]:10.4f}    {row[1]:10.4f}      {row[2]:10.4f}     {swirl:8.4f}")
+
+
 if __name__ == "__main__":
     command, kind, path = sys.argv[1:4]
     if command == "journal":
         journal(kind, path)
     else:
         text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
-        (parse_torques if kind == "torques" else parse_zones)(text)
+        {"torques": parse_torques, "zones": parse_zones, "components": parse_components}[kind](text)

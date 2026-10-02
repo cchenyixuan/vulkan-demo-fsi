@@ -1810,6 +1810,20 @@ class SphSimulatorV1:
         raw = self._readback_buffer(self.buffers["shift"])
         return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
 
+    def write_initial_velocities(self, velocities: np.ndarray, first_slot: int = 1) -> None:
+        """Overwrite the velocity of the slots [first_slot, first_slot + n) with
+        `velocities` (n, 3); masses are kept. Initial conditions for tests
+        (2026-10-03: the 30 L tank started from a Fluent LES snapshot). Call it
+        before bootstrap(): the bootstrap force pass and the backward half-kick
+        then start from this field. Slots follow the order of the particle
+        files in case.yaml (the fluid file first), as uploaded at construction."""
+        velocities = np.asarray(velocities, dtype=np.float32)
+        velocity_mass = self.readback_velocity_mass().copy()
+        if velocities.ndim != 2 or velocities.shape[1] != 3 or first_slot + velocities.shape[0] > velocity_mass.shape[0]:
+            raise ValueError(f"write_initial_velocities: bad shape {velocities.shape} from slot {first_slot}")
+        velocity_mass[first_slot:first_slot + velocities.shape[0], :3] = velocities
+        self._staging_upload(self.buffers["velocity_mass"], velocity_mass.astype(np.float32).tobytes())
+
     def write_scalars(self, values: np.ndarray) -> None:
         """Overwrite the scalar field of every slot (initial conditions for
         tests). `values` has shape (pool capacity, n_fields) or
