@@ -460,7 +460,7 @@ def thin_plates_block(plates) -> str:
 
 
 def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False, with_blades=True,
-                 legacy_baffles=False, with_baffle_plates=True, with_bell=True, with_disk=True):
+                 legacy_baffles=False, with_baffle_plates=True, with_bell=True, with_disk=True, with_shaft=True):
     """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
     ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
     and the disk for the Rushton) are kept on the full-length shaft; used for
@@ -473,7 +473,9 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=Fa
     t_pblade = max(PBT_BLADE["thickness"], thin)
 
     disk_mid = 0.5 * (RUSHTON_DISK["y0"] + RUSHTON_DISK["y1"])
-    rotor_parts = [y_cylinder(SHAFT_RADIUS, shaft_y0, shaft_y1)]
+    # with_shaft=False (2026-10-03, diagnostic --no-shaft): no shaft cylinder; hubs, collar and bell stay
+    # (the rotor moves kinematically, its parts need not touch)
+    rotor_parts = [y_cylinder(SHAFT_RADIUS, shaft_y0, shaft_y1)] if with_shaft else []
     if with_bell:
         rotor_parts.append(RevolvedProfile(ROTOR_BELL_PROFILE))
     if keep_rushton:
@@ -726,6 +728,9 @@ def main() -> int:
                              "effective viscosity of 1.0e-6")
     parser.add_argument("--no-rotor-bell", action="store_true",
                         help="rotor without the rotating bell at the lower end of the shaft (as until 2026-09-29)")
+    parser.add_argument("--no-shaft", action="store_true",
+                        help="diagnostic (2026-10-03): leave out the shaft cylinder (r = 4 mm, a 3 x 3 particle "
+                             "column at 3 mm that stirs like a paddle); hubs, collar and bell stay. Not physical")
     parser.add_argument("--conformal-baffles", action="store_true",
                         help="baffle plates on plane grids in the baffles' own frames (--thin-layers flat "
                              "layers), like --conformal-blades; not with --legacy-baffles")
@@ -869,7 +874,8 @@ def main() -> int:
                                             with_blades=not (args.conformal_blades or impeller_plates),
                                             legacy_baffles=args.legacy_baffles,
                                             with_baffle_plates=not (args.conformal_baffles or baffle_plates),
-                                            with_bell=not args.no_rotor_bell, with_disk=not impeller_plates)
+                                            with_bell=not args.no_rotor_bell, with_disk=not impeller_plates,
+                                            with_shaft=not args.no_shaft)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 
