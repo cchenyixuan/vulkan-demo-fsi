@@ -29,6 +29,10 @@ Options:
                          positions, optionally --lifeline-fields, and with --lifeline-aux the
                          velocity and shift every --lifeline-aux-every records
                          (experiment/v1/utils/lifeline_recorder.py)
+    --flow-statistics CONFIG.json
+                         time-averaged velocity statistics at fixed points (2026-10-02, Haringa 2023 H1):
+                         every --flow-statistics-every steps from --flow-statistics-start on, into
+                         --flow-statistics-out (experiment/v1/utils/flow_statistics.py)
 
 Note: the solver is not bit-reproducible run to run (voxel incoming lists are
 filled by atomics), so compare dumps against the run-to-run noise of an
@@ -53,6 +57,7 @@ from utils.sph.vulkan_context import VulkanContext
 from experiment.v1 import compile_shaders_v1
 from experiment.v1.utils.simulator_v1 import SphSimulatorV1
 from experiment.v1.utils.lifeline_recorder import LifelineRecorder
+from experiment.v1.utils.flow_statistics import FlowStatisticsSampler
 
 
 DEFAULT_CASE = "cases/lid_driven_cavity_2d/case.yaml"
@@ -114,6 +119,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lifeline-release-sphere", type=float, nargs=4, default=None,
                         metavar=("X", "Y", "Z", "R"),
                         help="draw the sample only from fluid particles inside this sphere (m) at the start")
+    parser.add_argument("--flow-statistics", type=str, default=None, metavar="CONFIG",
+                        help="sample points (flow_statistics.json of _demo_rushton_tank.py) for time-averaged "
+                             "velocity statistics (2026-10-02)")
+    parser.add_argument("--flow-statistics-out", type=str, default=None, metavar="PATH",
+                        help="output .npz of --flow-statistics (default: flow_statistics.npz next to the config)")
+    parser.add_argument("--flow-statistics-every", type=int, default=0, metavar="N",
+                        help="sample every N steps (default: the step count closest to 0.02 s)")
+    parser.add_argument("--flow-statistics-start", type=float, default=0.0, metavar="T",
+                        help="first sample at simulation time >= T (s)")
+    parser.add_argument("--flow-statistics-flush", type=int, default=250, metavar="M",
+                        help="write the accumulators (and a copy) every M samples")
     return parser.parse_args()
 
 
@@ -160,7 +176,15 @@ def main() -> None:
             sim.bootstrap()
             start = time.perf_counter()
             sampling = (args.torque_every > 0 or args.probe_every > 0 or bool(args.scalar_snapshot_times)
-                        or args.lifeline_dir is not None)
+                        or args.lifeline_dir is not None or args.flow_statistics is not None)
+            statistics = None
+            if args.flow_statistics is not None:
+                every = (args.flow_statistics_every if args.flow_statistics_every > 0
+                         else max(1, round(0.02 / case.timestep)))
+                out = args.flow_statistics_out or str(pathlib.Path(args.flow_statistics).with_name("flow_statistics.npz"))
+                statistics = FlowStatisticsSampler(sim, args.flow_statistics, out, every=every,
+                                                   start_time=args.flow_statistics_start,
+                                                   flush_every=args.flow_statistics_flush)
             recorder = None
             if args.lifeline_dir is not None:
                 every = args.lifeline_every if args.lifeline_every > 0 else max(1, round(0.03 / case.timestep))
@@ -276,8 +300,12 @@ def main() -> None:
                         snapshot_times.pop(0)
                 if recorder is not None and recorder.due():
                     recorder.record()
+                if statistics is not None and statistics.due():
+                    statistics.sample()
             if recorder is not None:
                 recorder.close()
+            if statistics is not None:
+                statistics.close()
             for handle in (torque_log, probe_log):
                 if handle is not None:
                     handle.close()

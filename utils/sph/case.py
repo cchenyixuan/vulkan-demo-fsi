@@ -536,7 +536,7 @@ class MaterialEntry:
     # Reserved (V0 unused; zero-padded on upload to match the struct's 48 B layout).
     viscosity_transfer: float = 0.0                 # micropolar (V0+)
     viscosity_rotation: float = 0.0                 # micropolar (V0+)
-    reserved_material_0: int = 0
+    free_slip: int = 0                              # BOUNDARY: 1 = free-slip wall (2026-10-02, USE_FREE_SLIP_WALLS)
     reserved_material_1: int = 0
 
     # --- Python-side runtime hints (NOT in the GPU struct) ---------------
@@ -1271,6 +1271,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (90,  lambda case: case.scalars.reactions[0].q_max if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (91,  lambda case: case.scalars.reactions[0].k_s if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
     (92,  lambda case: case.scalars.reactions[0].growth_yield if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (93,  lambda case: 1 if any(material.free_slip for material in case.materials) else 0, 'I'),  # USE_FREE_SLIP_WALLS
     (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
@@ -1584,6 +1585,11 @@ def _resolve_materials(library, used_names, physics, library_path) -> list[Mater
                 f"got {initial_velocity_raw}")
         initial_velocity = tuple(float(component) for component in initial_velocity_raw)
 
+        # Optional free_slip (2026-10-02): a no-shear wall, BOUNDARY materials only.
+        free_slip = bool(spec.get("free_slip", False))
+        if free_slip and kind != KIND_BOUNDARY:
+            raise ValueError(f"material '{name}': free_slip is only defined for kind=boundary")
+
         materials.append(MaterialEntry(
             name=name,
             group_id=group_id,
@@ -1595,6 +1601,7 @@ def _resolve_materials(library, used_names, physics, library_path) -> list[Mater
             radius=radius,
             volume=volume,
             rotor_angular_velocity=float(spec.get("rotor_angular_velocity", 0.0)),
+            free_slip=1 if free_slip else 0,
             initial_velocity=initial_velocity,
         ))
     return materials

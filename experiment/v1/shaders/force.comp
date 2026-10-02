@@ -126,6 +126,8 @@ vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 sel
     vec3 gravity_vector = vec3(GRAVITY_X, GRAVITY_Y, GRAVITY_Z);
     vec3 relative_body_force = gravity_vector - solid_particle_acceleration(self_kind, self_position);
     float morris_coefficient = 2.0 * (float(DIMENSION) + 2.0);
+    // free-slip wall (2026-10-02): no viscous force between this solid particle and the fluid
+    bool self_free_slip = USE_FREE_SLIP_WALLS && material_parameters[material[self_particle_id]].free_slip != 0u;
     uint cell_count = USE_NEIGHBOR_LIST ? 1u : (NEIGHBOR_Z_RANGE == 0u ? 9u : 27u);
     for (uint cell = 0u; cell < cell_count; cell++) {
         uint candidate_count;
@@ -189,11 +191,14 @@ vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 sel
             vec3 kernel_gradient_corrected = fluid_correction_matrix
                 * evaluate_kernel_gradient_unguarded(position_difference_solid_to_fluid, distance);
             vec3 fluid_acceleration_from_solid =
-                -solid_volume_dynamic * pressure_combined / fluid_density * kernel_gradient_corrected
-                + morris_coefficient * fluid_params.viscosity * solid_volume_dynamic
-                  * dot(fluid_velocity_mass.xyz - self_velocity, position_difference_solid_to_fluid)
-                  / (distance_squared + EPS_H_SQUARED)
-                  * kernel_gradient_corrected;
+                -solid_volume_dynamic * pressure_combined / fluid_density * kernel_gradient_corrected;
+            if (!self_free_slip) {
+                fluid_acceleration_from_solid +=
+                    morris_coefficient * fluid_params.viscosity * solid_volume_dynamic
+                    * dot(fluid_velocity_mass.xyz - self_velocity, position_difference_solid_to_fluid)
+                    / (distance_squared + EPS_H_SQUARED)
+                    * kernel_gradient_corrected;
+            }
             reaction -= (fluid_velocity_mass.w / self_mass) * fluid_acceleration_from_solid;
         }
     }
@@ -444,6 +449,9 @@ void main() {
             float neighbor_density  = neighbor_density_pressure.x;
             float neighbor_pressure = neighbor_density_pressure.y;
             float neighbor_volume_dynamic = self_mass / neighbor_density;
+            // free-slip wall neighbour (2026-10-02): pressure force only, no viscous force
+            bool neighbor_free_slip = USE_FREE_SLIP_WALLS
+                && material_parameters[material[neighbor_particle_id]].free_slip != 0u;
 #if WITH_THIN_PLATES
             // A neighbour behind a plate (a plate particle, or any particle whose
             // segment to this one crosses the plate) is a dummy particle of the wall:
@@ -560,8 +568,14 @@ void main() {
                     thin_plate_first = near_thin_plate[thin_plate_safe_slot(wall_slot)].index + 1u;
                 }
             }
-            if (!neighbor_is_wall_dummy || USE_THIN_PLATE_VISCOSITY)
 #endif
+            // the wall dummies of a thin plate follow USE_THIN_PLATE_VISCOSITY, a free-slip
+            // wall particle has none
+            bool pair_has_viscosity = !neighbor_free_slip;
+#if WITH_THIN_PLATES
+            if (neighbor_is_wall_dummy) pair_has_viscosity = USE_THIN_PLATE_VISCOSITY;
+#endif
+            if (pair_has_viscosity)
             a_viscosity +=
                 morris_coefficient * pair_viscosity * pair_volume_viscous
                 * dot(self_velocity - neighbor_velocity,

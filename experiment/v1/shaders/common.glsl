@@ -426,6 +426,14 @@ layout(constant_id = 90) const float REACTION_Q_MAX = 0.0;            // [substr
 layout(constant_id = 91) const float REACTION_HALF_SATURATION = 1.0;  // K_s, [substrate]
 layout(constant_id = 92) const float REACTION_YIELD = 0.0;            // [biomass] / [substrate]
 
+// --- Free-slip walls (2026-10-02, material flag `free_slip: true`) ---
+// A BOUNDARY material with free_slip exerts no viscous force on the fluid and,
+// with USE_SOLID_REACTION_FORCE, receives none back: only the pressure force
+// acts across it, a no-shear wall as in Adami et al. (2012). Used for the flat
+// no-shear top of the Haringa (2023) tanks. True when any material sets the
+// flag; false compiles the per-neighbour material read out.
+layout(constant_id = 93) const bool USE_FREE_SLIP_WALLS = false;
+
 // --- Multi-GPU ghost (V1 merged-buffer scheme) ---
 // V1 partitions along X. The voxel_id encoding (helpers.glsl) is "x-slowest"
 // so that each x-column of voxels is a contiguous voxel_id segment. Ghost
@@ -885,7 +893,7 @@ struct MaterialParameters {
     // --- Reserved for __future__ (V0 unused) --------------------------------
     float viscosity_transfer;     // micropolar mass transfer
     float viscosity_rotation;     // micropolar rotation
-    uint  reserved_material_0;
+    uint  free_slip;              // BOUNDARY only (2026-10-02): 1 = free-slip wall, see USE_FREE_SLIP_WALLS
     uint  reserved_material_1;
 };  // 48 B total
 

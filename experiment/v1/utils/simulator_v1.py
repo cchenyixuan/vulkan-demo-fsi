@@ -123,6 +123,7 @@ SPEC_ID_REACTION_LAYOUT                     = 89
 SPEC_ID_REACTION_Q_MAX                      = 90
 SPEC_ID_REACTION_HALF_SATURATION            = 91
 SPEC_ID_REACTION_YIELD                      = 92
+SPEC_ID_USE_FREE_SLIP_WALLS                 = 93
 SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
@@ -641,7 +642,7 @@ class SphSimulatorV1:
                 float(material.rotor_angular_velocity),
                 float(material.viscosity_transfer),
                 float(material.viscosity_rotation),
-                int(material.reserved_material_0),
+                int(material.free_slip),
                 int(material.reserved_material_1),
             )
             assert len(row) == 48
@@ -983,6 +984,7 @@ class SphSimulatorV1:
             (SPEC_ID_REACTION_Q_MAX,               float(case.scalars.reactions[0].q_max) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_REACTION_HALF_SATURATION,     float(case.scalars.reactions[0].k_s) if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
             (SPEC_ID_REACTION_YIELD,               float(case.scalars.reactions[0].growth_yield) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_USE_FREE_SLIP_WALLS,          1 if any(material.free_slip for material in case.materials) else 0, 'I'),
             (SPEC_ID_USE_SCALAR_BOUNDS_LIMITER,    1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
             (SPEC_ID_SCALAR_FIELD_COUNT,           0 if case.scalars is None else len(case.scalars.fields), 'I'),
             (SPEC_ID_LEADING_GHOST_VOXEL_COUNT,    0,                                         'I'),

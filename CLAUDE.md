@@ -129,7 +129,7 @@ run scripts.
 - **Spec constants**: ids and ranges are listed in `common.glsl` and mirrored by
   `_global_spec_entries()` in `simulator_v1.py` (and `_SPEC_CONSTANT_MAPPING` in
   `utils/sph/case.py`); all must be edited together.
-  Free ranges for new constants: 93+ (79, 89–92 = Monod reaction, 2026-10-01; 73 = SOLID_DENSITY_FLOOR, 76 = SHIFT_TRANSPORT_MODE, 77 = USE_MOMENTUM_SGS, 78 = MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01), 49, 72, 74, 75 = thin plates, 2026-09-30; 34 = BACKGROUND_PRESSURE,
+  Free ranges for new constants: 94+ (93 = USE_FREE_SLIP_WALLS, 2026-10-02; 79, 89–92 = Monod reaction, 2026-10-01; 73 = SOLID_DENSITY_FLOOR, 76 = SHIFT_TRANSPORT_MODE, 77 = USE_MOMENTUM_SGS, 78 = MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01), 49, 72, 74, 75 = thin plates, 2026-09-30; 34 = BACKGROUND_PRESSURE,
   35 = SOLID_PRESSURE_MODE, 36 = USE_SOLID_REACTION_FORCE, 37 = SOLID_PRESSURE_OFFSET, 38 = USE_DENSITY_DIFFUSION_GRADIENT_TERM, 39 = PST_NEAR_SOLID_MODE, 48 = PAIR_CORRECTION_MODE, added 2026-09-29; 47 = USE_NEIGHBOR_LIST,
   62 = MAX_NEIGHBORS, 63–71 = scalar transport, all added on the test branch).
 - **Scalar transport (test branch, 2026-09-27)**: optional case.yaml block
@@ -159,7 +159,15 @@ run scripts.
   are untouched. Tank generator: `--thin-plates`. Formulas in
   `shaders/thin_plates.glsl`, tests and known issues in
   `log/2026-09-30_thin-plates-mirror.md`, check script
-  `experiment/v1/checks/_check_thin_plate.py`.
+  `experiment/v1/checks/_check_thin_plate.py`. Placement (2026-10-02): a plate
+  must replace a lattice layer (plate on a lattice plane, its sites dropped);
+  thin-plate baffles let the fluid at rest drift up in density under a
+  background pressure (dummies take no part in the density diffusion), so the
+  Rushton tank generator uses solid baffles; `log/2026-10-02_haringa-h1-setup.md`.
+- **Free-slip walls (test branch, 2026-10-02)**: a boundary material with
+  `free_slip: true` exerts no viscous force on the fluid (pressure only),
+  spec 93 `USE_FREE_SLIP_WALLS`; used for the no-shear lid of the Haringa (2023)
+  tanks (`utils/geometry/_demo_rushton_tank.py --free-slip-lid`).
 - **Uniform-material simplifications** inherited from V0: `force.comp` uses
   self's mass / viscosity / volume for pair quantities (no multi-phase), no
   micropolar terms, no inlet spawn kernel (rotor motion added on the test branch, see above).
