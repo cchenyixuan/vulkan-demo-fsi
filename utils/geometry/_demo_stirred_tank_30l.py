@@ -110,8 +110,17 @@ RUSHTON_HUB = dict(radius=0.0102, y0=0.0211, y1=0.0414)
 RUSHTON_DISK = dict(radius=0.032, y0=0.0372, y1=0.0397)
 RUSHTON_BLADE = dict(radial=(0.024, 0.048), y0=0.0288, y1=0.048, thickness=2.2e-3, azimuth0_deg=23.1)
 
-PBT_HUB = dict(radius=0.0109, y0=0.180, y1=0.2093)
-PBT_BLADE = dict(radial=(0.0122, 0.0491), chord=0.0273, thickness=2.5e-3,
+# PBT corrected 2026-10-02 (sections of 'Moving Body_1.stl', log/2026-10-02_pbt-geometry.md): the blades are
+# flat 2.5 mm plates at 45 deg whose mid-surface chord is 24.8 mm. Until then the chord was 27.3 mm =
+# the blades' total height 19.3 mm / sin 45 deg, which counts the thickness (2.5 mm cos 45 deg = 1.8 mm
+# of the height) as chord: the thin-plate blades were 10 % too wide. The hub is r 10.87 mm only over
+# the blade band y 184.98 .. 204.25 mm, with a collar of r 7.5 mm from 180.0 to 209.3 mm; until then
+# one cylinder r 10.9 mm from 180.0 to 209.3 mm. --legacy-pbt restores the old values.
+PBT_HUB = dict(radius=0.01087, y0=0.18498, y1=0.20425)
+PBT_COLLAR = dict(radius=0.0075, y0=0.1800, y1=0.2093)
+LEGACY_PBT_HUB = dict(radius=0.0109, y0=0.180, y1=0.2093)
+LEGACY_PBT_CHORD = 0.0273
+PBT_BLADE = dict(radial=(0.0122, 0.0491), chord=0.0248, thickness=2.5e-3,
                  center_y=0.19465, pitch_deg=45.0, azimuth0_deg=24.3)
 
 # Blade tips measured on the dataset's 'Moving Body_1.stl' (2026-09-28): both blades end in a
@@ -470,6 +479,8 @@ def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=Fa
             rotor_parts.append(y_cylinder(RUSHTON_DISK["radius"], disk_mid - 0.5 * t_disk, disk_mid + 0.5 * t_disk))
     if keep_pbt:
         rotor_parts.append(y_cylinder(PBT_HUB["radius"], PBT_HUB["y0"], PBT_HUB["y1"]))
+        if PBT_HUB is not LEGACY_PBT_HUB:
+            rotor_parts.append(y_cylinder(PBT_COLLAR["radius"], PBT_COLLAR["y0"], PBT_COLLAR["y1"]))
     for k in range(6 if with_blades else 0):
         if keep_rushton:
             blade = radial_slab(RUSHTON_BLADE["azimuth0_deg"] + 60 * k,
@@ -715,6 +726,8 @@ def main() -> int:
     parser.add_argument("--conformal-baffles", action="store_true",
                         help="baffle plates on plane grids in the baffles' own frames (--thin-layers flat "
                              "layers), like --conformal-blades; not with --legacy-baffles")
+    parser.add_argument("--legacy-pbt", action="store_true",
+                        help="PBT as before 2026-10-02: chord 27.3 mm (10 %% too wide) and a hub r 10.9 mm over 180 .. 209.3 mm")
     parser.add_argument("--legacy-baffles", action="store_true",
                         help="baffles as until 2026-09-29: 13 mm wide (r = 125.4 .. 138.4 mm), 62 / 182 / 302 deg, "
                              "from y = 10 mm, no block at the lower end; the true baffles are 24 mm wide")
@@ -816,6 +829,11 @@ def main() -> int:
     parser.add_argument("--feed-stop", type=float, default=None, help="feed stop, s (default: never)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
+    if args.legacy_pbt:
+        global PBT_HUB
+        PBT_HUB = LEGACY_PBT_HUB
+        PBT_BLADE["chord"] = LEGACY_PBT_CHORD
+        print("legacy PBT: chord 27.3 mm, hub r 10.9 mm over y 0.180 .. 0.2093")
 
     dx = args.dx
     h = args.hdx * dx
