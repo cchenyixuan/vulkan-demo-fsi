@@ -123,6 +123,24 @@ def jets(count, mean):
     return out
 
 
+MSTAR_PROBE_RADIUS = 0.1164                      # M-Star point probes: x = 0, z = 116.4 mm (azimuth 90 deg)
+MSTAR_PROBE_HEIGHTS = (0.260, 0.310, 0.360, 0.410)
+
+
+def probe_points(count, mean):
+    """azimuthal-mean (u_r, u_theta, u_y) in the bins at the radius and heights of the M-Star point probes
+    (the probes sit at one azimuth, 28.5 deg downstream of baffle 1; the azimuthal mean ignores that)"""
+    shape = (len(R_EDGES) - 1, len(Y_EDGES) - 1)
+    r_mid, y_mid = 0.5 * (R_EDGES[1:] + R_EDGES[:-1]), 0.5 * (Y_EDGES[1:] + Y_EDGES[:-1])
+    column = np.argmin(np.abs(r_mid - MSTAR_PROBE_RADIUS))
+    out = []
+    for height in MSTAR_PROBE_HEIGHTS:
+        row = np.argmin(np.abs(y_mid - height))
+        index = column * shape[1] + row
+        out.append((height, *mean[index]) if count[index] > 0 else (height, np.nan, np.nan, np.nan))
+    return out
+
+
 def figure(maps, out):
     """r-y maps of the azimuthal-mean flow: |(u_r, u_y)| with arrows, and u_theta, one row per data set"""
     import matplotlib
@@ -209,6 +227,10 @@ def main():
         rushton, pbt = jets(count, mean)
         print(f"  {label:44s}  {rushton[0]:+.3f} {rushton[1]:+.3f} {rushton[2]:+.3f}   |   "
               f"{pbt[0]:+.3f} {pbt[1]:+.3f} {pbt[2]:+.3f}")
+    print("\n  at the M-Star point probes (r 116 mm), azimuthal mean: y mm  u_r  u_theta  u_y  m/s")
+    for label, (count, mean) in maps.items():
+        print(f"  {label:44s} " + "   ".join(f"{p[0] * 1e3:.0f}: {p[1]:+.3f} {p[2]:+.3f} {p[3]:+.3f}"
+                                            for p in probe_points(count, mean)))
     if arguments.figure:
         figure(maps, arguments.figure)
 
