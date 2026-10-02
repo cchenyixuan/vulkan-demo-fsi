@@ -36,7 +36,8 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-MASS_FACTOR = 1.2187                                  # V_p / dx^3 for h/dx = 3
+# torques are divided by the mass factor V_p / dx^3 that readback_rotor_torque() reports (1.2187 for h/dx = 3,
+# 1.083 for 4); 2026-10-03, was the constant 1.2187
 BAFFLE_AZIMUTHS_DEG = (61.45, 181.45, 301.45)
 INNER_RADIUS_CUT = 0.1395
 LIQUID_TOP = 0.4265
@@ -44,9 +45,9 @@ RUSHTON_BOX = (0.072, 0.0187, 0.0585)                 # radius, y0, y1
 PBT_BOX = (0.072, 0.165, 0.225)
 
 
-def boundary_torques(simulator, plate_names):
+def boundary_torques(simulator, plate_names, mass_factor):
     points, forces, plate = simulator.readback_boundary_forces(with_plate_index=True)
-    torque = (points[:, 2] * forces[:, 0] - points[:, 0] * forces[:, 2]) / MASS_FACTOR
+    torque = (points[:, 2] * forces[:, 0] - points[:, 0] * forces[:, 2]) / mass_factor
     radius, height = np.hypot(points[:, 0], points[:, 2]), points[:, 1]
     ordinary = plate < 0
     near_baffle_band = ordinary & (radius > 0.10) & (radius < INNER_RADIUS_CUT) & (height > 0) & (height < LIQUID_TOP)
@@ -105,7 +106,8 @@ def fluid_energy(simulator, rest_density, spacing):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("case", help="case directory (case.yaml)")
-    parser.add_argument("--steps", type=int, required=True)
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--time", type=float, default=None, help="physical time to run, s (instead of --steps)")
     parser.add_argument("--every", type=int, default=1000)
     parser.add_argument("--rest", action="store_true", help="rotor speed 0 (tank at rest)")
     parser.add_argument("--out", required=True, help="output prefix: OUT.csv, OUT_final.npz")
@@ -127,6 +129,9 @@ def main():
         for material in case.materials:
             material.rotor_angular_velocity = 0.0
     spacing = 2.0 * float(case.physics.particle_radius)
+    if (arguments.steps is None) == (arguments.time is None):
+        raise SystemExit("give exactly one of --steps and --time")
+    steps = arguments.steps if arguments.steps is not None else int(np.ceil(arguments.time / float(case.timestep)))
     rest_density = next(m.rest_density for m in case.materials if m.kind == 0)
     plate_names = [plate.name for plate in (case.thin_plates or [])]
     out = pathlib.Path(arguments.out)
@@ -152,7 +157,7 @@ def main():
                 simulator.write_initial_velocities(initial, first_slot=1)
                 print(f"[tank_energy] initial velocity of {initial.shape[0]:,} fluid particles from {arguments.initial_velocity}")
             simulator.bootstrap()
-            while simulator.step_count < arguments.steps:
+            while simulator.step_count < steps:
                 simulator.step()
                 if dump_times and simulator.simulation_time >= dump_times[0]:
                     write_dump(simulator, out.parent / f"{out.name}_t{dump_times.pop(0):.3f}.npz")
@@ -161,10 +166,10 @@ def main():
                 simulator.begin_readback_cache()
                 rotor = simulator.readback_rotor_torque(0.1, 0.007)
                 row = {"step": simulator.step_count, "time": simulator.simulation_time,
-                       "rotor": rotor["torque_axis"] / MASS_FACTOR,
-                       "rotor_lower": rotor["torque_axis_lower"] / MASS_FACTOR,
-                       "rotor_upper": rotor["torque_axis_upper"] / MASS_FACTOR}
-                row.update(boundary_torques(simulator, plate_names))
+                       "rotor": rotor["torque_axis"] / rotor["mass_factor"],
+                       "rotor_lower": rotor["torque_axis_lower"] / rotor["mass_factor"],
+                       "rotor_upper": rotor["torque_axis_upper"] / rotor["mass_factor"]}
+                row.update(boundary_torques(simulator, plate_names, rotor["mass_factor"]))
                 row.update(fluid_energy(simulator, rest_density, spacing))
                 status = simulator.readback_global_status()
                 row["overflow"] = (status["overflow_inside_count"] + status["overflow_incoming_count"]
@@ -184,7 +189,7 @@ def main():
             if log is not None:
                 log.close()
             simulator.destroy()
-    print(f"[tank_energy] {arguments.steps} steps, t = {arguments.steps * float(case.timestep):.3f} s, "
+    print(f"[tank_energy] {steps} steps, t = {steps * float(case.timestep):.3f} s, "
           f"{(time.time() - started) / 60:.1f} min, alive {status['alive_particle_count']:,} -> {out}.csv")
 
 
