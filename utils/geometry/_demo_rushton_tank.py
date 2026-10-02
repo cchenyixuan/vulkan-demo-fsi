@@ -40,9 +40,11 @@ in 0.3 s; with thin-plate baffles on lattice planes it still drifts by 10 to 25 
 and accelerates, for every variant tried (outline continued into the shells or not, baffles at
 general angles, detached from wall and floor, the 30 L wall convention, the 30 L c0 and p_b);
 without p_b nothing moves, without baffle plates nothing drifts. The wall dummies of a plate take
-no part in the density diffusion, so unlike a wall a plate does not pull the density back to rho0;
-the 30 L tank has half the plate area per wall area and drifts by about 1 kg/m3 per second at rest,
-slowing down. Solid baffles do not drift (mean density constant to 0.03 kg/m3 over 1.8 s rotating).
+no part in the density diffusion, so unlike a wall a plate does not pull the density back to rho0.
+Whether it runs away depends on the plate area (both faces) over the wall area: 0.17 (four baffles)
+runs away, 0.08 (two baffles, or four of half width) and 0.03 (impeller plates only) do not drift;
+the 30 L tank with all its plates (0.16) drifts by about 1 kg/m3 per second at rest, slowing down.
+Solid baffles do not drift (mean density constant to 0.03 kg/m3 over 1.8 s rotating).
 Particles of a wall shell lying exactly on a plate's plane inside its outline have an ambiguous
 side (static tank, unshifted planes, outline continued into the shells: +-0.3 N m per baffle);
 the frame vectors of the baffles are cleaned of rounding residues (cos 90 deg = 6e-17).
@@ -431,6 +433,8 @@ def main() -> int:
     parser.add_argument("--baffle-layers", type=int, default=3, help="layers of a solid baffle (odd, centred on its plane)")
     parser.add_argument("--baffle-gap", type=float, default=0.0, help="diagnostics: gap between baffle and wall (m)")
     parser.add_argument("--baffle-bottom", type=float, default=0.0, help="diagnostics: height of the baffles' lower edge (m)")
+    parser.add_argument("--baffle-count", type=int, default=None, help="diagnostics: number of baffles")
+    parser.add_argument("--baffle-width", type=float, default=None, help="diagnostics: baffle width (m)")
     parser.add_argument("--baffle-offset-deg", type=float, default=0.0, help="diagnostics: rotate the baffles")
     args = parser.parse_args()
 
@@ -438,6 +442,10 @@ def main() -> int:
     if args.rpm is not None:
         preset["rpm"] = args.rpm
     preset["baffle_azimuth0_deg"] += args.baffle_offset_deg
+    if args.baffle_count is not None:
+        preset["baffle_count"] = args.baffle_count
+    if args.baffle_width is not None:
+        preset["baffle_width"] = args.baffle_width
     dx, h = args.dx, args.hdx * args.dx
     border = args.border if args.border is not None else int(math.ceil(args.hdx))
     shell = border * dx
