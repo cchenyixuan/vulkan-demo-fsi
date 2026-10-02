@@ -346,9 +346,12 @@ def conformal_baffles(dx, layers, top):
     return np.vstack(points), boxes
 
 
-def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius):
+def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius,
+                      with_impeller=True, with_baffles=True):
     """The thin plates of the tank (2026-09-30, case block `thin_plates:`): the blades, the
     Rushton disk and the baffle plates, each ONE layer of particles on its mid-plane.
+    with_impeller / with_baffles = False leave out the blades and the disk / the baffles
+    (2026-10-03, mixed representations, see --thin-plates).
 
     Returns a list of dicts: name, shape, frame, centre, normal, axis_a, extent (the analytic
     outline the solver uses to decide what lies behind the plate), thickness (true, for the
@@ -359,7 +362,7 @@ def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius
     Disk: rings of particles between `disk_inner_radius` (the surface of the hub particles) and
     the rim; its outline is the annulus from the hub radius to the rim."""
     plates = []
-    for name, centre, axis_a, axis_b, normal, half_a, half_b in blade_frames(impellers):
+    for name, centre, axis_a, axis_b, normal, half_a, half_b in (blade_frames(impellers) if with_impeller else ()):
         cells_a = max(1, int(math.ceil(2.0 * half_a / dx - 1e-9)))
         cells_b = max(1, int(math.ceil(2.0 * half_b / dx - 1e-9)))
         a = -half_a + (np.arange(cells_a) + 0.5) * (2.0 * half_a / cells_a)
@@ -371,7 +374,7 @@ def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius
                            normal=normal, axis_a=axis_a, extent=(half_a, half_b), thickness=thickness,
                            points=points, measure=(2.0 * half_a / cells_a) * (2.0 * half_b / cells_b),
                            box=OrientedBox(centre, np.stack([axis_a, axis_b, normal]), [half_a, half_b, 0.5 * dx])))
-    if impellers in ("both", "rushton"):
+    if with_impeller and impellers in ("both", "rushton"):
         disk_mid = 0.5 * (RUSHTON_DISK["y0"] + RUSHTON_DISK["y1"])
         outer = RUSHTON_DISK["radius"]
         rings = max(1, int(math.ceil((outer - disk_inner_radius) / dx - 1e-9)))
@@ -396,7 +399,7 @@ def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius
         bottom, thickness = LEGACY_BAFFLES["y0"], LEGACY_BAFFLES["thickness"]
     else:
         azimuths, radial, bottom, thickness = BAFFLE_AZIMUTHS_DEG, BAFFLE_RADIAL, BAFFLE_Y0, BAFFLE_THICKNESS
-    for index, azimuth in enumerate(azimuths):
+    for index, azimuth in enumerate(azimuths if with_baffles else ()):
         e_r, e_t, e_y = radial_frame(azimuth)
         r0, r1 = radial
         half_a, half_b = 0.5 * (r1 - r0), 0.5 * (top - bottom)
@@ -738,7 +741,10 @@ def main() -> int:
     parser.add_argument("--thin-plates", action="store_true",
                         help="blades, Rushton disk and baffle plates as thin plates (case block "
                              "`thin_plates:`, one layer of particles each, shaders/thin_plates.glsl); needs "
-                             "--solid-reaction-force; replaces --conformal-blades / --conformal-baffles")
+                             "--solid-reaction-force; replaces --conformal-blades / --conformal-baffles. "
+                             "Mixed (2026-10-03): with --conformal-baffles only the blades and the disk are "
+                             "plates (baffles: conformal sheets); with --conformal-blades only the baffles are "
+                             "plates (blades: conformal sheets, disk: lattice, as without --thin-plates)")
     parser.add_argument("--thin-plate-dashpot", type=float, default=None,
                         help="numerics.thin_plate_dashpot (default of the solver: 0)")
     parser.add_argument("--skin", type=float, default=0.5,
@@ -849,17 +855,21 @@ def main() -> int:
     print(f"dx={dx:.4e} h={h:.4e} (h/dx={args.hdx}) border={border} thin>={args.thin_layers} layers -> {sites.shape[0]:,} lattice sites")
 
     if args.thin_plates:
-        if args.conformal_blades or args.conformal_baffles:
-            parser.error("--thin-plates replaces --conformal-blades and --conformal-baffles")
+        if args.conformal_blades and args.conformal_baffles:
+            parser.error("--thin-plates with both --conformal-blades and --conformal-baffles leaves no plate")
         if not (args.solid_reaction_force or args.solid_pressure != "increment"):
             parser.error("--thin-plates needs --solid-reaction-force (the load on the plates is a reaction)")
+    # Which parts are thin plates (2026-10-03): all of them with --thin-plates alone; with
+    # --conformal-baffles only the impeller (blades and disk), with --conformal-blades only the baffles.
+    impeller_plates = args.thin_plates and not args.conformal_blades
+    baffle_plates = args.thin_plates and not args.conformal_baffles
     interior = DishedTankInterior(TANK_RADIUS, LIQUID_HEIGHT, FLOOR_PROFILE)
     rotor_region, wall_solid = build_solids(thin, FLOOR_BOTTOM - shell, top_y, top_y, impellers=args.impellers,
                                             clip_tips=args.clip_tips,
-                                            with_blades=not (args.conformal_blades or args.thin_plates),
+                                            with_blades=not (args.conformal_blades or impeller_plates),
                                             legacy_baffles=args.legacy_baffles,
-                                            with_baffle_plates=not (args.conformal_baffles or args.thin_plates),
-                                            with_bell=not args.no_rotor_bell, with_disk=not args.thin_plates)
+                                            with_baffle_plates=not (args.conformal_baffles or baffle_plates),
+                                            with_bell=not args.no_rotor_bell, with_disk=not impeller_plates)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 
@@ -920,7 +930,8 @@ def main() -> int:
         # plate particle. Where two plates meet (disk and blades) the particles of the later
         # plate that come closer than 0.6 dx to those of an earlier one are dropped.
         plates = thin_plate_sheets(dx, args.impellers, LIQUID_HEIGHT, shell, args.legacy_baffles,
-                                   RUSHTON_HUB["radius"] + skin)
+                                   RUSHTON_HUB["radius"] + skin,
+                                   with_impeller=impeller_plates, with_baffles=baffle_plates)
         kept = np.zeros((0, 3))
         for plate in plates:
             points = plate["points"]
