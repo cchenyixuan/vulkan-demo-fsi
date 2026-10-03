@@ -123,6 +123,16 @@ LEGACY_PBT_CHORD = 0.0273
 PBT_BLADE = dict(radial=(0.0122, 0.0491), chord=0.0248, thickness=2.5e-3,
                  center_y=0.19465, pitch_deg=45.0, azimuth0_deg=24.3)
 
+# The hubs of the Fluent LES mesh (2026-10-03, wall zones rt / pbt / stator of the fine 25 s snapshot, Fluent
+# y - 58.5 mm; log/2026-10-03_smooth-walls.md) are thinner than those of the M-Star STL above: the Rushton hub
+# is the r 7.97 mm sleeve from the bell (y 18.6 mm) to the disk (37.1 mm), only the shaft above the disk; the PBT
+# sits on a sleeve r 7.56 mm from y 175.4 to 207.0 mm and its blades reach in to it (pitched faces from r 7.8 mm)
+# and out to r 48.0 mm (faces up to 47.96 mm). Rushton blades and disk, bell and shaft agree with the STL.
+# Generator flag --fluent-hubs.
+FLUENT_RUSHTON_HUB = dict(radius=0.00797, y0=0.0186, y1=0.0372)
+FLUENT_PBT_HUB = dict(radius=0.00756, y0=0.1754, y1=0.2070)
+FLUENT_PBT_RADIAL = (0.00756, 0.0480)
+
 # Blade tips measured on the dataset's 'Moving Body_1.stl' (2026-09-28): both blades end in a
 # straight cut. Rushton: cut at 48.0 mm from the axis, corners at 48.0 mm. PBT: cut at about
 # 48.2 mm along the blade centre line, its corners (the blade is 19 mm wide seen from above)
@@ -344,6 +354,96 @@ def conformal_baffles(dx, layers, top):
                       + grid_n.reshape(-1, 1) * e_t)
         boxes.append(OrientedBox(centre, np.stack([e_r, e_y, e_t]), [half_a, half_b, 0.5 * layers * dx]))
     return np.vstack(points), boxes
+
+
+def points_closer_than(queries, others, distance):
+    """For every query point: does a point of `others` lie closer than `distance`? Cell lists on a grid of
+    spacing `distance` (numpy only, the solver environment has no scipy): a neighbour that close lies in one
+    of the 27 cells around the query's cell."""
+    bias = 1 << 20
+
+    def cell_ids(cells):
+        cells = cells + bias
+        return (cells[:, 0] << 42) | (cells[:, 1] << 21) | cells[:, 2]
+
+    other_ids = cell_ids(np.floor(others / distance).astype(np.int64))
+    order = np.argsort(other_ids, kind="stable")
+    sorted_ids, sorted_points = other_ids[order], others[order]
+    query_cells = np.floor(queries / distance).astype(np.int64)
+    found = np.zeros(queries.shape[0], dtype=bool)
+    for offset in np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1], indexing="ij")).reshape(3, -1).T:
+        ids = cell_ids(query_cells + offset)
+        slot = np.searchsorted(sorted_ids, ids, side="left")
+        stop = np.searchsorted(sorted_ids, ids, side="right")
+        while True:
+            index = np.nonzero((slot < stop) & ~found)[0]
+            if index.size == 0:
+                break
+            gap = sorted_points[slot[index]] - queries[index]
+            found[index[np.einsum("ij,ij->i", gap, gap) < distance ** 2]] = True
+            slot[index] += 1
+    return found
+
+
+def smooth_tank_shell(dx, layers):
+    """Shell of the cylinder wall and of the dished floor as particle layers that follow the surfaces
+    (2026-10-03, --smooth-walls). Taken from the lattice, the shell of a curved wall is a staircase; at 3 mm
+    its steps brake the swirl by pressure (form drag) about twice as hard as Fluent's smooth wall
+    (log/2026-10-03_fluent-and-wall-torque.md). Layer k = 0 .. layers - 1 lies (k + 0.5) dx outside the
+    surface along its normal, as the lattice shell's first layer does on a flat wall:
+      cylinder r = TANK_RADIUS: rings on the lattice planes y = j dx from (layers + 0.5) dx below the floor
+        rim up to the top of the lid shell;
+      floor y = floor(r) (FLOOR_PROFILE): the profile's normal is averaged over about dx of arc (the profile
+        is piecewise linear), each offset profile is resampled at about dx along its arc, and each sample
+        becomes a ring about the axis (one particle on the axis);
+    ring particles about dx apart (count = round(2 pi r / dx)), every other ring turned by half a spacing.
+    At the rim the floor follows the knuckle: floor particles closer than 0.6 dx to a cylinder particle above
+    the rim are dropped, cylinder particles below the rim closer than 0.6 dx to a remaining floor particle too
+    (cylinder first, a first version, left a pocket in the knuckle where fluid sat 0.6 mm outside the floor)."""
+    top = LIQUID_HEIGHT + layers * dx
+    rim = FLOOR_PROFILE[-1, 1]
+    rows = np.arange(math.floor((rim - (layers + 0.5) * dx) / dx), math.floor(top / dx + 1e-9) + 1) * dx
+    rings = []
+    for k in range(layers):
+        radius = TANK_RADIUS + (k + 0.5) * dx
+        count = int(round(2.0 * math.pi * radius / dx))
+        for index, y in enumerate(rows):
+            angle = (np.arange(count) + 0.5 * (index % 2)) * (2.0 * math.pi / count)
+            rings.append(np.column_stack([radius * np.cos(angle), np.full(count, y), radius * np.sin(angle)]))
+    cylinder = np.vstack(rings)
+
+    dense_r = np.linspace(0.0, TANK_RADIUS, 4001)
+    dense_y = np.interp(dense_r, FLOOR_PROFILE[:, 0], FLOOR_PROFILE[:, 1])
+    tangent = np.stack([np.gradient(dense_r), np.gradient(dense_y)], axis=1)
+    tangent /= np.linalg.norm(tangent, axis=1)[:, None]
+    arc = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(dense_r), np.diff(dense_y)))])
+    window = max(1, int(round(dx / (arc[-1] / (arc.size - 1)))))
+    kernel = np.ones(window) / window
+    tangent = np.stack([np.convolve(np.pad(tangent[:, axis], (window // 2, window - 1 - window // 2), mode="edge"),
+                                    kernel, mode="valid") for axis in range(2)], axis=1)
+    tangent /= np.linalg.norm(tangent, axis=1)[:, None]
+    normal = np.stack([tangent[:, 1], -tangent[:, 0]], axis=1)            # out of the liquid: down on the crown
+    rings = []
+    for k in range(layers):
+        offset_r = dense_r + (k + 0.5) * dx * normal[:, 0]
+        offset_y = dense_y + (k + 0.5) * dx * normal[:, 1]
+        offset_arc = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(offset_r), np.diff(offset_y)))])
+        samples = max(1, int(round(offset_arc[-1] / dx)))
+        targets = np.arange(samples + 1) * (offset_arc[-1] / samples)
+        for index, (r, y) in enumerate(zip(np.interp(targets, offset_arc, offset_r),
+                                           np.interp(targets, offset_arc, offset_y))):
+            if r < 0.25 * dx:
+                rings.append(np.array([[0.0, y, 0.0]]))
+                continue
+            count = max(3, int(round(2.0 * math.pi * r / dx)))
+            angle = (np.arange(count) + 0.5 * (index % 2)) * (2.0 * math.pi / count)
+            rings.append(np.column_stack([r * np.cos(angle), np.full(count, y), r * np.sin(angle)]))
+    floor = np.vstack(rings)
+    below_rim = cylinder[:, 1] < rim - 1e-9
+    floor = floor[~points_closer_than(floor, cylinder[~below_rim], 0.6 * dx)]
+    lower = cylinder[below_rim]
+    lower = lower[~points_closer_than(lower, floor, 0.6 * dx)]
+    return np.vstack([cylinder[~below_rim], lower, floor])
 
 
 def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius,
@@ -756,6 +856,12 @@ def main() -> int:
                         help="rotor / baffle / probe sites are claimed up to this many spacings outside "
                              "the solid surface (default 0.5; 0 = site centre inside the solid)")
     parser.add_argument("--border", type=int, default=None, help="wall shell layers (default = hdx)")
+    parser.add_argument("--fluent-hubs", action="store_true",
+                        help="hubs and PBT blade span of the Fluent LES mesh (FLUENT_RUSHTON_HUB, FLUENT_PBT_HUB, "
+                             "FLUENT_PBT_RADIAL) instead of the M-Star STL's")
+    parser.add_argument("--smooth-walls", action="store_true",
+                        help="shell of the cylinder and the dished floor as layers that follow the surfaces "
+                             "(smooth_tank_shell) instead of lattice sites (a staircase); the flat lid stays on the lattice")
     parser.add_argument("--out", default="cases/stirred_tank_30l")
     parser.add_argument("--max-per-voxel", type=int, default=None)
     parser.add_argument("--max-incoming", type=int, default=32)
@@ -840,11 +946,19 @@ def main() -> int:
     parser.add_argument("--feed-stop", type=float, default=None, help="feed stop, s (default: never)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
+    global PBT_HUB, PBT_COLLAR, RUSHTON_HUB
     if args.legacy_pbt:
-        global PBT_HUB
         PBT_HUB = LEGACY_PBT_HUB
         PBT_BLADE["chord"] = LEGACY_PBT_CHORD
         print("legacy PBT: chord 27.3 mm, hub r 10.9 mm over y 0.180 .. 0.2093")
+    if args.fluent_hubs:
+        if args.legacy_pbt:
+            parser.error("--fluent-hubs cannot be combined with --legacy-pbt")
+        # the collar is replaced by the Fluent sleeve (build_solids adds PBT_COLLAR as well, the same cylinder)
+        RUSHTON_HUB, PBT_HUB, PBT_COLLAR = FLUENT_RUSHTON_HUB, FLUENT_PBT_HUB, FLUENT_PBT_HUB
+        PBT_BLADE["radial"] = FLUENT_PBT_RADIAL
+        print("Fluent hubs: Rushton hub r 7.97 mm y 18.6 .. 37.2 mm, PBT sleeve r 7.56 mm y 175.4 .. 207.0 mm, "
+              "PBT blades r 7.56 .. 48.0 mm")
 
     dx = args.dx
     h = args.hdx * dx
@@ -966,6 +1080,28 @@ def main() -> int:
     is_shell = ~is_fluid & ~is_rotor & ~is_wall_solid & ~in_blade & (sdf_interior > -0.5 * dx)
     # Keep only shell sites within `border` layers of the liquid surface (drop far corners).
     is_shell &= sdf_interior <= shell + 0.5 * dx
+    shell_points = np.zeros((0, 3))
+    if args.smooth_walls:
+        # --smooth-walls (2026-10-03): the cylinder and the dished floor get a shell that follows the surfaces.
+        # Of the lattice shell only the flat lid is kept (y above the liquid, r < TANK_RADIUS + 0.5 dx), all of
+        # it: shell particles closer than 0.6 dx to a lid site are dropped instead (thinning the lid at the
+        # corner left an annular gap through which fluid climbed out, 12 particles in 0.2 s at rest). Shell
+        # particles inside a lattice solid (bearing boss, shaft below the floor) are dropped, the solid stays;
+        # every other lattice site (static solids, fluid) closer than 0.6 dx to a shell particle is dropped.
+        shell_points = smooth_tank_shell(dx, border)
+        shell_points = shell_points[(wall_solid.signed_distance(shell_points) > 0.0)
+                                    & (rotor_region.signed_distance(shell_points) > 0.0)]
+        radius_sites = np.hypot(sites[:, 0], sites[:, 2])
+        is_shell &= (sites[:, 1] > LIQUID_HEIGHT - 0.5 * dx) & (radius_sites < TANK_RADIUS + 0.5 * dx)
+        shell_points = shell_points[~points_closer_than(shell_points, sites[is_shell], 0.6 * dx)]
+        candidates = np.nonzero((is_wall_solid | is_fluid) & (sdf_interior < (border + 1) * dx))[0]
+        too_close = candidates[points_closer_than(sites[candidates], shell_points, 0.6 * dx)]
+        dropped_fluid = int(is_fluid[too_close].sum())
+        is_shell[too_close] = False
+        is_wall_solid[too_close] = False
+        is_fluid[too_close] = False
+        print(f"smooth walls: {shell_points.shape[0]:,} shell particles in {border} layers; "
+              f"{too_close.size:,} lattice sites closer than 0.6 dx dropped, {dropped_fluid} of them fluid")
 
     fluid = sites[is_fluid]
     if plates:
@@ -975,7 +1111,7 @@ def main() -> int:
               f"(the solver keeps {MAX_NEAR_THIN_PLATES})")
         if near_count.max() > MAX_NEAR_THIN_PLATES:
             parser.error("more plates inside one support than the solver keeps (MAX_NEAR_THIN_PLATES)")
-    wall = np.vstack([sites[is_wall_solid | is_shell], baffle_points])
+    wall = np.vstack([sites[is_wall_solid | is_shell], baffle_points, shell_points])
     if args.conformal_baffles:
         print(f"conformal baffles: {baffle_points.shape[0]:,} baffle particles in {args.thin_layers} layer(s)")
     rotor = np.vstack([sites[is_rotor], blade_points])
