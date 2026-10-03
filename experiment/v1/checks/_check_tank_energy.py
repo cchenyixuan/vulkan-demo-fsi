@@ -10,6 +10,9 @@ and every --every steps writes one CSV row:
     0 < y < 426.5 mm), lid, floor, the ordinary wall particles next to each baffle (100 < r < 139.5 mm,
     within 20 degrees of the baffle: brackets, conformal sheet baffles or lattice baffles), every static
     thin plate, and the split of _check_blade_leak_tracking.py (baffle = plates + 100 < r < 139.5 mm);
+    with --split-height H (2026-10-03) also the parts below H: below_split_cylinder (r > 139.5 mm, 0 < y < H),
+    below_split_baffles (the baffle split, y < H) and below_split_walls (every static boundary record below
+    H, floor included), for the angular momentum sink of the region below the Rushton;
   - kinetic energy with the physical mass rho0 dx^3 per zone: Rushton box and PBT box (Fluent's cell
     zones rt_rotorbox / pbt_rotorbox: r < 72 mm, y 18.7..58.5 / 165..225 mm) and the bulk (the rest);
     the bulk energy split into the radial, tangential and axial velocity components; mean speed per
@@ -45,7 +48,7 @@ RUSHTON_BOX = (0.072, 0.0187, 0.0585)                 # radius, y0, y1
 PBT_BOX = (0.072, 0.165, 0.225)
 
 
-def boundary_torques(simulator, plate_names, mass_factor):
+def boundary_torques(simulator, plate_names, mass_factor, split_height=None):
     points, forces, plate = simulator.readback_boundary_forces(with_plate_index=True)
     torque = (points[:, 2] * forces[:, 0] - points[:, 0] * forces[:, 2]) / mass_factor
     radius, height = np.hypot(points[:, 0], points[:, 2]), points[:, 1]
@@ -64,6 +67,11 @@ def boundary_torques(simulator, plate_names, mass_factor):
     csv_baffle = (((radius < INNER_RADIUS_CUT) & (radius > 0.10) & (height > 0.0)) | (plate >= 0))
     row["csv_walls"] = torque.sum()
     row["csv_baffles"] = torque[csv_baffle].sum()
+    if split_height is not None:
+        below = height < split_height
+        row["below_split_cylinder"] = torque[ordinary & (radius > INNER_RADIUS_CUT) & (height > 0) & below].sum()
+        row["below_split_baffles"] = torque[csv_baffle & below].sum()
+        row["below_split_walls"] = torque[below].sum()
     return row
 
 
@@ -114,6 +122,8 @@ def main():
     parser.add_argument("--initial-velocity", default=None,
                         help="(n_fluid, 3) .npy of initial fluid velocities in fluid.obj order "
                              "(_map_fluent_velocity.py), written before bootstrap")
+    parser.add_argument("--split-height", type=float, default=None,
+                        help="m, also log the boundary torques below this height (default: no extra columns)")
     parser.add_argument("--dump-times", type=float, nargs="*", default=[],
                         help="also write OUT_tX.XXX.npz dumps (format of the final dump) at these times, s")
     arguments = parser.parse_args()
@@ -169,7 +179,7 @@ def main():
                        "rotor": rotor["torque_axis"] / rotor["mass_factor"],
                        "rotor_lower": rotor["torque_axis_lower"] / rotor["mass_factor"],
                        "rotor_upper": rotor["torque_axis_upper"] / rotor["mass_factor"]}
-                row.update(boundary_torques(simulator, plate_names, rotor["mass_factor"]))
+                row.update(boundary_torques(simulator, plate_names, rotor["mass_factor"], arguments.split_height))
                 row.update(fluid_energy(simulator, rest_density, spacing))
                 status = simulator.readback_global_status()
                 row["overflow"] = (status["overflow_inside_count"] + status["overflow_incoming_count"]

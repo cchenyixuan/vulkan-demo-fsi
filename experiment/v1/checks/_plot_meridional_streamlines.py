@@ -12,7 +12,10 @@ dump (solids, outside the tank) are masked. Shown per data set:
     flow 2 pi d(psi), given in the title as a fraction of N D^3 (N = 200 rpm, D = 96 mm);
   - white arrows: direction of (u_r, u_y).
 Fluent y is shifted by -58.5 mm into the generator frame; the mirrored fine snapshots are oriented so that the
-swirl is positive.
+swirl is positive. psi > 0 (upward flow inside r) is a clockwise cell in this view (r to the right, y up); the
+title said the opposite until 2026-10-03. The velocities of Fluent's rotating zones are turned by 12 degrees in
+their sense of rotation (--fluent-rotor-lag): the written cells sit one time step ahead of their velocities
+(_analyze_rushton_lower_flow.py). psi uses u_y only and is not affected.
 
 usage:
     python experiment/v1/checks/_plot_meridional_streamlines.py OUT.png --volumes REF_final.npz 0.003 \
@@ -26,11 +29,12 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _analyze_axisymmetric_energy as axi   # noqa: E402
+import _analyze_rushton_lower_flow as lower   # noqa: E402
 
 PUMPING_SCALE = (200.0 / 60.0) * 0.096 ** 3
 
 
-def field(datasets, kind):
+def field(datasets, kind, rotor_lag_degrees=12.0):
     """count-weighted azimuthal mean over several snapshots of one kind"""
     total_count, total_sum = 0.0, 0.0
     for path in datasets:
@@ -38,6 +42,10 @@ def field(datasets, kind):
             cells = axi.read_interpolation_file(path)
             x = np.stack([cells["x"], cells["y"] - axi.FLUENT_Y_SHIFT, cells["z"]], axis=1)
             v = np.stack([cells["x-velocity"], cells["y-velocity"], cells["z-velocity"]], axis=1)
+            rotor = lower.in_fluent_rotor_zones(x)
+            radius = np.maximum(np.hypot(x[rotor, 0], x[rotor, 2]), 1e-12)
+            sense = np.sign(((v[rotor, 0] * x[rotor, 2] - v[rotor, 2] * x[rotor, 0]) / radius).sum()) or 1.0
+            v[rotor] = lower.turn_about_y(v[rotor], sense * np.radians(rotor_lag_degrees))
         else:
             x, v = axi.sph_arrays(path)
         count, mean, _ = axi.bin_moments(x, v)
@@ -70,6 +78,7 @@ def main():
     parser.add_argument("--volumes", nargs=2, required=True, metavar=("REF_DUMP", "DX"))
     parser.add_argument("--fluent", action="append", default=[])
     parser.add_argument("--fluent-label", default=None)
+    parser.add_argument("--fluent-rotor-lag", type=float, default=12.0)
     parser.add_argument("--sph", nargs=2, action="append", default=[], metavar=("LABEL", "DUMP"))
     parser.add_argument("--bin", type=float, default=0.006)
     parser.add_argument("--levels", type=float, default=0.1, help="flow between two stream lines, in N D^3")
@@ -85,7 +94,7 @@ def main():
     panels = []
     if arguments.fluent:
         label = arguments.fluent_label or f"Fluent, {len(arguments.fluent)} snapshots"
-        panels.append((label, *field(arguments.fluent, "fluent")))
+        panels.append((label, *field(arguments.fluent, "fluent", arguments.fluent_rotor_lag)))
     for label, path in arguments.sph:
         panels.append((label, *field([path], "sph")))
 
@@ -125,7 +134,7 @@ def main():
         circulation = np.nanmax(psi_scaled) - np.nanmin(psi_scaled)
         ax.set_title(f"{label}\nloops span {np.nanmin(psi_scaled):+.2f} .. {np.nanmax(psi_scaled):+.2f} N D³", fontsize=8)
     fig.colorbar(image, ax=axes[0, :].tolist(), shrink=0.5, label="|u_θ| azimuthal mean, m/s")
-    fig.suptitle(f"azimuthal-mean meridional streamlines (solid: anticlockwise in this view, dashed: clockwise); "
+    fig.suptitle(f"azimuthal-mean meridional streamlines (solid: clockwise in this view, dashed: anticlockwise); "
                  f"{arguments.levels:g} N D³ between lines; dotted: Fluent's rotor boxes; light band: baffles", fontsize=8)
     fig.savefig(arguments.out, dpi=140)
     print(f"wrote {arguments.out}")
