@@ -10,7 +10,8 @@ velocity), or the pitched thin plate gives more force for the same relative flow
              +y = r F_theta, the sign set so that the resistance is positive; blade faces (|n . e_theta| > 0.3,
              r > 8 mm) are front (pressure side, rotation * n_theta < 0) or back, the rest (sleeve, edges, hub)
              apart. SPH: _check_impeller_parts.py --pbt-bands ... --out PREFIX (PREFIX_parts.json), window
-             0.3..0.7 s, front + back per band, lattice hub and collar apart. Front and back each carry the
+             0.3..0.7 s, front + back per band (blades of ordinary particles, generator --conformal-pbt: the
+             net per band, by the particles' own radius), lattice hub and collar apart. Front and back each carry the
              reference pressure (Fluent's gauge reference, our background pressure) times their area; only the
              net of a band is physical.
   flow       azimuthal means in the band (cells / particles weighted equally; Fluent's rotor-zone velocities
@@ -88,8 +89,12 @@ def sph_torque(path):
     parts = window["0.3..0.7"] if "0.3..0.7" in window else next(iter(window.values()))
     out = {"front": np.zeros(len(EDGES) - 1), "back": np.zeros(len(EDGES) - 1)}
     for k, (a, b) in enumerate(zip(EDGES[:-1], EDGES[1:])):
+        band = f"r {a * 1e3:4.1f}..{b * 1e3:4.1f} mm"
+        if f"PBT solid blade, {band}" in parts:          # blades of ordinary particles (--conformal-pbt): net only
+            out["front"][k] = parts[f"PBT solid blade, {band}"]
+            continue
         for side in ("front", "back"):
-            out[side][k] = parts[f"PBT blade {side}, r {a * 1e3:4.1f}..{b * 1e3:4.1f} mm"]
+            out[side][k] = parts[f"PBT blade {side}, {band}"]
     out["other"] = parts.get("PBT hub and collar (lattice)", np.nan)
     out["total"] = out["front"].sum() + out["back"].sum() + out["other"]
     return out

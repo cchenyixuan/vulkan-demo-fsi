@@ -850,6 +850,11 @@ def main() -> int:
                              "Mixed (2026-10-03): with --conformal-baffles only the blades and the disk are "
                              "plates (baffles: conformal sheets); with --conformal-blades only the baffles are "
                              "plates (blades: conformal sheets, disk: lattice, as without --thin-plates)")
+    parser.add_argument("--conformal-pbt", type=int, default=None, metavar="LAYERS",
+                        help="with --thin-plates (2026-10-04): only the PBT blades as conformal sheets of LAYERS "
+                             "flat layers (a solid outer edge), the Rushton blades and disk stay thin plates, the "
+                             "baffles follow --conformal-baffles / --thin-layers; to test whether the PBT tip flow "
+                             "depends on the thin-plate edge")
     parser.add_argument("--thin-plate-dashpot", type=float, default=None,
                         help="numerics.thin_plate_dashpot (default of the solver: 0)")
     parser.add_argument("--skin", type=float, default=0.5,
@@ -978,6 +983,8 @@ def main() -> int:
             parser.error("--thin-plates with both --conformal-blades and --conformal-baffles leaves no plate")
         if not (args.solid_reaction_force or args.solid_pressure != "increment"):
             parser.error("--thin-plates needs --solid-reaction-force (the load on the plates is a reaction)")
+    if args.conformal_pbt is not None and not (args.thin_plates and not args.conformal_blades and args.impellers == "both"):
+        parser.error("--conformal-pbt needs --thin-plates, both impellers and no --conformal-blades")
     # Which parts are thin plates (2026-10-03): all of them with --thin-plates alone; with
     # --conformal-baffles only the impeller (blades and disk), with --conformal-blades only the baffles.
     impeller_plates = args.thin_plates and not args.conformal_blades
@@ -1007,12 +1014,15 @@ def main() -> int:
     skin = args.skin * dx
     is_rotor = sdf_rotor <= skin
     blade_points = np.zeros((0, 3))
-    if args.conformal_blades:
+    if args.conformal_blades or args.conformal_pbt is not None:
         # Blades: plane sheets of particles in the blade frames; the lattice sites inside the
         # sheets' boxes (true outline, thickness thin_layers * dx) are dropped, whatever they
         # would have been, and so are the lattice rotor sites (hub, disk) that would sit closer
         # than 0.6 dx to a blade particle.
-        blade_points, blade_boxes = conformal_blades(dx, args.thin_layers, args.impellers)
+        if args.conformal_pbt is not None:
+            blade_points, blade_boxes = conformal_blades(dx, args.conformal_pbt, "pbt")
+        else:
+            blade_points, blade_boxes = conformal_blades(dx, args.thin_layers, args.impellers)
         in_blade = Union(*blade_boxes).signed_distance(sites) <= 0.0
         near = np.nonzero(is_rotor & ~in_blade)[0]
         if near.size:
@@ -1049,7 +1059,8 @@ def main() -> int:
         # spacing thick) are dropped, and so is every other lattice site closer than 0.6 dx to a
         # plate particle. Where two plates meet (disk and blades) the particles of the later
         # plate that come closer than 0.6 dx to those of an earlier one are dropped.
-        plates = thin_plate_sheets(dx, args.impellers, LIQUID_HEIGHT, shell, args.legacy_baffles,
+        plates = thin_plate_sheets(dx, "rushton" if args.conformal_pbt is not None else args.impellers, LIQUID_HEIGHT, shell,
+                                   args.legacy_baffles,
                                    RUSHTON_HUB["radius"] + skin,
                                    with_impeller=impeller_plates, with_baffles=baffle_plates)
         kept = np.zeros((0, 3))
@@ -1124,8 +1135,9 @@ def main() -> int:
     if args.conformal_baffles:
         print(f"conformal baffles: {baffle_points.shape[0]:,} baffle particles in {args.thin_layers} layer(s)")
     rotor = np.vstack([sites[is_rotor], blade_points])
-    if args.conformal_blades:
-        print(f"conformal blades: {blade_points.shape[0]:,} blade particles in {args.thin_layers} layer(s), "
+    if args.conformal_blades or args.conformal_pbt is not None:
+        layers = args.conformal_pbt if args.conformal_pbt is not None else args.thin_layers
+        print(f"conformal blades: {blade_points.shape[0]:,} blade particles in {layers} layer(s), "
               f"{int(in_blade.sum()):,} lattice sites dropped")
     n_plate_rotor = sum(plate["points"].shape[0] for plate in plates if plate["frame"] == "rotor")
     n_plate_static = sum(plate["points"].shape[0] for plate in plates if plate["frame"] == "static")
