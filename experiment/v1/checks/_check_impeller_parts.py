@@ -111,8 +111,10 @@ def split(simulator, case, rotor_groups, pbt_bands=None):
         add("shaft and PBT hub (lattice)", lattice_torque[~hub & ~bell].sum())
     else:
         pbt_hub = (r < 0.012) & (y > 0.170) & (y < 0.215)
-        # PBT blades made of ordinary rotor particles (generator --conformal-pbt, 2026-10-04): by their own radius
-        pbt_sheet = (r >= 0.012) & (y > 0.175) & (y < 0.215)
+        # PBT blades made of ordinary rotor particles (generator --conformal-pbt, 2026-10-04): by their own radius.
+        # Not with thin-plate PBT blades: their particles are rotor particles too, with zero force of their own.
+        pbt_plates = any(entry.name.startswith("pbt_blade") for entry in case.thin_plates or [])
+        pbt_sheet = (r >= 0.012) & (y > 0.175) & (y < 0.215) & (not pbt_plates)
         add("PBT hub and collar (lattice)", lattice_torque[pbt_hub].sum())
         if pbt_sheet.any():
             for r0, r1 in zip(pbt_bands[:-1], pbt_bands[1:]):

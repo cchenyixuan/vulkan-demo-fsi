@@ -90,7 +90,7 @@ def sph_torque(path):
     out = {"front": np.zeros(len(EDGES) - 1), "back": np.zeros(len(EDGES) - 1)}
     for k, (a, b) in enumerate(zip(EDGES[:-1], EDGES[1:])):
         band = f"r {a * 1e3:4.1f}..{b * 1e3:4.1f} mm"
-        if f"PBT solid blade, {band}" in parts:          # blades of ordinary particles (--conformal-pbt): net only
+        if f"PBT blade front, {band}" not in parts:      # blades of ordinary particles (--conformal-pbt): net only
             out["front"][k] = parts[f"PBT solid blade, {band}"]
             continue
         for side in ("front", "back"):
