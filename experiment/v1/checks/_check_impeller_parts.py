@@ -14,11 +14,21 @@ steps splits the resistance torque of the rotor:
 Torque about +y, divided by the mass factor; reported as resistance (positive = against the rotation, which
 turns along +y). Averages over the windows given with --windows.
 
+Options of 2026-10-04 (PBT study, log/2026-10-04_fluctuation-scales-and-pbt-bands.md), off by default:
+  --pbt-bands E0 E1 ...  the PBT blade records also split by the radius of the fluid particle into the bands
+                         [E0, E1), [E1, E2), ... m, front and back ("PBT blade front, r 24.0..32.0 mm"), and
+                         the lattice part "shaft and PBT hub" split into "PBT hub and collar (lattice)"
+                         (r < 12 mm, 170 < y < 215 mm) and "shaft (lattice)";
+  --out PREFIX           window means of every part as PREFIX_parts.json;
+  --dump-times T ...     dumps PREFIX_tT.npz in the format of _check_tank_energy.py (needs --out).
+
 usage (repo root, solver environment):
     python experiment/v1/checks/_check_impeller_parts.py CASE_DIR --time 4 --every 200 \
-        [--initial-velocity V.npy] --windows 0.3 0.7 0.7 1.5 3 4
+        [--initial-velocity V.npy] --windows 0.3 0.7 0.7 1.5 3 4 \
+        [--pbt-bands 0.0122 0.016 0.024 0.032 0.040 0.050 --out PREFIX --dump-times 0.4 0.5]
 """
 import argparse
+import json
 import pathlib
 import sys
 
@@ -36,7 +46,7 @@ def rotation(theta):
     return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
 
 
-def split(simulator, case, rotor_groups):
+def split(simulator, case, rotor_groups, pbt_bands=None):
     theta = float(simulator.rotor_angle)
     turn = rotation(theta)
     pivot = np.asarray(case.rotor.pivot, dtype=np.float64)
@@ -69,8 +79,19 @@ def split(simulator, case, rotor_groups):
             add("Rushton disk top", t[y > DISK_MID].sum())
             add("Rushton disk bottom", t[y <= DISK_MID].sum())
         elif entry.name.startswith("pbt_blade"):
+            # side of the pitched plate by its normal, turned to face the motion (2026-10-04; "ahead of the
+            # centre" put the back face near the leading edge into the front)
+            normal = turn @ np.asarray(entry.normal, dtype=np.float64)
+            normal = normal if normal @ motion > 0 else -normal
+            ahead = (position[mask] - centre) @ normal > 0
             add("PBT blade front", t[ahead].sum())
             add("PBT blade back", t[~ahead].sum())
+            if pbt_bands is not None:
+                r = np.hypot(position[mask, 0], position[mask, 2])
+                for r0, r1 in zip(pbt_bands[:-1], pbt_bands[1:]):
+                    band = (r >= r0) & (r < r1)
+                    for side, select in (("front", ahead), ("back", ~ahead)):
+                        add(f"PBT blade {side}, r {r0 * 1e3:4.1f}..{r1 * 1e3:4.1f} mm", t[select & band].sum())
         else:
             add(f"plate {entry.name}", t.sum())
     positions = simulator.readback_positions()
@@ -86,7 +107,12 @@ def split(simulator, case, rotor_groups):
     bell = y <= 0.019
     add("Rushton hub (lattice)", lattice_torque[hub].sum())
     add("bell (lattice)", lattice_torque[bell].sum())
-    add("shaft and PBT hub (lattice)", lattice_torque[~hub & ~bell].sum())
+    if pbt_bands is None:
+        add("shaft and PBT hub (lattice)", lattice_torque[~hub & ~bell].sum())
+    else:
+        pbt_hub = (r < 0.012) & (y > 0.170) & (y < 0.215)
+        add("PBT hub and collar (lattice)", lattice_torque[pbt_hub].sum())
+        add("shaft (lattice)", lattice_torque[~hub & ~bell & ~pbt_hub].sum())
     return parts
 
 
@@ -97,7 +123,12 @@ def main():
     parser.add_argument("--every", type=int, default=200)
     parser.add_argument("--initial-velocity", default=None)
     parser.add_argument("--windows", type=float, nargs="+", default=[0.3, 0.7])
+    parser.add_argument("--pbt-bands", type=float, nargs="+", default=None)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--dump-times", type=float, nargs="*", default=[])
     arguments = parser.parse_args()
+    if arguments.dump_times and not arguments.out:
+        parser.error("--dump-times needs --out")
 
     from utils.sph.case import load_case
     from utils.sph.vulkan_context import VulkanContext
@@ -110,6 +141,10 @@ def main():
     windows = list(zip(arguments.windows[0::2], arguments.windows[1::2]))
     rotor_groups = np.asarray([m.group_id for m in case.materials if m.kind == 3], dtype=np.uint32)
     samples = []
+    dump_times = sorted(arguments.dump_times)
+    out = pathlib.Path(arguments.out) if arguments.out else None
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
     with VulkanContext.create(application_name="impeller_parts", enable_validation=False) as context:
         simulator = SphSimulatorV1(context, case)
         try:
@@ -118,11 +153,18 @@ def main():
             simulator.bootstrap()
             while simulator.step_count < steps:
                 simulator.step()
+                if dump_times and simulator.simulation_time >= dump_times[0]:
+                    np.savez(out.parent / f"{out.name}_t{dump_times.pop(0):.3f}.npz",
+                             positions=simulator.readback_positions(), material=simulator.readback_material(),
+                             velocity_mass=simulator.readback_velocity_mass(),
+                             particle_uid=simulator.readback_particle_uid(),
+                             status=json.dumps(simulator.readback_global_status()),
+                             density_pressure=simulator.readback_density_pressure())
                 if simulator.step_count % arguments.every or simulator.simulation_time < windows[0][0]:
                     continue
                 simulator.begin_readback_cache()
                 total = simulator.readback_rotor_torque(0.1, 0.007)
-                parts = split(simulator, case, rotor_groups)
+                parts = split(simulator, case, rotor_groups, arguments.pbt_bands)
                 factor = total["mass_factor"]
                 parts = {name: -value / factor for name, value in parts.items()}
                 parts["TOTAL (solver, lower + upper + shaft)"] = -total["torque_axis"] / factor
@@ -132,6 +174,11 @@ def main():
         finally:
             simulator.destroy()
     names = list(samples[0][1])
+    if out is not None:
+        means = {f"{a:g}..{b:g}": {name: float(np.mean([s[name] for t, s in samples if a <= t < b and name in s]))
+                                   for name in names} for a, b in windows}
+        with open(out.parent / f"{out.name}_parts.json", "w") as handle:
+            json.dump({"case": str(arguments.case), "samples": len(samples), "windows": means}, handle, indent=1)
     print(f"{arguments.case}: resistance torque, mN m (positive = against the rotation)")
     print("  part                                         " + "".join(f"{f'{a:g}..{b:g} s':>12s}" for a, b in windows))
     for name in names:
