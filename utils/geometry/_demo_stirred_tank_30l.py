@@ -1086,11 +1086,19 @@ def main() -> int:
         # Of the lattice shell only the flat lid is kept (y above the liquid, r < TANK_RADIUS + 0.5 dx), all of
         # it: shell particles closer than 0.6 dx to a lid site are dropped instead (thinning the lid at the
         # corner left an annular gap through which fluid climbed out, 12 particles in 0.2 s at rest). Shell
-        # particles inside a lattice solid (bearing boss, shaft below the floor) are dropped, the solid stays;
-        # every other lattice site (static solids, fluid) closer than 0.6 dx to a shell particle is dropped.
+        # particles inside the rotor are dropped. Inside a static lattice solid (bearing boss, baffle brackets)
+        # the solid stays and a shell particle is kept only where it fills a notch of the solid's staircase:
+        # within one spacing of the solid's surface and no site of the solid closer than 0.6 dx (2026-10-04;
+        # dropping all of them left the notches open: at 2 mm fluid from under the rotating bell went down
+        # between the bearing boss and the floor shell and out of the domain, 54 particles in 0.2 s at rest,
+        # 979 in 0.7 s stirred, and at two baffle brackets fluid sat in notches at the cylinder, r 145 mm).
+        # Every other lattice site (static solids, fluid) closer than 0.6 dx to a shell particle is dropped.
         shell_points = smooth_tank_shell(dx, border)
-        shell_points = shell_points[(wall_solid.signed_distance(shell_points) > 0.0)
-                                    & (rotor_region.signed_distance(shell_points) > 0.0)]
+        depth = wall_solid.signed_distance(shell_points)
+        fills_notch = (depth > -dx) & ~points_closer_than(shell_points, sites[is_wall_solid], 0.6 * dx)
+        outside_rotor = rotor_region.signed_distance(shell_points) > 0.0
+        notch_count = int((fills_notch & (depth <= 0.0) & outside_rotor).sum())
+        shell_points = shell_points[((depth > 0.0) | fills_notch) & outside_rotor]
         radius_sites = np.hypot(sites[:, 0], sites[:, 2])
         is_shell &= (sites[:, 1] > LIQUID_HEIGHT - 0.5 * dx) & (radius_sites < TANK_RADIUS + 0.5 * dx)
         shell_points = shell_points[~points_closer_than(shell_points, sites[is_shell], 0.6 * dx)]
@@ -1100,7 +1108,8 @@ def main() -> int:
         is_shell[too_close] = False
         is_wall_solid[too_close] = False
         is_fluid[too_close] = False
-        print(f"smooth walls: {shell_points.shape[0]:,} shell particles in {border} layers; "
+        print(f"smooth walls: {shell_points.shape[0]:,} shell particles in {border} layers "
+              f"({notch_count} of them in notches of lattice solids); "
               f"{too_close.size:,} lattice sites closer than 0.6 dx dropped, {dropped_fluid} of them fluid")
 
     fluid = sites[is_fluid]
