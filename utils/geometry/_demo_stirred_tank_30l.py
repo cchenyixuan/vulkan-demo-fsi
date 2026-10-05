@@ -864,6 +864,11 @@ def main() -> int:
     parser.add_argument("--fluent-hubs", action="store_true",
                         help="hubs and PBT blade span of the Fluent LES mesh (FLUENT_RUSHTON_HUB, FLUENT_PBT_HUB, "
                              "FLUENT_PBT_RADIAL) instead of the M-Star STL's")
+    parser.add_argument("--pbt-tip-radius", type=float, default=None, metavar="R",
+                        help="diagnostic (2026-10-05): cut the PBT blades at radius R (m) instead of the true tip "
+                             "(thin plates: PBT_TRUE_LENGTH 48.2 mm; lattice blades: 49.1 mm). A shorter blade mimics "
+                             "the tip unloading Fluent shows and our thin plates lack; 45.2 mm brings the PBT torque "
+                             "to about Fluent's 15 mN m. Not physical")
     parser.add_argument("--smooth-walls", action="store_true",
                         help="shell of the cylinder and the dished floor as layers that follow the surfaces "
                              "(smooth_tank_shell) instead of lattice sites (a staircase); the flat lid stays on the lattice")
@@ -954,7 +959,13 @@ def main() -> int:
     parser.add_argument("--feed-stop", type=float, default=None, help="feed stop, s (default: never)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
-    global PBT_HUB, PBT_COLLAR, RUSHTON_HUB
+    global PBT_HUB, PBT_COLLAR, RUSHTON_HUB, PBT_TRUE_LENGTH, PBT_TIP_RADIUS
+    if args.pbt_tip_radius is not None:
+        # shortened PBT blades (diagnostic): the thin plates end at R, the lattice blades (with or without
+        # --clip-tips) are cut at R as well
+        PBT_TRUE_LENGTH = PBT_TIP_RADIUS = args.pbt_tip_radius
+        PBT_BLADE["radial"] = (PBT_BLADE["radial"][0], args.pbt_tip_radius)
+        print(f"PBT blades cut at r = {args.pbt_tip_radius * 1e3:.1f} mm (diagnostic --pbt-tip-radius)")
     if args.legacy_pbt:
         PBT_HUB = LEGACY_PBT_HUB
         PBT_BLADE["chord"] = LEGACY_PBT_CHORD
