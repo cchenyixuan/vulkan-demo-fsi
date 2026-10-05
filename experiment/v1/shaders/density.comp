@@ -138,6 +138,10 @@ void main() {
     // Dead code unless USE_SCALAR_SGS.
     bool self_is_fluid = (self_params.kind == MATERIAL_FLUID);
     mat3 velocity_gradient = mat3(0.0);
+    // Near-wall damping of the momentum SGS (2026-10-05, USE_SGS_WALL_DAMPING):
+    // distance to the nearest solid neighbour (or thin-plate wall dummy); the
+    // support radius when there is none. Dead code unless the option is on.
+    float nearest_wall_distance = sqrt(smoothing_length_squared());
 
     float density_drift     = 0.0;
     float density_diffusion = 0.0;
@@ -275,6 +279,15 @@ void main() {
             if ((USE_SCALAR_SGS || USE_MOMENTUM_SGS) && self_is_fluid) {
                 velocity_gradient += neighbor_volume
                     * outerProduct(neighbor_velocity - self_velocity, raw_gradient);
+            }
+            if (USE_MOMENTUM_SGS && USE_SGS_WALL_DAMPING && self_is_fluid) {
+                // nearest solid neighbour (ordinary wall / rotor particle, or a wall dummy
+                // of a thin plate) for the mixing-length limit after the loop
+                bool neighbor_is_solid = is_solid_kind(material_parameters[material[neighbor_particle_id]].kind);
+#if WITH_THIN_PLATES
+                neighbor_is_solid = neighbor_is_solid || neighbor_is_wall_dummy;
+#endif
+                if (neighbor_is_solid) nearest_wall_distance = min(nearest_wall_distance, distance);
             }
 
             // --- δ-SPH density diffusion (gated by USE_DENSITY_DIFFUSION) -
@@ -431,7 +444,13 @@ void main() {
                                      + dot(strain_rate[1], strain_rate[1])
                                      + dot(strain_rate[2], strain_rate[2]);   // S:S
         // momentum SGS (2026-10-01): its own (C_s Delta)^2, see USE_MOMENTUM_SGS
-        turbulent_viscosity[self_particle_id] =
-            (USE_MOMENTUM_SGS ? MOMENTUM_SGS_LENGTH_SQUARED : SGS_LENGTH_SQUARED) * sqrt(2.0 * strain_rate_contracted);
+        float mixing_length_squared = USE_MOMENTUM_SGS ? MOMENTUM_SGS_LENGTH_SQUARED : SGS_LENGTH_SQUARED;
+        if (USE_MOMENTUM_SGS && USE_SGS_WALL_DAMPING) {
+            // Smagorinsky-Lilly wall limit: L_s = min(kappa d, C_s Delta), see common.glsl
+            float wall_distance = max(nearest_wall_distance - SGS_WALL_DISTANCE_OFFSET, 0.0);
+            float wall_length   = 0.41 * wall_distance;
+            mixing_length_squared = min(mixing_length_squared, wall_length * wall_length);
+        }
+        turbulent_viscosity[self_particle_id] = mixing_length_squared * sqrt(2.0 * strain_rate_contracted);
     }
 }

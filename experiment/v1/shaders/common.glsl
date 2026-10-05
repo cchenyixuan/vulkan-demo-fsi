@@ -179,6 +179,18 @@ layout(constant_id = 76) const uint SHIFT_TRANSPORT_MODE = 0u;
 // value). The original code has no SGS term in the momentum equation.
 layout(constant_id = 77) const bool  USE_MOMENTUM_SGS = false;
 layout(constant_id = 78) const float MOMENTUM_SGS_LENGTH_SQUARED = 0.0;
+// Near-wall damping of the momentum SGS (numerics.momentum_sgs_wall_damping,
+// 2026-10-05): the mixing length is limited by the distance to the wall as in
+// the Smagorinsky-Lilly model of Fluent,
+//     L_s = min(kappa d, C_s Delta),   nu_t = L_s^2 |S|,   kappa = 0.41,
+// d = distance from the fluid particle to the nearest solid particle or thin-
+// plate wall dummy inside its support, minus SGS_WALL_DISTANCE_OFFSET (the
+// particle radius: the solid particle centres sit half a spacing inside the
+// surface); no solid inside the support = no limit. Without it the eddy
+// viscosity keeps its full value up to the wall, which over-damps the shear
+// layers on the blades (log/2026-10-05_paratera-2mm-sheet-baffles.md).
+layout(constant_id = 94) const bool  USE_SGS_WALL_DAMPING = false;
+layout(constant_id = 95) const float SGS_WALL_DISTANCE_OFFSET = 0.0;
 // SOLID_PRESSURE_OFFSET p_w (numerics.solid_pressure_offset, Pa; mirror modes
 // only): constant added to the mirrored solid pressure,
 //     P_j = P_i + rho_i (g - a_j) . (x_j - x_i) + p_w,

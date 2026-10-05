@@ -310,6 +310,8 @@ compile `_test_common.comp` by hand as a regression check after
            (2026-10-01; Monod uptake in predict.comp, log/2026-10-01_reaction-and-feed.md)
 77, 78   : USE_MOMENTUM_SGS, MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01; Smagorinsky nu_t added to the viscosity of
            fluid-fluid pairs in force.comp, nu_t from density.comp; log/2026-10-01_momentum-sgs.md)
+94, 95   : USE_SGS_WALL_DAMPING, SGS_WALL_DISTANCE_OFFSET (2026-10-05; Smagorinsky-Lilly wall limit
+           L_s = min(0.41 d, C_s Delta) of the momentum SGS, d from the nearest solid neighbour in density.comp)
 49       : THIN_PLATE_COUNT (2026-09-30, plates builds only)
 40 - 49  : SPH numerical parameters (ε_h², PST main, PST anti, toggles, ...)
 50 - 53  : capacities + workgroup size + POOL_SIZE

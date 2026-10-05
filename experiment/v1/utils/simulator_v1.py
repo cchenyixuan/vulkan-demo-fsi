@@ -125,6 +125,8 @@ SPEC_ID_REACTION_HALF_SATURATION            = 91
 SPEC_ID_REACTION_YIELD                      = 92
 SPEC_ID_USE_FREE_SLIP_WALLS                 = 93
 SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
+SPEC_ID_USE_SGS_WALL_DAMPING                = 94
+SPEC_ID_SGS_WALL_DISTANCE_OFFSET            = 95
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
 SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM = 38
@@ -939,6 +941,8 @@ class SphSimulatorV1:
             (SPEC_ID_SHIFT_TRANSPORT_MODE,         SHIFT_TRANSPORT_MODES[numerics.shift_transport], 'I'),
             (SPEC_ID_USE_MOMENTUM_SGS,             1 if numerics.momentum_sgs else 0,           'I'),
             (SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED,  float(case.momentum_sgs_length_squared),   'f'),
+            (SPEC_ID_USE_SGS_WALL_DAMPING,         1 if (numerics.momentum_sgs and numerics.momentum_sgs_wall_damping) else 0, 'I'),
+            (SPEC_ID_SGS_WALL_DISTANCE_OFFSET,     float(case.physics.particle_radius),      'f'),
             (SPEC_ID_SOLID_PRESSURE_OFFSET,        float(numerics.solid_pressure_offset),     'f'),
             (SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM, 1 if numerics.density_diffusion_gradient_term else 0, 'I'),
             (SPEC_ID_PST_NEAR_SOLID_MODE,          int(PST_NEAR_SOLID_MODES[numerics.pst_near_solid]), 'I'),

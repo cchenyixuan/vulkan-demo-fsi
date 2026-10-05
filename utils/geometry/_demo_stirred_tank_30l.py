@@ -884,6 +884,9 @@ def main() -> int:
                         help="numerics.momentum_sgs with Smagorinsky C_s (2026-10-01); see --momentum-sgs-width")
     parser.add_argument("--momentum-sgs-width", default="dx",
                         help="filter width of the momentum SGS: 'dx', '2dx', 'h' or metres (default dx)")
+    parser.add_argument("--momentum-sgs-wall-damping", action="store_true",
+                        help="numerics.momentum_sgs_wall_damping (2026-10-05): mixing length limited by 0.41 x the "
+                             "distance to the nearest solid particle or plate dummy (Smagorinsky-Lilly wall limit)")
     parser.add_argument("--shift-transport", choices=("none", "density", "momentum", "both"), default="none",
                         help="numerics.shift_transport: transport terms of the particle shift in the continuity "
                              "and momentum equations (2026-09-30)")
@@ -1189,9 +1192,11 @@ def main() -> int:
         width = {"dx": args.dx, "2dx": 2.0 * args.dx, "h": args.hdx * args.dx}.get(width_text)
         if width is None:
             width = float(width_text)
+        damping = "  momentum_sgs_wall_damping: true\n" if args.momentum_sgs_wall_damping else ""
         case_text = case_text.replace(
             "  use_pst: true",
-            f"  momentum_sgs: true\n  momentum_sgs_cs: {args.momentum_sgs:g}\n  momentum_sgs_filter_width: {width:.6g}\n  use_pst: true")
+            f"  momentum_sgs: true\n  momentum_sgs_cs: {args.momentum_sgs:g}\n  momentum_sgs_filter_width: {width:.6g}\n"
+            f"{damping}  use_pst: true")
     if args.shift_transport != "none":
         case_text = case_text.replace("  use_pst: true", f"  shift_transport: {args.shift_transport}\n  use_pst: true")
     if args.no_solid_density_floor:

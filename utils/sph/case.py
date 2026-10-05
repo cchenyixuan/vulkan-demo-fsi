@@ -407,6 +407,9 @@ class NumericsConfig:
     momentum_sgs: bool = False
     momentum_sgs_cs: float = 0.1
     momentum_sgs_filter_width: Optional[float] = None
+    # Near-wall damping of the momentum SGS (2026-10-05, USE_SGS_WALL_DAMPING): L_s = min(0.41 d, C_s Delta)
+    # with d the distance to the nearest solid particle or thin-plate dummy minus the particle radius.
+    momentum_sgs_wall_damping: bool = False
     # Mirror modes: constant p_w (Pa) added to the mirrored solid pressure, a
     # repulsive layer on fluid-solid pairs only (see common.glsl).
     solid_pressure_offset: float = 0.0
@@ -423,6 +426,7 @@ class NumericsConfig:
             raise ValueError(f"numerics.thin_plate_dashpot must be >= 0, got {self.thin_plate_dashpot}")
         self.momentum_sgs = bool(self.momentum_sgs)
         self.momentum_sgs_cs = float(self.momentum_sgs_cs)
+        self.momentum_sgs_wall_damping = bool(self.momentum_sgs_wall_damping)
         if self.momentum_sgs_filter_width is not None:
             self.momentum_sgs_filter_width = float(self.momentum_sgs_filter_width)
         if self.shift_transport not in SHIFT_TRANSPORT_MODES:
@@ -1274,6 +1278,8 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (93,  lambda case: 1 if any(material.free_slip for material in case.materials) else 0, 'I'),  # USE_FREE_SLIP_WALLS
     (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED
+    (94,  lambda case: 1 if (case.numerics.momentum_sgs and case.numerics.momentum_sgs_wall_damping) else 0, 'I'),  # USE_SGS_WALL_DAMPING
+    (95,  lambda case: case.physics.particle_radius,                   'f'),  # SGS_WALL_DISTANCE_OFFSET
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
     (38,  lambda case: 1 if case.numerics.density_diffusion_gradient_term else 0, 'I'),
     (39,  lambda case: PST_NEAR_SOLID_MODES[case.numerics.pst_near_solid], 'I'),  # PST_NEAR_SOLID_MODE
