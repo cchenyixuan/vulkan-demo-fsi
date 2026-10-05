@@ -905,6 +905,9 @@ def main() -> int:
                         help="numerics.density_diffusion_gradient_term (needed with gravity)")
     parser.add_argument("--pst-near-solid", choices=("full", "tangential"), default="full",
                         help="numerics.pst_near_solid")
+    parser.add_argument("--pst-main", type=float, default=None,
+                        help="numerics.pst_main, the main coefficient of the particle shift (default of the case "
+                             "0.1; 0.05 cut the sub-kernel noise by 25 %% in the 0.7 s test of 2026-10-04)")
     parser.add_argument("--solid-pressure", choices=("increment", "mirror", "mirror_tic", "accumulate", "extrapolate"),
                         default="increment",
                         help="numerics.solid_pressure: pressure of the solid particles seen by the fluid "
@@ -1195,6 +1198,9 @@ def main() -> int:
         case_text = case_text.replace("  use_pst: true", f"  solid_pressure: {args.solid_pressure}\n"
                                       f"  solid_reaction_force: true\n"
                                       f"  solid_pressure_offset: {args.solid_pressure_offset:g}\n  use_pst: true")
+    if args.pst_main is not None:
+        assert case_text.count("  pst_main: 0.1\n") == 1
+        case_text = case_text.replace("  pst_main: 0.1\n", f"  pst_main: {args.pst_main:g}\n")
     if args.symmetric_pair_correction:
         assert case_text.count("  use_pst: true") == 1
         case_text = case_text.replace("  use_pst: true", "  symmetric_pair_correction: true\n  use_pst: true")
