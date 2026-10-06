@@ -78,7 +78,20 @@ N1 的曲线就是一个饱饥循环：GLY 从 24.6 升到 37（120 s），糖�
 
 ## D1 提交（Mahuika，`cluster_jobs/mahuika/submit_D1.sh`）
 
-SUBMIT_TODO
+代码 `fsi_138281c.tar.gz`（`git archive` 加本机编译的 spv，`predict.comp.spv` md5 与本机一致）解到
+`/nesi/project/uoa04509/sph/vulkan-demo-fsi_138281c`。两个作业，PRO 6000，各 `--mem=96G -t 60:00:00`，`job_lifeline.sh`：
+
+| 作业 | 名称 | 生成器选项（生产配置之外） | 内容 |
+| --- | --- | --- | --- |
+| 9569343 | D1two | `--ninepool --sgs --feed-start 20` | 双向：九池在粒子上，摄取从粒子自己的 C_s 扣 |
+| 9569344 | D1one | `--ninepool --ninepool-one-way --q-max-umol-per-g-h 1354 --k-s 9.8e-6 --sgs --feed-start 20` | 单向：Monod 汇（容量 = 双向稳态 k_E11 X_E11），池沿 lifeline 离线积分 |
+
+共同：2 mm，90 s（2,056,600 步），加料 2 × 10⁻⁴ mol/s 从 20 s，2 万条 lifeline 从 30 s，记录 substrate、gly、growth_rate、pen_capacity、sto，
+探针每 457 步，`REGIME_MONOD="3.761e-7 9.8e-6"`（分区按 C_s 的 Monod 比）。预计每个约 40 小时；队列前面有 P1（预计 10 月 10 日开始）。
+输出 `/nesi/nobackup/uoa04509/sph/lifeline/D1_2mm_ninepool_{two,one}_way_*`，日志 `sph/logs/life_D1two_9569343.out`、`life_D1one_9569344.out`。
+
+跑完后要做的分析：两套 lifeline 的 X_gly、μ、q_p 分布和区间停留时间；单向的池用 `_model_ninepool.py` 沿记录的 C_s 积分（脚本待写）；
+全罐 q_p 相对理想混合的损失。
 
 ## 待确认
 
