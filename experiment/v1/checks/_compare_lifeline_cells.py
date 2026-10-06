@@ -103,12 +103,21 @@ def main():
               f"mean residence E {residence[1]:.2f} s, L {residence[2]:.2f} s, S {residence[3]:.2f} s")
     try:
         import _model_ninepool as model
+        # ideally mixed reference: chemostat steady states of the 0-D model (D 0.02 .. 0.08, where the
+        # integrator is reliable), q_p interpolated at the population-mean growth rate
+        table = []
+        y = model.Y0
+        for D in (0.02, 0.03, 0.04, 0.05, 0.06, 0.08):
+            sol = model.run(D, 0.0895, 5e-3, 400.0, y); y = sol.y[:, -1]
+            v, _ = model.rates(y[:9], y[9], y[10])
+            table.append((v[2], v[7]))
+        table = np.array(table)
         for label, time, s in sets:
             mu_mean = float(np.nanmean(s["mu"]))
-            sol = model.run(max(mu_mean - model.P["vd"], 1e-3), 0.0895, 5e-3, 400.0, model.Y0, method="BDF")   # LSODA can stall at low D
-            v, _ = model.rates(sol.y[:9, -1], sol.y[9, -1], sol.y[10, -1])
+            q_ideal = float(np.interp(mu_mean, table[:, 0], table[:, 1]))
+            note = "" if table[0, 0] <= mu_mean <= table[-1, 0] else " (outside the table, clamped)"
             print(f"   {label:8s} mean q_p {np.nanmean(s['q_p']):.3e} vs ideally mixed chemostat at the same mu ({mu_mean:.4f} 1/h): "
-                  f"{v[7]:.3e} -> {100.0 * (np.nanmean(s['q_p']) / v[7] - 1.0):+.1f} %")
+                  f"{q_ideal:.3e} -> {100.0 * (np.nanmean(s['q_p']) / q_ideal - 1.0):+.1f} %{note}")
     except Exception as error:   # scipy missing in the solver environment
         print(f"   (ideal-mixing reference skipped: {error})")
     return 0
