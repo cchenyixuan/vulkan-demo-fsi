@@ -212,6 +212,55 @@ void main() {
                     delta[min(biomass_component, 3u)] += REACTION_YIELD * uptake;
                 }
             }
+            // Level-2 cell model (2026-10-06, stage 5, see REACTION_STATE_LAYOUT in common.glsl):
+            // uptake limited by the physiological state mu, which relaxes towards the realised growth
+            // rate; maintenance and product. The state vec4 has a higher index than this one, so its
+            // increment is written back to scalar_delta here and applied by a later pass of this loop.
+            // Every expression is finite for any input (RTX 5090 rule, see thin_plates.glsl).
+            if (REACTION_MODE == 2u && vec4_index == (REACTION_LAYOUT & 15u)) {
+                uint substrate_component   = min((REACTION_LAYOUT >> 4u) & 15u, 3u);
+                uint biomass_component     = min((REACTION_LAYOUT >> 8u) & 15u, 3u);
+                uint uptake_component      = (REACTION_LAYOUT >> 12u) & 15u;
+                uint state_index           = scalar_index(self_particle_id, REACTION_STATE_LAYOUT & 15u);
+                uint growth_rate_component = min((REACTION_STATE_LAYOUT >> 4u) & 15u, 3u);
+                uint product_component     = (REACTION_STATE_LAYOUT >> 8u) & 15u;
+                uint maintenance_component = (REACTION_STATE_LAYOUT >> 12u) & 15u;
+                vec4  state_delta = scalar_delta[state_index];
+                vec4  state_value = scalar[state_index];
+                float substrate   = max(value[substrate_component] + delta[substrate_component], 0.0);
+                float biomass     = max(value[biomass_component] + delta[biomass_component], 0.0);
+                float growth_rate = max(state_value[growth_rate_component] + state_delta[growth_rate_component], 0.0);
+                float biomass_time = biomass * TIMESTEP;
+                float rate_factor  = REACTION_Q_MAX * biomass_time / (REACTION_HALF_SATURATION + substrate);
+                float uptake       = substrate * rate_factor / (1.0 + rate_factor);              // supply
+                float growth_rate_maximum = max(REACTION_YIELD * (REACTION_Q_MAX - REACTION_MAINTENANCE), 0.0);
+                if (REACTION_YIELD > 0.0) {
+                    float demand = ((growth_rate + REACTION_DEMAND_MARGIN * growth_rate_maximum) / REACTION_YIELD
+                                    + REACTION_MAINTENANCE) * biomass_time;
+                    uptake = min(uptake, demand);
+                }
+                float maintenance   = min(uptake, REACTION_MAINTENANCE * biomass_time);
+                float growth        = REACTION_YIELD * (uptake - maintenance);
+                float growth_actual = growth / max(biomass_time, 1.0e-30);
+                float tau           = (growth_actual > growth_rate) ? REACTION_TAU_UP : REACTION_TAU_DOWN;
+                float relaxation    = TIMESTEP / max(tau, 1.0e-30);
+                float growth_rate_new = (growth_rate + relaxation * growth_actual) / (1.0 + relaxation);
+                float product_rate  = max(REACTION_PRODUCT_P0 + growth_rate_new * (REACTION_PRODUCT_P1
+                                          + REACTION_PRODUCT_P2 * growth_rate_new), 0.0);
+                delta[substrate_component] -= uptake;
+                if (uptake_component < 4u) {
+                    delta[uptake_component] += uptake;
+                }
+                delta[biomass_component] += growth;
+                state_delta[growth_rate_component] += growth_rate_new - growth_rate;
+                if (product_component < 4u) {
+                    state_delta[product_component] += product_rate * biomass_time;
+                }
+                if (maintenance_component < 4u) {
+                    state_delta[maintenance_component] += maintenance;
+                }
+                scalar_delta[state_index] = state_delta;
+            }
             precise vec4 compensation = vec4(0.0);
             if (USE_SCALAR_COMPENSATED_SUM) {
                 // Kahan (1965): value holds the running sum, compensation the

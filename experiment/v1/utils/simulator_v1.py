@@ -123,6 +123,14 @@ SPEC_ID_REACTION_LAYOUT                     = 89
 SPEC_ID_REACTION_Q_MAX                      = 90
 SPEC_ID_REACTION_HALF_SATURATION            = 91
 SPEC_ID_REACTION_YIELD                      = 92
+SPEC_ID_REACTION_STATE_LAYOUT               = 96    # stage 5 (2026-10-06)
+SPEC_ID_REACTION_MAINTENANCE                = 97
+SPEC_ID_REACTION_DEMAND_MARGIN              = 98
+SPEC_ID_REACTION_TAU_UP                     = 99
+SPEC_ID_REACTION_TAU_DOWN                   = 100
+SPEC_ID_REACTION_PRODUCT_P0                 = 101
+SPEC_ID_REACTION_PRODUCT_P1                 = 102
+SPEC_ID_REACTION_PRODUCT_P2                 = 103
 SPEC_ID_USE_FREE_SLIP_WALLS                 = 93
 SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
 SPEC_ID_USE_SGS_WALL_DAMPING                = 94
@@ -983,11 +991,19 @@ class SphSimulatorV1:
             (SPEC_ID_USE_SCALAR_SHIFT_CORRECTION,  1 if case.scalars is not None and case.scalars.shift_correction else 0, 'I'),
             (SPEC_ID_USE_SCALAR_COMPENSATED_SUM,   1 if case.scalars is None or case.scalars.compensated_sum else 0, 'I'),
             (SPEC_ID_USE_SCALAR_INJECTION,         1 if case.scalars is not None and (case.scalars.injections or case.scalars.sources) else 0, 'I'),
-            (SPEC_ID_REACTION_MODE,                1 if case.scalars is not None and case.scalars.reactions else 0, 'I'),
+            (SPEC_ID_REACTION_MODE,                case.scalars.reactions[0].mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),
             (SPEC_ID_REACTION_LAYOUT,              case.scalars.reaction_layout() if case.scalars is not None else 0, 'I'),
             (SPEC_ID_REACTION_Q_MAX,               float(case.scalars.reactions[0].q_max) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_REACTION_HALF_SATURATION,     float(case.scalars.reactions[0].k_s) if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
             (SPEC_ID_REACTION_YIELD,               float(case.scalars.reactions[0].growth_yield) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_REACTION_STATE_LAYOUT,        case.scalars.reaction_state_layout() if case.scalars is not None else 0, 'I'),
+            (SPEC_ID_REACTION_MAINTENANCE,         float(case.scalars.reactions[0].maintenance_rate) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_REACTION_DEMAND_MARGIN,       float(case.scalars.reactions[0].demand_margin) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_REACTION_TAU_UP,              float(case.scalars.reactions[0].tau_up) if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
+            (SPEC_ID_REACTION_TAU_DOWN,            float(case.scalars.reactions[0].tau_down) if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
+            (SPEC_ID_REACTION_PRODUCT_P0,          float(case.scalars.reactions[0].product_rate[0]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_REACTION_PRODUCT_P1,          float(case.scalars.reactions[0].product_rate[1]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_REACTION_PRODUCT_P2,          float(case.scalars.reactions[0].product_rate[2]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_USE_FREE_SLIP_WALLS,          1 if any(material.free_slip for material in case.materials) else 0, 'I'),
             (SPEC_ID_USE_SCALAR_BOUNDS_LIMITER,    1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
             (SPEC_ID_SCALAR_FIELD_COUNT,           0 if case.scalars is None else len(case.scalars.fields), 'I'),

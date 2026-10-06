@@ -782,6 +782,15 @@ def scalars_block(args, h) -> str:
         lines.append(f"    - {{name: biomass, diffusivity: 0.0, turbulent: false, initial: {args.biomass:.6e}}}")
         lines.append("    - {name: uptake, diffusivity: 0.0, turbulent: false, initial: 0.0}")
         lines.append("    - {name: feed, diffusivity: 0.0, turbulent: false, initial: 0.0}")
+        if args.state_limited:
+            # level-2 cell model (2026-10-06, stage 5): state vec4 after the substrate vec4
+            q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
+            maintenance = args.maintenance_umol_per_g_h * 1e-6 / 3600.0
+            growth_rate_initial = (args.growth_rate_initial if args.growth_rate_initial is not None
+                                   else max(args.growth_yield * (q_max - maintenance), 0.0))
+            lines.append(f"    - {{name: growth_rate, diffusivity: 0.0, turbulent: false, initial: {growth_rate_initial:.6e}}}")
+            lines.append("    - {name: product, diffusivity: 0.0, turbulent: false, initial: 0.0}")
+            lines.append("    - {name: maintenance, diffusivity: 0.0, turbulent: false, initial: 0.0}")
     for index in range(args.tracers):
         lines.append(f"    - {{name: tracer_{index + 1:02d}, diffusivity: {args.tracer_diffusivity:.3e}, "
                      f"turbulent: true, initial: 0.0}}")
@@ -789,7 +798,17 @@ def scalars_block(args, h) -> str:
               "    turbulent_schmidt: 0.7"]
     if args.substrate:
         q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
-        if not args.no_uptake:
+        if args.state_limited:
+            maintenance = args.maintenance_umol_per_g_h * 1e-6 / 3600.0
+            p0, p1, p2 = args.product_rate
+            lines += ["  reactions:",
+                      f"    - {{type: state_limited, substrate: substrate, biomass: biomass, uptake: uptake, "
+                      f"growth_rate: growth_rate, product: product, maintenance: maintenance, "
+                      f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: {args.growth_yield:.6e}, "
+                      f"maintenance_rate: {maintenance:.6e}, demand_margin: {args.demand_margin:.6e}, "
+                      f"tau_up: {args.tau_up:.6e}, tau_down: {args.tau_down:.6e}, "
+                      f"product_rate: [{p0:.6e}, {p1:.6e}, {p2:.6e}]}}"]
+        elif not args.no_uptake:
             lines += ["  reactions:",
                       f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
                       f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: {args.growth_yield:.6e}}}"]
@@ -960,6 +979,17 @@ def main() -> int:
     parser.add_argument("--substrate-initial", type=float, default=None, help="initial substrate, mol / kg (10 K_s)")
     parser.add_argument("--substrate-diffusivity", type=float, default=6.0e-10, help="m^2 / s (glucose in water)")
     parser.add_argument("--no-uptake", action="store_true", help="substrate setup without the Monod sink (pure tracer feed)")
+    parser.add_argument("--state-limited", action="store_true",
+                        help="stage 5 (2026-10-06): level-2 cell model instead of Monod; adds the fields growth_rate, "
+                             "product, maintenance (needs --substrate and --growth-yield > 0; docs/stage5_pichia_level2_design)")
+    parser.add_argument("--maintenance-umol-per-g-h", type=float, default=0.0, help="level 2: maintenance uptake m_s, umol / (g h)")
+    parser.add_argument("--demand-margin", type=float, default=0.1, help="level 2: alpha, margin of the demand above mu")
+    parser.add_argument("--tau-up", type=float, default=60.0, help="level 2: relaxation time of mu upwards, s")
+    parser.add_argument("--tau-down", type=float, default=60.0, help="level 2: relaxation time of mu downwards, s")
+    parser.add_argument("--product-rate", type=float, nargs=3, default=(0.0, 0.0, 0.0), metavar=("P0", "P1", "P2"),
+                        help="level 2: q_p(mu) = p0 + p1 mu + p2 mu^2, g product / (g biomass s), /(g), s/g")
+    parser.add_argument("--growth-rate-initial", type=float, default=None,
+                        help="level 2: initial mu, 1/s (default mu_max = yield (q_max - m_s))")
     parser.add_argument("--feed-rate", type=float, default=2.0e-4,
                         help="feed, mol / s (default 2.0e-4: mean q / q_max about 0.28 in 29.5 L, as in Haringa 2023)")
     parser.add_argument("--feed-center", type=float, nargs=3, default=None, help="feed sphere centre (default: injection point)")
@@ -1259,9 +1289,12 @@ def main() -> int:
                                           f"  thin_plate_dashpot: {args.thin_plate_dashpot:g}\n  use_pst: true")
     (out / "case.yaml").write_text(case_text, encoding="utf-8")
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity), encoding="utf-8")
+    if args.state_limited and (not args.substrate or args.no_uptake or args.growth_yield <= 0.0):
+        parser.error("--state-limited needs --substrate, no --no-uptake and --growth-yield > 0")
     if args.tracers > 0 or args.substrate:
-        if args.tracers + (4 if args.substrate else 0) > 12:
-            parser.error("at most 12 scalar fields: --substrate uses 4, so --tracers <= 8")
+        substrate_fields = (7 if args.state_limited else 4) if args.substrate else 0
+        if args.tracers + substrate_fields > 12:
+            parser.error("at most 12 scalar fields: --substrate uses 4 (7 with --state-limited), so --tracers <= 8 (5)")
         with open(out / "case.yaml", "a", encoding="utf-8") as handle:
             handle.write(scalars_block(args, h))
         print(f"scalars: {args.tracers} tracer(s), pulses from t = {args.injection_start} s every "

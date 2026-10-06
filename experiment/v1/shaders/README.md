@@ -307,6 +307,9 @@ compile `_test_common.comp` by hand as a regression check after
 76       : SHIFT_TRANSPORT_MODE (2026-09-30; transport terms of the particle shift: 0 none (original), 1 density,
            2 momentum, 3 both; density.comp accumulates both, log/2026-09-30_shift-transport.md)
 79, 89-92: REACTION_MODE, REACTION_LAYOUT, REACTION_Q_MAX, REACTION_HALF_SATURATION, REACTION_YIELD
+96-103   : REACTION_STATE_LAYOUT, REACTION_MAINTENANCE, REACTION_DEMAND_MARGIN, REACTION_TAU_UP,
+           REACTION_TAU_DOWN, REACTION_PRODUCT_P0..P2 (2026-10-06, stage 5 level-2 cell model,
+           reaction type state_limited = REACTION_MODE 2; predict.comp)
            (2026-10-01; Monod uptake in predict.comp, log/2026-10-01_reaction-and-feed.md)
 77, 78   : USE_MOMENTUM_SGS, MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01; Smagorinsky nu_t added to the viscosity of
            fluid-fluid pairs in force.comp, nu_t from density.comp; log/2026-10-01_momentum-sgs.md)

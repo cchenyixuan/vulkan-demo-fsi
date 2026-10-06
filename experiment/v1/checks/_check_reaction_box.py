@@ -15,8 +15,16 @@ scalar fields in one vec4: substrate C, biomass X, cumulative uptake U, cumulati
       sum m (C + U - F) must stay at its initial value; the fed amount sum rho0 dx^3 F must equal
       rate t N_in dx^3 / V_sphere (N_in particles in the sphere, fixed at rest); C >= 0 everywhere.
 
+Level-2 cell model (2026-10-06, stage 5, reaction type state_limited; seven fields in two vec4: C, X, U, F |
+mu, P, M):
+  S1  huge demand margin, no maintenance, no product: C and X must equal the monod run to float precision.
+  S2  batch with maintenance, demand limit, state relaxation and product (dimensionless parameters)
+      against an RK4 integration of the level-2 ODE; C + U conserved; X - X0 = Y (U - M).
+  S3  step response of the state: C >> K_s from mu = 0 (linear rise at alpha mu_max / tau_up, then exponential
+      to mu_max); C = 0 from mu_max (exponential decay with tau_down); against the exact curves.
+
 Usage (repo root, solver env):
-    python experiment/v1/checks/_check_reaction_box.py [--only R1,R2,R3] [--out output/reaction_checks]
+    python experiment/v1/checks/_check_reaction_box.py [--only R1,R2,R3,S1,S2,S3] [--out output/reaction_checks]
 """
 import argparse
 import json
@@ -266,9 +274,150 @@ def check_r3(out):
     return {"name": "R3", "passed": bool(passed), "budget_drift": float(drift), "fed_error": float(fed_error)}
 
 
+FIELDS_SEVEN = lambda c0, x0, mu0: FIELDS_FOUR(c0, x0) + [
+    {"name": "growth_rate", "diffusivity": 0.0, "turbulent": False, "initial": mu0},
+    {"name": "product", "diffusivity": 0.0, "turbulent": False, "initial": 0.0},
+    {"name": "maintenance", "diffusivity": 0.0, "turbulent": False, "initial": 0.0}]
+COLUMN = {"C": 0, "X": 1, "U": 2, "F": 3, "mu": 4, "P": 5, "M": 6}
+
+
+def state_limited(q_max, k_s, growth_yield, maintenance_rate=0.0, demand_margin=0.0, tau_up=1.0, tau_down=1.0,
+                  product_rate=(0.0, 0.0, 0.0)):
+    return {"type": "state_limited", "substrate": "substrate", "biomass": "biomass", "uptake": "uptake",
+            "growth_rate": "growth_rate", "product": "product", "maintenance": "maintenance",
+            "q_max": q_max, "k_s": k_s, "yield": growth_yield, "maintenance_rate": maintenance_rate,
+            "demand_margin": demand_margin, "tau_up": tau_up, "tau_down": tau_down,
+            "product_rate": list(product_rate)}
+
+
+def rk4_state_limited(c0, x0, mu0, p, times):
+    """double-precision RK4 of the level-2 ODE (C, X, mu, U, M, P) with the parameters dict p"""
+    mu_max = max(p["yield"] * (p["q_max"] - p["maintenance_rate"]), 0.0)
+    def rhs(state):
+        c, x, mu, _, _, _ = state
+        c = max(c, 0.0)
+        q_env = p["q_max"] * c / (p["k_s"] + c)
+        q_dem = (max(mu, 0.0) + p["demand_margin"] * mu_max) / p["yield"] + p["maintenance_rate"] if p["yield"] > 0 else math.inf
+        q = min(q_env, q_dem)
+        m = min(q, p["maintenance_rate"])
+        mu_act = p["yield"] * (q - m)
+        tau = p["tau_up"] if mu_act > mu else p["tau_down"]
+        p0, p1, p2 = p["product_rate"]
+        q_p = max(p0 + p1 * mu + p2 * mu * mu, 0.0)
+        return np.array([-q * x, mu_act * x, (mu_act - mu) / tau, q * x, m * x, q_p * x])
+    state = np.array([c0, x0, mu0, 0.0, 0.0, 0.0], dtype=np.float64)
+    out = [state.copy()]
+    for t0, t1 in zip(times[:-1], times[1:]):
+        steps = max(1, int(math.ceil((t1 - t0) / 2e-4)))
+        h = (t1 - t0) / steps
+        for _ in range(steps):
+            k1 = rhs(state); k2 = rhs(state + 0.5 * h * k1); k3 = rhs(state + 0.5 * h * k2); k4 = rhs(state + h * k3)
+            state = state + h / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
+        out.append(state.copy())
+    return np.asarray(out)
+
+
+def means(series, *names):
+    return [np.array([s["values"][:, COLUMN[n]].mean() for s in series]) for n in names]
+
+
+def check_s1(out):
+    """S1: state_limited with a huge demand margin, no maintenance, no product = level 1 (same floats)."""
+    c0, x0, q_max, k_s, growth_yield = 1.0, 0.1, 2.0, 0.2, 0.5
+    monod = {"type": "monod", "substrate": "substrate", "biomass": "biomass", "uptake": "uptake",
+             "q_max": q_max, "k_s": k_s, "yield": growth_yield}
+    limited = state_limited(q_max, k_s, growth_yield, demand_margin=1.0e6)
+    from utils.sph.case import load_case
+    results = []
+    for label, reaction in (("monod", monod), ("state_limited", limited)):
+        case_path, _ = build_case(out / f"s1_{label}", fields=FIELDS_SEVEN(c0, x0, 0.0), reaction=reaction)
+        dt = load_case(str(case_path)).timestep
+        steps = int(round(4.0 / dt))
+        _, series, _ = run_box(case_path, steps, 20)
+        results.append((np.array([s["time"] for s in series]), np.stack([s["values"] for s in series])))
+    (times, a), (_, b) = results
+    difference_c = np.abs(a[:, :, 0] - b[:, :, 0]).max()
+    difference_x = np.abs(a[:, :, 1] - b[:, :, 1]).max()
+    mu_final = b[-1, :, COLUMN["mu"]].mean()
+    print(f"S1 level-1 limit: {steps} steps; max |C_monod - C_limited| {difference_c:.2e}, max |X ...| {difference_x:.2e}; "
+          f"mu at the end {mu_final:.5f} (realised growth rate; mu_max {growth_yield * q_max:.3f})")
+    passed = difference_c < 1e-6 * c0 and difference_x < 1e-6 * x0
+    print(f"   -> {'PASS' if passed else 'FAIL'}")
+    return {"name": "S1", "passed": bool(passed), "difference_c": float(difference_c), "difference_x": float(difference_x)}
+
+
+def check_s2(out):
+    """S2: batch with maintenance, demand limit, state relaxation and product against RK4; budgets."""
+    c0, x0, mu0 = 1.0, 0.1, 0.0
+    p = dict(q_max=2.0, k_s=0.2, growth_yield=0.5, maintenance_rate=0.2, demand_margin=0.1, tau_up=0.5, tau_down=0.2,
+             product_rate=(0.1, 0.5, 0.0))
+    reaction = state_limited(**p)
+    p["yield"] = p.pop("growth_yield")
+    case_path, _ = build_case(out / "s2", fields=FIELDS_SEVEN(c0, x0, mu0), reaction=reaction)
+    from utils.sph.case import load_case
+    dt = load_case(str(case_path)).timestep
+    steps = int(round(8.0 / dt))
+    _, series, status = run_box(case_path, steps, 40)
+    times = np.array([s["time"] for s in series])
+    c, x, mu, u, m, prod = means(series, "C", "X", "mu", "U", "M", "P")
+    reference = rk4_state_limited(c0, x0, mu0, p, times)
+    errors = {name: float(np.abs(value - reference[:, k]).max())
+              for k, (name, value) in enumerate((("C", c), ("X", x), ("mu", mu), ("U", u), ("M", m), ("P", prod)))}
+    budget = c + u                                   # no feed: C + U constant
+    growth_budget = x - x0 - p["yield"] * (u - m)    # X - X0 = Y (U - M)
+    print(f"S2 level-2 batch: dt {dt:.3e} s, {steps} steps (mu_max {p['yield'] * (p['q_max'] - p['maintenance_rate']):.3f})")
+    for index in range(0, len(times), max(1, len(times) // 8)):
+        print(f"   t {times[index]:6.3f}: C {c[index]:.5f} ({reference[index, 0]:.5f})  X {x[index]:.5f} ({reference[index, 1]:.5f})  "
+              f"mu {mu[index]:.5f} ({reference[index, 2]:.5f})  M {m[index]:.5f} ({reference[index, 4]:.5f})  "
+              f"P {prod[index]:.5f} ({reference[index, 5]:.5f})")
+    drift = abs(budget[-1] - budget[0]) / budget[0]
+    growth_drift = np.abs(growth_budget).max() / x0
+    worst = max(errors.values())
+    passed = worst < 3e-3 and drift < 1e-5 and growth_drift < 1e-5
+    print(f"   max |GPU - RK4|: " + ", ".join(f"{k} {v:.2e}" for k, v in errors.items())
+          + f"; C + U drift {drift:.1e}; |X - X0 - Y (U - M)| / X0 {growth_drift:.1e}; overflow "
+          f"{status['overflow_inside_count']}/{status['overflow_incoming_count']} -> {'PASS' if passed else 'FAIL'}")
+    return {"name": "S2", "passed": bool(passed), "errors": errors, "budget_drift": float(drift),
+            "growth_budget": float(growth_drift)}
+
+
+def check_s3(out):
+    """S3: step responses of the state mu. Up: C >> K_s, mu0 = 0: mu rises linearly at alpha mu_max / tau_up,
+    then relaxes exponentially to mu_max. Down: C = 0, mu0 = mu_max: mu = mu_max exp(-t / tau_down)."""
+    q_max, k_s, growth_yield, alpha, tau_up, tau_down = 2.0, 0.2, 0.5, 0.1, 0.5, 0.3
+    mu_max = growth_yield * q_max
+    from utils.sph.case import load_case
+    # up
+    reaction = state_limited(q_max, k_s, growth_yield, demand_margin=alpha, tau_up=tau_up, tau_down=tau_down)
+    case_path, _ = build_case(out / "s3_up", fields=FIELDS_SEVEN(1.0e3, 1.0e-3, 0.0), reaction=reaction)
+    dt = load_case(str(case_path)).timestep
+    steps = int(round(8.0 / dt))
+    _, series, _ = run_box(case_path, steps, 40)
+    times = np.array([s["time"] for s in series])
+    (mu_up,) = means(series, "mu")
+    t_knee = (1.0 - alpha) * tau_up / alpha
+    exact_up = np.where(times < t_knee, alpha * mu_max * times / tau_up,
+                        mu_max - alpha * mu_max * np.exp(-(times - t_knee) / tau_up))
+    # down
+    case_path, _ = build_case(out / "s3_down", fields=FIELDS_SEVEN(0.0, 1.0e-3, mu_max), reaction=reaction)
+    _, series_down, _ = run_box(case_path, steps, 40)
+    (mu_down,) = means(series_down, "mu")
+    exact_down = mu_max * np.exp(-times / tau_down)
+    error_up = np.abs(mu_up - exact_up).max() / mu_max
+    error_down = np.abs(mu_down - exact_down).max() / mu_max
+    print(f"S3 state step response: dt {dt:.3e} s, {steps} steps, mu_max {mu_max:.3f}, knee at {t_knee:.2f} s")
+    for index in range(0, len(times), max(1, len(times) // 8)):
+        print(f"   t {times[index]:6.3f}: up mu {mu_up[index]:.5f} (exact {exact_up[index]:.5f})   down mu {mu_down[index]:.5f} "
+              f"(exact {exact_down[index]:.5f})")
+    passed = error_up < 3e-3 and error_down < 3e-3
+    print(f"   max |mu - exact| / mu_max: up {error_up:.2e}, down {error_down:.2e} (first order in dt / tau = {dt / tau_down:.1e}) "
+          f"-> {'PASS' if passed else 'FAIL'}")
+    return {"name": "S3", "passed": bool(passed), "error_up": float(error_up), "error_down": float(error_down)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--only", default="R1,R2,R3")
+    parser.add_argument("--only", default="R1,R2,R3,S1,S2,S3")
     parser.add_argument("--out", default="output/reaction_checks")
     arguments = parser.parse_args()
     from experiment.v1 import compile_shaders_v1
@@ -276,7 +425,8 @@ def main():
     out = pathlib.Path(arguments.out)
     out.mkdir(parents=True, exist_ok=True)
     results = []
-    for name, function in (("R1", check_r1), ("R2", check_r2), ("R3", check_r3)):
+    for name, function in (("R1", check_r1), ("R2", check_r2), ("R3", check_r3),
+                           ("S1", check_s1), ("S2", check_s2), ("S3", check_s3)):
         if name in arguments.only.split(","):
             results.append(function(out))
     (out / "summary.json").write_text(json.dumps(results, indent=1), encoding="utf-8")

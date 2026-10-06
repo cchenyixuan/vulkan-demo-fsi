@@ -700,7 +700,16 @@ class ScalarReactionConfig:
         C -= dC,   uptake += dC,   X += yield dC
     ``q_max`` in [substrate] / ([biomass] s), ``k_s`` in [substrate], ``yield`` (case.yaml key) in
     [biomass] / [substrate], 0 = no growth. substrate, biomass and uptake must share one vec4
-    (fields are packed four per vec4 in declaration order)."""
+    (fields are packed four per vec4 in declaration order).
+
+    Type ``state_limited`` (2026-10-06, stage 5, REACTION_MODE 2; formulas in common.glsl at
+    REACTION_STATE_LAYOUT): the cell state ``growth_rate`` (mu, 1/s) limits the uptake to
+    ((mu + demand_margin mu_max) / yield + maintenance_rate) X and relaxes towards the realised
+    growth rate with ``tau_up`` / ``tau_down`` (s); ``maintenance_rate`` m_s in [substrate] /
+    ([biomass] s) is taken first, growth is yield (uptake - maintenance); ``product`` gains
+    max(p0 + p1 mu + p2 mu^2, 0) X dt with ``product_rate`` = [p0, p1, p2]; ``maintenance``
+    accumulates the maintenance uptake. growth_rate, product and maintenance share one vec4
+    with a HIGHER index than the substrate's. yield 0 removes the demand limit."""
     type: str
     substrate: str
     biomass: str
@@ -708,15 +717,43 @@ class ScalarReactionConfig:
     k_s: float
     uptake: Optional[str] = None
     growth_yield: float = 0.0
+    growth_rate: Optional[str] = None
+    product: Optional[str] = None
+    maintenance: Optional[str] = None
+    maintenance_rate: float = 0.0
+    demand_margin: float = 0.0
+    tau_up: float = 1.0
+    tau_down: float = 1.0
+    product_rate: tuple = (0.0, 0.0, 0.0)
 
     def __post_init__(self):
-        if self.type != "monod":
-            raise ValueError(f"scalars.reactions: only type 'monod' is supported, got {self.type!r}")
+        if self.type not in ("monod", "state_limited"):
+            raise ValueError(f"scalars.reactions: type must be 'monod' or 'state_limited', got {self.type!r}")
         self.q_max = float(self.q_max)
         self.k_s = float(self.k_s)
         self.growth_yield = float(self.growth_yield)
         if self.q_max < 0.0 or self.k_s <= 0.0:
             raise ValueError("scalars.reactions: q_max must be >= 0 and k_s > 0")
+        self.maintenance_rate = float(self.maintenance_rate)
+        self.demand_margin = float(self.demand_margin)
+        self.tau_up = float(self.tau_up)
+        self.tau_down = float(self.tau_down)
+        self.product_rate = tuple(float(p) for p in self.product_rate)
+        if self.type == "state_limited":
+            if not self.growth_rate:
+                raise ValueError("scalars.reactions: state_limited needs a growth_rate field")
+            if self.maintenance_rate < 0.0 or self.demand_margin < 0.0 or self.tau_up <= 0.0 or self.tau_down <= 0.0:
+                raise ValueError("scalars.reactions: state_limited needs maintenance_rate >= 0, demand_margin >= 0, "
+                                 "tau_up > 0 and tau_down > 0")
+            if len(self.product_rate) != 3:
+                raise ValueError("scalars.reactions: product_rate must be [p0, p1, p2]")
+        elif self.growth_rate or self.product or self.maintenance:
+            raise ValueError("scalars.reactions: growth_rate / product / maintenance belong to type state_limited")
+
+    @property
+    def mode(self) -> int:
+        """REACTION_MODE spec constant."""
+        return 2 if self.type == "state_limited" else 1
 
 
 @dataclass
@@ -807,6 +844,16 @@ class ScalarsConfig:
                     raise ValueError(f"scalars.reactions: unknown field {name!r} (fields: {names})")
             if len({names.index(name) // 4 for name in used}) != 1:
                 raise ValueError("scalars.reactions: substrate, biomass and uptake must share one vec4")
+            if reaction.type == "state_limited":
+                state = [reaction.growth_rate] + [f for f in (reaction.product, reaction.maintenance) if f]
+                for name in state:
+                    if name not in names:
+                        raise ValueError(f"scalars.reactions: unknown field {name!r} (fields: {names})")
+                if len({names.index(name) // 4 for name in state}) != 1:
+                    raise ValueError("scalars.reactions: growth_rate, product and maintenance must share one vec4")
+                if names.index(reaction.growth_rate) // 4 <= names.index(reaction.substrate) // 4:
+                    raise ValueError("scalars.reactions: the state vec4 (growth_rate, product, maintenance) must be "
+                                     "declared after the substrate's vec4 (predict.comp applies it in a later pass)")
         # At most MAX_INJECTION_SLOTS pulses and sources may be active at the same time.
         events = sorted([(i.start, 1) for i in self.injections]
                         + [(i.start + i.duration, -1) for i in self.injections]
@@ -845,6 +892,16 @@ class ScalarsConfig:
         biomass = self.field_location(reaction.biomass)[1]
         uptake = self.field_location(reaction.uptake)[1] if reaction.uptake else 4
         return vec4_index | (substrate << 4) | (biomass << 8) | (uptake << 12)
+
+    def reaction_state_layout(self) -> int:
+        """REACTION_STATE_LAYOUT spec constant (0 unless the reaction is state_limited)."""
+        if not self.reactions or self.reactions[0].type != "state_limited":
+            return 0
+        reaction = self.reactions[0]
+        vec4_index, growth_rate = self.field_location(reaction.growth_rate)
+        product = self.field_location(reaction.product)[1] if reaction.product else 4
+        maintenance = self.field_location(reaction.maintenance)[1] if reaction.maintenance else 4
+        return vec4_index | (growth_rate << 4) | (product << 8) | (maintenance << 12)
 
 
 def _parse_scalars(data: dict, source: str) -> "ScalarsConfig":
@@ -1270,11 +1327,19 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (36,  lambda case: 1 if case.numerics.solid_reaction_force else 0, 'I'),  # USE_SOLID_REACTION_FORCE
     (73,  lambda case: 1 if case.numerics.solid_density_floor else 0, 'I'),  # SOLID_DENSITY_FLOOR
     (76,  lambda case: SHIFT_TRANSPORT_MODES[case.numerics.shift_transport], 'I'),  # SHIFT_TRANSPORT_MODE
-    (79,  lambda case: 1 if case.scalars is not None and case.scalars.reactions else 0, 'I'),  # REACTION_MODE
+    (79,  lambda case: case.scalars.reactions[0].mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),  # REACTION_MODE
     (89,  lambda case: case.scalars.reaction_layout() if case.scalars is not None else 0, 'I'),  # REACTION_LAYOUT
     (90,  lambda case: case.scalars.reactions[0].q_max if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (91,  lambda case: case.scalars.reactions[0].k_s if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
     (92,  lambda case: case.scalars.reactions[0].growth_yield if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (96,  lambda case: case.scalars.reaction_state_layout() if case.scalars is not None else 0, 'I'),  # REACTION_STATE_LAYOUT (2026-10-06)
+    (97,  lambda case: case.scalars.reactions[0].maintenance_rate if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (98,  lambda case: case.scalars.reactions[0].demand_margin if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (99,  lambda case: case.scalars.reactions[0].tau_up if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
+    (100, lambda case: case.scalars.reactions[0].tau_down if case.scalars is not None and case.scalars.reactions else 1.0, 'f'),
+    (101, lambda case: case.scalars.reactions[0].product_rate[0] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (102, lambda case: case.scalars.reactions[0].product_rate[1] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (103, lambda case: case.scalars.reactions[0].product_rate[2] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (93,  lambda case: 1 if any(material.free_slip for material in case.materials) else 0, 'I'),  # USE_FREE_SLIP_WALLS
     (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED

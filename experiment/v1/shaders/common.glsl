@@ -437,6 +437,31 @@ layout(constant_id = 89) const uint  REACTION_LAYOUT = 0u;
 layout(constant_id = 90) const float REACTION_Q_MAX = 0.0;            // [substrate] / ([biomass] s)
 layout(constant_id = 91) const float REACTION_HALF_SATURATION = 1.0;  // K_s, [substrate]
 layout(constant_id = 92) const float REACTION_YIELD = 0.0;            // [biomass] / [substrate]
+// Level-2 cell model (2026-10-06, stage 5, reaction type `state_limited`, REACTION_MODE 2;
+// docs/stage5_pichia_level2_design_2026-10-02.md). The cell keeps a physiological state,
+// its specific growth rate mu (1/s), which limits what it can take up; per particle and
+// step, with C the substrate after transport and sources, X the biomass:
+//     a         = q_max X dt / (K_s + C),   dC_env = C a / (1 + a)        supply (as level 1)
+//     dC_dem    = ((mu + alpha mu_max) / Y + m_s) X dt                      demand of the state
+//     dC        = min(dC_env, dC_dem)                                       uptake
+//     dM        = min(dC, m_s X dt)                                         maintenance
+//     dX        = Y (dC - dM),   mu_act = dX / (X dt)                       growth (never < 0)
+//     mu       += (mu_act - mu) r / (1 + r),   r = dt / tau                 tau_up if mu_act > mu, else tau_down
+//     dP        = max(p0 + p1 mu + p2 mu^2, 0) X dt                         product
+//     mu_max    = max(Y (q_max - m_s), 0)
+// C, X, U (cumulative uptake) share the vec4 of REACTION_LAYOUT; mu, P (product) and M
+// (cumulative maintenance) share a second vec4 with a HIGHER index, packed in
+// REACTION_STATE_LAYOUT as vec4 index | mu << 4 | product << 8 | maintenance << 12
+// (component 4 = no such field). Y = 0 removes the demand limit (q_dem infinite).
+// alpha large or tau -> 0 recovers level 1 (same floats when m_s = p = 0).
+layout(constant_id = 96)  const uint  REACTION_STATE_LAYOUT = 0u;
+layout(constant_id = 97)  const float REACTION_MAINTENANCE = 0.0;     // m_s, [substrate] / ([biomass] s)
+layout(constant_id = 98)  const float REACTION_DEMAND_MARGIN = 0.0;   // alpha
+layout(constant_id = 99)  const float REACTION_TAU_UP = 1.0;          // s
+layout(constant_id = 100) const float REACTION_TAU_DOWN = 1.0;        // s
+layout(constant_id = 101) const float REACTION_PRODUCT_P0 = 0.0;      // [product] / ([biomass] s)
+layout(constant_id = 102) const float REACTION_PRODUCT_P1 = 0.0;      // [product] / [biomass]
+layout(constant_id = 103) const float REACTION_PRODUCT_P2 = 0.0;      // [product] s / [biomass]
 
 // --- Free-slip walls (2026-10-02, material flag `free_slip: true`) ---
 // A BOUNDARY material with free_slip exerts no viscous force on the fluid and,

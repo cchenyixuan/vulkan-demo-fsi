@@ -129,7 +129,7 @@ run scripts.
 - **Spec constants**: ids and ranges are listed in `common.glsl` and mirrored by
   `_global_spec_entries()` in `simulator_v1.py` (and `_SPEC_CONSTANT_MAPPING` in
   `utils/sph/case.py`); all must be edited together.
-  Free ranges for new constants: 96+ (94, 95 = SGS wall damping, 2026-10-05; 93 = USE_FREE_SLIP_WALLS, 2026-10-02; 79, 89–92 = Monod reaction, 2026-10-01; 73 = SOLID_DENSITY_FLOOR, 76 = SHIFT_TRANSPORT_MODE, 77 = USE_MOMENTUM_SGS, 78 = MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01), 49, 72, 74, 75 = thin plates, 2026-09-30; 34 = BACKGROUND_PRESSURE,
+  Free ranges for new constants: 104+ (96-103 = level-2 cell model `state_limited`, 2026-10-06; 94, 95 = SGS wall damping, 2026-10-05; 93 = USE_FREE_SLIP_WALLS, 2026-10-02; 79, 89–92 = Monod reaction, 2026-10-01; 73 = SOLID_DENSITY_FLOOR, 76 = SHIFT_TRANSPORT_MODE, 77 = USE_MOMENTUM_SGS, 78 = MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01), 49, 72, 74, 75 = thin plates, 2026-09-30; 34 = BACKGROUND_PRESSURE,
   35 = SOLID_PRESSURE_MODE, 36 = USE_SOLID_REACTION_FORCE, 37 = SOLID_PRESSURE_OFFSET, 38 = USE_DENSITY_DIFFUSION_GRADIENT_TERM, 39 = PST_NEAR_SOLID_MODE, 48 = PAIR_CORRECTION_MODE, added 2026-09-29; 47 = USE_NEIGHBOR_LIST,
   62 = MAX_NEIGHBORS, 63–71 = scalar transport, all added on the test branch).
 - **Scalar transport (test branch, 2026-09-27)**: optional case.yaml block
