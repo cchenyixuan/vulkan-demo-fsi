@@ -131,6 +131,7 @@ SPEC_ID_REACTION_TAU_DOWN                   = 100
 SPEC_ID_REACTION_PRODUCT_P0                 = 101
 SPEC_ID_REACTION_PRODUCT_P1                 = 102
 SPEC_ID_REACTION_PRODUCT_P2                 = 103
+SPEC_ID_SCALAR_DIFFUSING_VEC4_MASK          = 104  # 2026-10-07
 SPEC_ID_USE_FREE_SLIP_WALLS                 = 93
 SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
 SPEC_ID_USE_SGS_WALL_DAMPING                = 94
@@ -183,7 +184,7 @@ SPEC_ID_USE_SCALAR_INJECTION                = 69
 SPEC_ID_USE_SCALAR_BOUNDS_LIMITER           = 70
 SPEC_ID_SCALAR_FIELD_COUNT                  = 71
 # Compile-time capacities, mirror common.glsl MAX_SCALAR_VEC4 / MAX_INJECTION_SLOTS.
-MAX_SCALAR_VEC4                             = 3
+MAX_SCALAR_VEC4                             = 4    # 3 until 2026-10-07
 MAX_INJECTION_SLOTS                         = 4
 INJECTION_SLOT_BYTES                        = 48
 SPEC_ID_LEADING_GHOST_VOXEL_COUNT           = 80
@@ -1004,6 +1005,7 @@ class SphSimulatorV1:
             (SPEC_ID_REACTION_PRODUCT_P0,          float(case.scalars.reactions[0].product_rate[0]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_REACTION_PRODUCT_P1,          float(case.scalars.reactions[0].product_rate[1]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_REACTION_PRODUCT_P2,          float(case.scalars.reactions[0].product_rate[2]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+            (SPEC_ID_SCALAR_DIFFUSING_VEC4_MASK,   case.scalars.diffusing_vec4_mask() if case.scalars is not None else 0xF, 'I'),
             (SPEC_ID_USE_FREE_SLIP_WALLS,          1 if any(material.free_slip for material in case.materials) else 0, 'I'),
             (SPEC_ID_USE_SCALAR_BOUNDS_LIMITER,    1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
             (SPEC_ID_SCALAR_FIELD_COUNT,           0 if case.scalars is None else len(case.scalars.fields), 'I'),

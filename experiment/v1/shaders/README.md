@@ -310,6 +310,7 @@ compile `_test_common.comp` by hand as a regression check after
 96-103   : REACTION_STATE_LAYOUT, REACTION_MAINTENANCE, REACTION_DEMAND_MARGIN, REACTION_TAU_UP,
            REACTION_TAU_DOWN, REACTION_PRODUCT_P0..P2 (2026-10-06, stage 5 level-2 cell model,
            reaction type state_limited = REACTION_MODE 2; predict.comp)
+104      : SCALAR_DIFFUSING_VEC4_MASK (2026-10-07; vec4 without diffusion skip the pair loop of force.comp)
            (2026-10-01; Monod uptake in predict.comp, log/2026-10-01_reaction-and-feed.md)
 77, 78   : USE_MOMENTUM_SGS, MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01; Smagorinsky nu_t added to the viscosity of
            fluid-fluid pairs in force.comp, nu_t from density.comp; log/2026-10-01_momentum-sgs.md)

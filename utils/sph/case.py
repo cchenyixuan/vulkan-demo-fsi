@@ -789,7 +789,7 @@ class ScalarSourceConfig:
         return math.inf if self.stop is None else self.stop
 
 
-MAX_SCALAR_FIELDS = 12              # 4 * MAX_SCALAR_VEC4 in common.glsl
+MAX_SCALAR_FIELDS = 16              # 4 * MAX_SCALAR_VEC4 in common.glsl (12 until 2026-10-07)
 MAX_INJECTION_SLOTS = 4             # MAX_INJECTION_SLOTS in common.glsl
 
 
@@ -892,6 +892,16 @@ class ScalarsConfig:
         biomass = self.field_location(reaction.biomass)[1]
         uptake = self.field_location(reaction.uptake)[1] if reaction.uptake else 4
         return vec4_index | (substrate << 4) | (biomass << 8) | (uptake << 12)
+
+    def diffusing_vec4_mask(self) -> int:
+        """SCALAR_DIFFUSING_VEC4_MASK (2026-10-07): bit v set when some field of vec4 v diffuses
+        (molecular diffusivity > 0 or the SGS flag with SGS enabled); the other vec4 are skipped in
+        the pair loop of force.comp (their diffusion increment is exactly 0 anyway)."""
+        mask = 0
+        for index, field in enumerate(self.fields):
+            if field.diffusivity > 0.0 or (self.sgs.enabled and field.turbulent):
+                mask |= 1 << (index // 4)
+        return mask
 
     def reaction_state_layout(self) -> int:
         """REACTION_STATE_LAYOUT spec constant (0 unless the reaction is state_limited)."""
@@ -1340,6 +1350,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (101, lambda case: case.scalars.reactions[0].product_rate[0] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (102, lambda case: case.scalars.reactions[0].product_rate[1] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (103, lambda case: case.scalars.reactions[0].product_rate[2] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
+    (104, lambda case: case.scalars.diffusing_vec4_mask() if case.scalars is not None else 0xF, 'I'),  # SCALAR_DIFFUSING_VEC4_MASK (2026-10-07)
     (93,  lambda case: 1 if any(material.free_slip for material in case.materials) else 0, 'I'),  # USE_FREE_SLIP_WALLS
     (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED

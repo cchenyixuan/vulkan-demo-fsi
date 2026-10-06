@@ -659,6 +659,8 @@ void main() {
                        * (distance * distance + scalar_laplacian_eps_squared));
                 float gradient_weight = -fluid_weight * neighbor_volume_dynamic;
                 for (uint vec4_index = 0u; vec4_index < SCALAR_VEC4_COUNT; vec4_index++) {
+                    // cell-carried vec4 (no diffusivity, no SGS): nothing to accumulate (2026-10-07)
+                    if (((SCALAR_DIFFUSING_VEC4_MASK >> vec4_index) & 1u) == 0u) continue;
                     vec4 neighbor_scalar = scalar[scalar_index(neighbor_particle_id, vec4_index)]
                                          * scalar_component_mask(vec4_index);
                     vec4 neighbor_diffusivity = scalar_parameters[2u * vec4_index]

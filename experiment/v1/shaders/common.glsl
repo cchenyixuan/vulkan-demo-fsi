@@ -462,6 +462,13 @@ layout(constant_id = 100) const float REACTION_TAU_DOWN = 1.0;        // s
 layout(constant_id = 101) const float REACTION_PRODUCT_P0 = 0.0;      // [product] / ([biomass] s)
 layout(constant_id = 102) const float REACTION_PRODUCT_P1 = 0.0;      // [product] / [biomass]
 layout(constant_id = 103) const float REACTION_PRODUCT_P2 = 0.0;      // [product] s / [biomass]
+// Which scalar vec4 take part in the neighbour diffusion loop of force.comp
+// (2026-10-07): bit v set = some field of vec4 v has a molecular diffusivity
+// or the SGS flag. A vec4 of cell-carried fields (diffusivity 0, no SGS) is
+// skipped in the pair loop; its increment is exactly 0 either way, so the
+// result is unchanged and the pair loop no longer reads it. All bits set
+// (the default) reproduces the behaviour before this constant existed.
+layout(constant_id = 104) const uint SCALAR_DIFFUSING_VEC4_MASK = 0xFu;
 
 // --- Free-slip walls (2026-10-02, material flag `free_slip: true`) ---
 // A BOUNDARY material with free_slip exerts no viscous force on the fluid and,
@@ -522,7 +529,7 @@ const uint PARTICLE_ID_NONE      = 0u;
 // Register arrays in force.comp are sized with MAX_SCALAR_VEC4; the loops run
 // to SCALAR_VEC4_COUNT (<= MAX_SCALAR_VEC4, checked in Python) so the unused
 // array elements disappear after specialization.
-const uint MAX_SCALAR_VEC4     = 3u;   // up to 12 scalar fields
+const uint MAX_SCALAR_VEC4     = 4u;   // up to 16 scalar fields (3 until 2026-10-07; raised for the 9-pool cell model)
 const uint MAX_INJECTION_SLOTS = 4u;   // simultaneously active tracer pulses
 
 // ============================================================================

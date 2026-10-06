@@ -1293,8 +1293,8 @@ def main() -> int:
         parser.error("--state-limited needs --substrate, no --no-uptake and --growth-yield > 0")
     if args.tracers > 0 or args.substrate:
         substrate_fields = (7 if args.state_limited else 4) if args.substrate else 0
-        if args.tracers + substrate_fields > 12:
-            parser.error("at most 12 scalar fields: --substrate uses 4 (7 with --state-limited), so --tracers <= 8 (5)")
+        if args.tracers + substrate_fields > 16:
+            parser.error("at most 16 scalar fields: --substrate uses 4 (7 with --state-limited), so --tracers <= 12 (9)")
         with open(out / "case.yaml", "a", encoding="utf-8") as handle:
             handle.write(scalars_block(args, h))
         print(f"scalars: {args.tracers} tracer(s), pulses from t = {args.injection_start} s every "
