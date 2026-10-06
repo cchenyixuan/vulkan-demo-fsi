@@ -447,7 +447,7 @@ def smooth_tank_shell(dx, layers):
 
 
 def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius,
-                      with_impeller=True, with_baffles=True):
+                      with_impeller=True, with_baffles=True, with_disk=True):
     """The thin plates of the tank (2026-09-30, case block `thin_plates:`): the blades, the
     Rushton disk and the baffle plates, each ONE layer of particles on its mid-plane.
     with_impeller / with_baffles = False leave out the blades and the disk / the baffles
@@ -474,7 +474,7 @@ def thin_plate_sheets(dx, impellers, top, lid, legacy_baffles, disk_inner_radius
                            normal=normal, axis_a=axis_a, extent=(half_a, half_b), thickness=thickness,
                            points=points, measure=(2.0 * half_a / cells_a) * (2.0 * half_b / cells_b),
                            box=OrientedBox(centre, np.stack([axis_a, axis_b, normal]), [half_a, half_b, 0.5 * dx])))
-    if with_impeller and impellers in ("both", "rushton"):
+    if with_impeller and with_disk and impellers in ("both", "rushton"):
         disk_mid = 0.5 * (RUSHTON_DISK["y0"] + RUSHTON_DISK["y1"])
         outer = RUSHTON_DISK["radius"]
         rings = max(1, int(math.ceil((outer - disk_inner_radius) / dx - 1e-9)))
@@ -560,16 +560,18 @@ def thin_plates_block(plates) -> str:
 
 
 def build_solids(thin, shaft_y0, shaft_y1, top_y, impellers="both", clip_tips=False, with_blades=True,
-                 legacy_baffles=False, with_baffle_plates=True, with_bell=True, with_disk=True, with_shaft=True):
+                 legacy_baffles=False, with_baffle_plates=True, with_bell=True, with_disk=True, with_shaft=True,
+                 disk_thickness=None):
     """Return (rotor_region, wall_solid_region). ``thin`` = minimum thickness.
     ``impellers`` = "both" | "rushton" | "pbt": which impellers (hub + blades,
     and the disk for the Rushton) are kept on the full-length shaft; used for
-    the single-impeller control runs of 2026-09-26."""
+    the single-impeller control runs of 2026-09-26.
+    ``disk_thickness`` overrides the disk's max(true thickness, thin) (2026-10-06, --solid-disk)."""
     keep_rushton = impellers in ("both", "rushton")
     keep_pbt = impellers in ("both", "pbt")
     t_baffle = max(LEGACY_BAFFLES["thickness"] if legacy_baffles else BAFFLE_THICKNESS, thin)
     t_rblade = max(RUSHTON_BLADE["thickness"], thin)
-    t_disk = max(RUSHTON_DISK["y1"] - RUSHTON_DISK["y0"], thin)
+    t_disk = max(RUSHTON_DISK["y1"] - RUSHTON_DISK["y0"], thin) if disk_thickness is None else disk_thickness
     t_pblade = max(PBT_BLADE["thickness"], thin)
 
     disk_mid = 0.5 * (RUSHTON_DISK["y0"] + RUSHTON_DISK["y1"])
@@ -855,6 +857,10 @@ def main() -> int:
                              "flat layers (a solid outer edge), the Rushton blades and disk stay thin plates, the "
                              "baffles follow --conformal-baffles / --thin-layers; to test whether the PBT tip flow "
                              "depends on the thin-plate edge")
+    parser.add_argument("--solid-disk", type=int, default=None, metavar="LAYERS",
+                        help="with --thin-plates: the Rushton disk as a lattice cylinder of rotor particles "
+                             "LAYERS spacings thick instead of a thin-plate annulus; the blades stay thin plates "
+                             "(2026-10-06, test of the jet tilt)")
     parser.add_argument("--thin-plate-dashpot", type=float, default=None,
                         help="numerics.thin_plate_dashpot (default of the solver: 0)")
     parser.add_argument("--skin", type=float, default=0.5,
@@ -1002,6 +1008,8 @@ def main() -> int:
             parser.error("--thin-plates needs --solid-reaction-force (the load on the plates is a reaction)")
     if args.conformal_pbt is not None and not (args.thin_plates and not args.conformal_blades and args.impellers == "both"):
         parser.error("--conformal-pbt needs --thin-plates, both impellers and no --conformal-blades")
+    if args.solid_disk is not None and not (args.thin_plates and not args.conformal_blades):
+        parser.error("--solid-disk needs --thin-plates and no --conformal-blades (it replaces the thin-plate disk)")
     # Which parts are thin plates (2026-10-03): all of them with --thin-plates alone; with
     # --conformal-baffles only the impeller (blades and disk), with --conformal-blades only the baffles.
     impeller_plates = args.thin_plates and not args.conformal_blades
@@ -1012,8 +1020,10 @@ def main() -> int:
                                             with_blades=not (args.conformal_blades or impeller_plates),
                                             legacy_baffles=args.legacy_baffles,
                                             with_baffle_plates=not (args.conformal_baffles or baffle_plates),
-                                            with_bell=not args.no_rotor_bell, with_disk=not impeller_plates,
-                                            with_shaft=not args.no_shaft)
+                                            with_bell=not args.no_rotor_bell,
+                                            with_disk=not impeller_plates or args.solid_disk is not None,
+                                            with_shaft=not args.no_shaft,
+                                            disk_thickness=None if args.solid_disk is None else args.solid_disk * dx)
     if args.impellers != "both":
         print(f"impellers={args.impellers} (single-impeller control)")
 
@@ -1079,7 +1089,8 @@ def main() -> int:
         plates = thin_plate_sheets(dx, "rushton" if args.conformal_pbt is not None else args.impellers, LIQUID_HEIGHT, shell,
                                    args.legacy_baffles,
                                    RUSHTON_HUB["radius"] + skin,
-                                   with_impeller=impeller_plates, with_baffles=baffle_plates)
+                                   with_impeller=impeller_plates, with_baffles=baffle_plates,
+                                   with_disk=args.solid_disk is None)
         kept = np.zeros((0, 3))
         for plate in plates:
             points = plate["points"]
