@@ -38,3 +38,18 @@
 
 - 混合时间高于实验时，用 PST 0.05 和 SGS Δ = h 加阻尼各做一个 2 mm 敏感性算例（各约 45 卡时），还是只做 3 mm 的？
 - 实验比三套 CFD 都快 4 到 8 s，注入方式和探头响应要在报告里单独讨论。
+
+## 改到 Mahuika（用户：P1 改到去 mahuika 排队吧）
+
+并行科技作业 1668830 在 4090 上实测约 13 步/s（15:07 起算，7.5 分钟到 6000 步），160 万步要 34 小时、34 卡时；
+用户决定改到 Mahuika 排队（免费）。1668830 已取消（跑了约 20 分钟，约 0.3 卡时）。
+
+Mahuika 当时 GPU 全满：PRO 6000 8 张在用、排队 2 个作业各要 2 张；H100 8 张在用、排 7 个；L4 16 张在用、排 9 个；
+A100 22 张在用、无排队（但 A100 上这个算例约 6 步/s，要 75 小时）。
+PRO 6000 上 2 mm 加 10 个示踪剂实测 14 步/s（10 月 2 日），160 万步约 32 小时。
+
+代码：本机 `git archive` HEAD（6a89cf2，求解器和生成器与 f91eedf 相同）加本机编译的 spv 打成 `fsi_f91eedf.tar.gz`，
+解到 `/nesi/project/uoa04509/sph/vulkan-demo-fsi_f91eedf`（`force_plates.comp.spv` 的 md5 与本机一致）。
+作业 9554591，`job_mix.sh`（已有 `CODE_DIR` 支持），`--gres=gpu:pro_6000:1 --mem=96G -t 48:00:00`，参数与并行科技的相同
+（`mix_2mm_sheets_P1 0.002 1600000 457 1 0`，`EXTRA_FLAGS` 为生产配置的生成器选项）。输出 `/nesi/nobackup/uoa04509/sph/mixing/`，
+日志 `.../sph/logs/mix_mix2mmP1_9554591.out`。
