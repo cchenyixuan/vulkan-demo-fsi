@@ -98,3 +98,15 @@ N1 的曲线就是一个饱饥循环：GLY 从 24.6 升到 37（120 s），糖�
 - 单向协议里 Monod 汇的容量取双向稳态的 k_E11 X_E11（1354 μmol/gdw/h）而不是 Haringa 的固定 1600，为的是两种协议的群体平均摄取一致。
 - 饥饿段 ATP 代数补丁的低估（Haringa 自己写明）原样保留。
 - 2 mm 从静止 20 s 时流场还在缓慢变化（10-05），加料 20 s 起、lifeline 30 s 起，和 C1 一样。
+
+## 分析工具（同日补）
+
+| 脚本 | 用途 |
+| --- | --- |
+| `experiment/v1/checks/_integrate_ninepool_lifelines.py` | 单向协议的后半步：沿记录的 C_s(t)（和 C_PAA）离线积分九池，向量化 Euler，步长 ≤ 0.01 s，记录间线性插值；输出 X_gly、μ、q_p、X_sto、ATP、E11 的序列和分布；`--check` 对双向算例记录的池做比较 |
+| `experiment/v1/checks/_compare_lifeline_cells.py` | 双向对单向：五个量的分布，按 C_s 的区间占比与平均停留时间（Haringa 2017 的 0.2 / 0.05），平均 q_p 对同 μ 理想混合恒化器 |
+
+交叉检验（本机 4 mm 双向算例，30 s，2000 条 lifeline 从 10 s，记录 C_s、gly、μ、q_p、sto，`output/ninepool_test/`，不入库）：
+从记录的初值出发沿 lifeline 的 C_s 离线积分，与 GPU 记录的池相比，最大差 X_gly 7.8 × 10⁻⁴（相对最大值）、μ 6.9 × 10⁻⁴、q_p 1.0 × 10⁻⁷、
+X_sto 1.2 × 10⁻⁶；剩余差来自时间步（GPU 8.8 × 10⁻⁵ s 对 0.01 s）和 C_s 的 0.03 s 采样。两套实现一致。
+顺带看到 4 mm 槽里加料 30 s 内的群体：X_gly 均值 15、5% 到 95% 分位 10 到 23，μ 0.012 到 0.050 h⁻¹，大部分细胞处于糖限制。
