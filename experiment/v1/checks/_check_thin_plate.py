@@ -393,13 +393,13 @@ def run_rotor(method, arguments, out):
             previous_of_uid[uid[fluid]] = positions[fluid, :3]          # rotor angle 0
             penetrated = set()
             crossing_records = []
-            sums = np.zeros(4)
+            sums = np.zeros(7)
             samples = 0
             history = []
             report_every = max(1, arguments.steps // arguments.reports)
             print("   step     time   turns    alive   torque on the paddle   on the walls   on the fluid   residual   "
                   "residual / paddle   C read   C fluid   max speed   mean speed   through the paddle   "
-                  "p min     p max   paddle off its plane")
+                  "p min     p max   paddle off its plane   faces: pressure side   suction side   mid-plane")
             print("   (torques with the mass factor, mN m; C = torque / mass factor / (rho U^2 A r): "
                   "read = minus the torque read back on the paddle, fluid = what the fluid receives from the "
                   "paddle = torque on the fluid + torque on the walls)")
@@ -444,8 +444,26 @@ def run_rotor(method, arguments, out):
                         reactions = simulator.readback_thin_plate_reactions()
                         paddle_torque = float((np.cross(reactions["position"], reactions["force"]) @ axis).sum())
                     # gravity is along the axis: it has no torque about it, also on the fluid
-                    terms = np.array([paddle_torque, torque_of(wall, True), torque_of(fluid, False), 0.0])
+                    terms = np.zeros(7)
+                    terms[:3] = paddle_torque, torque_of(wall, True), torque_of(fluid, False)
                     terms[3] = terms[0] + terms[1] + terms[2]
+                    # faces (2026-10-06): the +x half of the paddle moves toward -z (axis +y, omega > 0),
+                    # so in the frame of the rotor the face at x z < 0 is the pressure side of either half,
+                    # x z > 0 the suction side; the mid-plane layer of a solid paddle with an odd number of
+                    # layers belongs to neither
+                    if method == "plate":
+                        face_points = reactions["position"]
+                        face_torque = np.cross(face_points, reactions["force"]) @ axis
+                    else:
+                        face_points = positions[plate, :3].astype(np.float64)
+                        face_torque = (velocity_mass[plate, 3].astype(np.float64)
+                                       * (np.cross(face_points, acceleration[plate, :3].astype(np.float64) - gravity_vector) @ axis))
+                    in_frame = rotate_about_axis(face_points, axis, -simulator.rotor_angle)
+                    on_mid_plane = np.abs(in_frame[:, 2]) < 0.25 * dx
+                    side = in_frame[:, 0] * in_frame[:, 2]
+                    terms[4] = face_torque[(side < 0.0) & ~on_mid_plane].sum()
+                    terms[5] = face_torque[(side > 0.0) & ~on_mid_plane].sum()
+                    terms[6] = face_torque[on_mid_plane].sum()
                     sums += terms
                     samples += 1
                 if not need_report:
@@ -458,13 +476,14 @@ def run_rotor(method, arguments, out):
                 plate_in_frame = rotate_about_axis(positions[plate, :3].astype(np.float64), axis, -simulator.rotor_angle)
                 off_plane = float(np.abs(plate_in_frame[:, 2]).max()) - 0.5 * (geometry["layers"] - 1) * dx
                 status = simulator.readback_global_status()
-                history.append((simulator.simulation_time, *mean))
+                history.append((simulator.simulation_time, *mean, pressure.mean()))
                 print(f"   {step:6d} {simulator.simulation_time:7.3f}  {simulator.rotor_angle / (2.0 * math.pi):6.2f}  "
                       f"{status['alive_particle_count']:7d}   {mean[0] * 1e3:12.4f} mN m   {mean[1] * 1e3:10.4f}   "
                       f"{mean[2] * 1e3:10.4f}   {mean[3] * 1e3:9.4f}   {mean[3] / mean[0] if mean[0] != 0 else float('nan'):12.4f}   "
                       f"{-mean[0] / mass_factor / torque_scale:7.4f}  {(mean[1] + mean[2]) / mass_factor / torque_scale:7.4f}   "
                       f"{speed.max():8.4f}   {speed.mean():9.5f}   "
-                      f"{len(penetrated):10d}       {pressure.min():8.1f}  {pressure.max():8.1f}   {off_plane:.2e}")
+                      f"{len(penetrated):10d}       {pressure.min():8.1f}  {pressure.max():8.1f}   {off_plane:.2e}   "
+                      f"{mean[4] * 1e3:10.4f}   {mean[5] * 1e3:10.4f}   {mean[6] * 1e3:10.4f}")
             if crossing_records:
                 crossings = np.vstack(crossing_records)
                 edge_distance = np.minimum(geometry["half_a"] - np.abs(crossings[:, 0]),
@@ -482,9 +501,13 @@ def run_rotor(method, arguments, out):
                   f"walls {late[:, 2].mean() * 1e3:.4f}, fluid {late[:, 3].mean() * 1e3:.4f}, residual "
                   f"{late[:, 4].mean() * 1e3:.4f} mN m = {100.0 * late[:, 4].mean() / late[:, 1].mean():.2f} % of the paddle; "
                   f"C read {-late[:, 1].mean() / mass_factor / torque_scale:.4f}, "
-                  f"C fluid {(late[:, 2].mean() + late[:, 3].mean()) / mass_factor / torque_scale:.4f}")
+                  f"C fluid {(late[:, 2].mean() + late[:, 3].mean()) / mass_factor / torque_scale:.4f}; "
+                  f"faces: pressure side {late[:, 5].mean() * 1e3:.4f} mN m, suction side {late[:, 6].mean() * 1e3:.4f}, "
+                  f"mid-plane {late[:, 7].mean() * 1e3:.4f}; mean fluid pressure {late[:, 8].mean():.1f} Pa "
+                  f"(a uniform pressure p gives each face p H a^2 = {late[:, 8].mean() * 2.0 * geometry['half_b'] * geometry['half_a'] ** 2 * 1e3:.4f} mN m)")
             np.savetxt(out / f"{name}_history.csv", history, delimiter=",",
-                       header="time,torque_paddle,torque_walls,torque_fluid,residual", comments="")
+                       header="time,torque_paddle,torque_walls,torque_fluid,residual,pressure_side,suction_side,mid_plane,"
+                              "mean_pressure", comments="")
         finally:
             simulator.destroy()
 
