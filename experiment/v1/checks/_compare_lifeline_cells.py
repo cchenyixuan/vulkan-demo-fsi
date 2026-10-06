@@ -105,7 +105,7 @@ def main():
         import _model_ninepool as model
         for label, time, s in sets:
             mu_mean = float(np.nanmean(s["mu"]))
-            sol = model.run(max(mu_mean - model.P["vd"], 1e-3), 0.0895, 5e-3, 400.0, model.Y0)
+            sol = model.run(max(mu_mean - model.P["vd"], 1e-3), 0.0895, 5e-3, 400.0, model.Y0, method="BDF")   # LSODA can stall at low D
             v, _ = model.rates(sol.y[:9, -1], sol.y[9, -1], sol.y[10, -1])
             print(f"   {label:8s} mean q_p {np.nanmean(s['q_p']):.3e} vs ideally mixed chemostat at the same mu ({mu_mean:.4f} 1/h): "
                   f"{v[7]:.3e} -> {100.0 * (np.nanmean(s['q_p']) / v[7] - 1.0):+.1f} %")

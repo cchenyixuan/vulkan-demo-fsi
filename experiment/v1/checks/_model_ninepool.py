@@ -75,9 +75,10 @@ def rhs(t, y, D, Cs_f, CPAA_f, feed_on, p=P, atp_dynamic=False):
     return [pools[0], pools[1], pools[2], pools[4], de11, de32, de4, dv33, datp, dCs, dCPAA, dCx]
 
 
-def run(D, Cs_f, CPAA_f, hours, y0, feed_on=lambda t: 1.0, t_eval=None, atp_dynamic=False, max_step=np.inf):
+def run(D, Cs_f, CPAA_f, hours, y0, feed_on=lambda t: 1.0, t_eval=None, atp_dynamic=False, max_step=np.inf,
+        method="LSODA"):
     from scipy.integrate import solve_ivp
-    return solve_ivp(rhs, (0.0, hours), y0, args=(D, Cs_f, CPAA_f, feed_on, P, atp_dynamic), method="LSODA",
+    return solve_ivp(rhs, (0.0, hours), y0, args=(D, Cs_f, CPAA_f, feed_on, P, atp_dynamic), method=method,
                      rtol=1e-7, atol=[1e-6] * 9 + [1e-12, 1e-12, 1e-6], t_eval=t_eval, max_step=max_step)
 
 
