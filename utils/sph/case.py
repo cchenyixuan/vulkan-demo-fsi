@@ -691,6 +691,38 @@ class ScalarProbesConfig:
                 raise ValueError(f"scalars.probes.radius must be > 0, got {self.radius}")
 
 
+# 9-pool cell model of Penicillium chrysogenum (Tang et al. 2017, in the form of Haringa et al. 2018
+# supplementary A; stage 5, 2026-10-07). Rates per hour, pools umol/gdw, concentrations mol/kg.
+# Order = index in the ReactionParameterBuffer (common.glsl); predict.comp reads them by index.
+# Three values differ from the printed tables, see docs/stage5_pichia_level2_design_2026-10-02.md
+# sec. 8.1: q_E11,max 1.65e-2 (printed 6.5e-2), pH_int 7.20 (Haringa prints 2.20), and the sign of
+# the PAA import (extracellular minus intracellular undissociated acid).
+NINEPOOL_PARAMETER_ORDER = (
+    "qE11max", "mu0", "k11", "kdE11", "kE11", "Ks11",
+    "v12max", "Kgly12", "KAA12", "KATP12",
+    "v13max", "Kgly13", "KAA13", "KATP13",
+    "v21max", "Kgly21", "KATP21", "mATP22",
+    "kperm31", "acell", "alpha32", "beta32", "kdE32",
+    "beta33", "kdE33", "Kgly33", "m33",
+    "alpha4", "beta4", "kdE4",
+    "k41", "Ks41", "Ksto41", "k42", "Ks42", "Ksto42", "KATP42",
+    "pHint", "pHext", "pKPAA", "vd", "Mw", "rho", "ATP_A", "ATP_B")
+NINEPOOL_DEFAULTS = dict(
+    qE11max=1.65e-2, mu0=5.5e-2, k11=0.10, kdE11=1.46e-2, kE11=0.26, Ks11=9.8e-6,
+    v12max=0.18, Kgly12=31.38, KAA12=870.23, KATP12=2.01,
+    v13max=0.32, Kgly13=38.54, KAA13=757.81, KATP13=1.95,
+    v21max=0.35, Kgly21=25.64, KATP21=6.01, mATP22=3.3e-2,
+    kperm31=1.62e-2, acell=56.0, alpha32=0.0, beta32=1.56e3, kdE32=0.35,
+    beta33=6.5e-4, kdE33=1.47e-2, Kgly33=30.76, m33=6.0,
+    alpha4=8.01e-4, beta4=0.289, kdE4=0.29,
+    k41=1.01, Ks41=1e-8, Ksto41=4.25e3, k42=3.99, Ks42=1e-4, Ksto42=7.99e3, KATP42=6.48,
+    pHint=7.20, pHext=6.50, pKPAA=4.31, vd=5e-3, Mw=28.05, rho=1000.0, ATP_A=8.5, ATP_B=10.5)
+# roles of ReactionParameterBuffer.reaction_field_slot, in order (common.glsl)
+NINEPOOL_ROLES = ("substrate", "paa", "uptake", "product", "growth_rate", "biomass",
+                  "gly", "aa", "sto", "paa_pool", "e11", "e32", "e4", "pen_capacity")
+NINEPOOL_REQUIRED = ("substrate", "paa", "biomass", "gly", "aa", "sto", "paa_pool", "e11", "e32", "e4", "pen_capacity")
+
+
 @dataclass
 class ScalarReactionConfig:
     """Monod uptake by biomass carried on the FLUID particles (``scalars.reactions`` entry,
@@ -709,7 +741,15 @@ class ScalarReactionConfig:
     ([biomass] s) is taken first, growth is yield (uptake - maintenance); ``product`` gains
     max(p0 + p1 mu + p2 mu^2, 0) X dt with ``product_rate`` = [p0, p1, p2]; ``maintenance``
     accumulates the maintenance uptake. growth_rate, product and maintenance share one vec4
-    with a HIGHER index than the substrate's. yield 0 removes the demand limit."""
+    with a HIGHER index than the substrate's. yield 0 removes the demand limit.
+
+    Type ``ninepool`` (2026-10-07, stage 5, REACTION_MODE 3): the 9-pool model of Tang et al. 2017
+    on every FLUID particle. Field roles (case.yaml keys, NINEPOOL_ROLES): substrate (C_s), paa
+    (C_PAA), biomass (x_bio, gdw/kg), gly, aa, sto, paa_pool (umol/gdw), e11, e32, e4 (-),
+    pen_capacity (v33, mol/Cmol/h); optional uptake (cumulative C_s taken), product (cumulative
+    penicillin, mol/kg), growth_rate (mu of the step, 1/h, overwritten). Every role's vec4 index
+    must be >= the substrate's. ``ninepool:`` is a dict of parameter overrides (NINEPOOL_DEFAULTS).
+    q_max, k_s and yield are ignored (the model has its own uptake)."""
     type: str
     substrate: str
     biomass: str
@@ -725,10 +765,20 @@ class ScalarReactionConfig:
     tau_up: float = 1.0
     tau_down: float = 1.0
     product_rate: tuple = (0.0, 0.0, 0.0)
+    paa: Optional[str] = None
+    gly: Optional[str] = None
+    aa: Optional[str] = None
+    sto: Optional[str] = None
+    paa_pool: Optional[str] = None
+    e11: Optional[str] = None
+    e32: Optional[str] = None
+    e4: Optional[str] = None
+    pen_capacity: Optional[str] = None
+    ninepool: Optional[dict] = None
 
     def __post_init__(self):
-        if self.type not in ("monod", "state_limited"):
-            raise ValueError(f"scalars.reactions: type must be 'monod' or 'state_limited', got {self.type!r}")
+        if self.type not in ("monod", "state_limited", "ninepool"):
+            raise ValueError(f"scalars.reactions: type must be 'monod', 'state_limited' or 'ninepool', got {self.type!r}")
         self.q_max = float(self.q_max)
         self.k_s = float(self.k_s)
         self.growth_yield = float(self.growth_yield)
@@ -747,13 +797,32 @@ class ScalarReactionConfig:
                                  "tau_up > 0 and tau_down > 0")
             if len(self.product_rate) != 3:
                 raise ValueError("scalars.reactions: product_rate must be [p0, p1, p2]")
+        elif self.type == "ninepool":
+            missing = [role for role in NINEPOOL_REQUIRED if not getattr(self, role)]
+            if missing:
+                raise ValueError(f"scalars.reactions: ninepool needs the fields {missing}")
+            values = dict(NINEPOOL_DEFAULTS)
+            unknown = set(self.ninepool or {}) - set(values)
+            if unknown:
+                raise ValueError(f"scalars.reactions: unknown ninepool parameters {sorted(unknown)}")
+            values.update({k: float(v) for k, v in (self.ninepool or {}).items()})
+            for key, value in values.items():
+                if key.startswith("K") and value <= 0.0:
+                    raise ValueError(f"scalars.reactions: ninepool parameter {key} must be > 0")
+            if values["Mw"] <= 0.0 or values["rho"] <= 0.0 or values["ATP_B"] <= 0.0:
+                raise ValueError("scalars.reactions: ninepool Mw, rho and ATP_B must be > 0")
+            self.ninepool = values
         elif self.growth_rate or self.product or self.maintenance:
             raise ValueError("scalars.reactions: growth_rate / product / maintenance belong to type state_limited")
 
     @property
     def mode(self) -> int:
         """REACTION_MODE spec constant."""
-        return 2 if self.type == "state_limited" else 1
+        return {"monod": 1, "state_limited": 2, "ninepool": 3}[self.type]
+
+    def ninepool_values(self) -> list:
+        """parameters in NINEPOOL_PARAMETER_ORDER (ninepool only)"""
+        return [self.ninepool[name] for name in NINEPOOL_PARAMETER_ORDER]
 
 
 @dataclass
@@ -842,8 +911,16 @@ class ScalarsConfig:
             for name in used:
                 if name not in names:
                     raise ValueError(f"scalars.reactions: unknown field {name!r} (fields: {names})")
-            if len({names.index(name) // 4 for name in used}) != 1:
+            if reaction.type != "ninepool" and len({names.index(name) // 4 for name in used}) != 1:
                 raise ValueError("scalars.reactions: substrate, biomass and uptake must share one vec4")
+            if reaction.type == "ninepool":
+                for role in NINEPOOL_ROLES:
+                    name = getattr(reaction, role)
+                    if name is not None and name not in names:
+                        raise ValueError(f"scalars.reactions: unknown field {name!r} (fields: {names})")
+                    if name is not None and names.index(name) // 4 < names.index(reaction.substrate) // 4:
+                        raise ValueError(f"scalars.reactions: ninepool field {name!r} must not be declared in a "
+                                         f"vec4 before the substrate's (predict.comp applies it in a later pass)")
             if reaction.type == "state_limited":
                 state = [reaction.growth_rate] + [f for f in (reaction.product, reaction.maintenance) if f]
                 for name in state:
@@ -902,6 +979,14 @@ class ScalarsConfig:
             if field.diffusivity > 0.0 or (self.sgs.enabled and field.turbulent):
                 mask |= 1 << (index // 4)
         return mask
+
+    def reaction_slots(self) -> list:
+        """field index (4 v + c) per NINEPOOL_ROLES entry, None if absent (ninepool only)"""
+        if not self.reactions or self.reactions[0].type != "ninepool":
+            return []
+        reaction = self.reactions[0]
+        return [self.field_names.index(getattr(reaction, role)) if getattr(reaction, role) else None
+                for role in NINEPOOL_ROLES]
 
     def reaction_state_layout(self) -> int:
         """REACTION_STATE_LAYOUT spec constant (0 unless the reaction is state_limited)."""

@@ -185,6 +185,9 @@ SPEC_ID_USE_SCALAR_BOUNDS_LIMITER           = 70
 SPEC_ID_SCALAR_FIELD_COUNT                  = 71
 # Compile-time capacities, mirror common.glsl MAX_SCALAR_VEC4 / MAX_INJECTION_SLOTS.
 MAX_SCALAR_VEC4                             = 4    # 3 until 2026-10-07
+REACTION_SLOT_COUNT                         = 16   # ReactionParameterBuffer (2026-10-07)
+REACTION_PARAMETER_COUNT                    = 64
+REACTION_PARAMETER_BYTES                    = 4 * (REACTION_SLOT_COUNT + REACTION_PARAMETER_COUNT)
 MAX_INJECTION_SLOTS                         = 4
 INJECTION_SLOT_BYTES                        = 48
 SPEC_ID_LEADING_GHOST_VOXEL_COUNT           = 80
@@ -449,6 +452,9 @@ class SphSimulatorV1:
             # Forces the fluid particles received from the wall dummies of thin
             # plates, with their positions (force.comp, plates builds).
             _BufferSpec("thin_plate_reaction",          3, 13, thin_plate_reaction_bytes, BSU | TRANSFER),
+            # Reaction parameters of the 9-pool cell model (2026-10-07): 16 uint
+            # field slots + 64 float parameters, written once at start-up.
+            _BufferSpec("reaction_parameters",          3, 14, REACTION_PARAMETER_BYTES, BSU | TRANSFER),
         ]
 
     def _allocate_buffer(self, size: int, usage: int, memory_properties: int) -> Buffer:
@@ -685,6 +691,15 @@ class SphSimulatorV1:
                 parameters[vec4_index, 0, component] = field.diffusivity
                 parameters[vec4_index, 1, component] = 1.0 if field.turbulent else 0.0
             data["scalar_parameters"] = parameters.tobytes()
+            if scalars.reactions and scalars.reactions[0].type == "ninepool":
+                # 9-pool cell model (2026-10-07): field slots and parameters, see case.py
+                slots = np.full(REACTION_SLOT_COUNT, 0xFFFFFFFF, dtype=np.uint32)
+                for role, slot in enumerate(scalars.reaction_slots()):
+                    slots[role] = slot if slot is not None else 0xFFFFFFFF
+                values = np.zeros(REACTION_PARAMETER_COUNT, dtype=np.float32)
+                ordered = scalars.reactions[0].ninepool_values()
+                values[:len(ordered)] = ordered
+                data["reaction_parameters"] = slots.tobytes() + values.tobytes()
 
         return data
 

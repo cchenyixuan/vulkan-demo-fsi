@@ -760,6 +760,12 @@ def write_preview(path, fluid, wall, rotor, dx):
 HARINGA_Q_MAX_UMOL_PER_G_H = 1600.0
 HARINGA_K_S = 7.8e-6
 HARINGA_BIOMASS = 55.0
+# 9-pool cell model (stage 5, 2026-10-07): initial pools = chemostat steady state of the 0-D model near
+# mu 0.035 1/h (experiment/v1/checks/_model_ninepool.py); enzyme pools from their steady-state formulas.
+NINEPOOL_INITIAL = dict(gly=20.0, aa=928.0, sto=2650.0, paa=2.7, e11=0.131, e32=142.0, e4=0.034, v33=4.4e-4,
+                        Cs=7.4e-6, CPAA=2.3e-3)
+NINEPOOL_FIELDS = ("substrate", "paa_ext", "uptake", "feed", "gly", "aa", "sto", "paa_pool",
+                   "e11", "e32", "e4", "pen_capacity", "biomass", "product", "growth_rate")
 
 
 def scalars_block(args, h) -> str:
@@ -775,7 +781,24 @@ def scalars_block(args, h) -> str:
              "# continuous feed (log/2026-10-01_reaction-and-feed.md).",
              "scalars:", "  fields:"]
     sgs_flag = "true" if args.sgs else "false"
-    if args.substrate:
+    if args.ninepool:
+        # 9-pool cell model (2026-10-07): 15 fields in 4 vec4, C_s and C_PAA diffuse, the rest ride on the particle
+        initial = {"substrate": args.substrate_initial if args.substrate_initial is not None else NINEPOOL_INITIAL["Cs"],
+                   "paa_ext": args.paa_initial, "uptake": 0.0, "feed": 0.0, "gly": NINEPOOL_INITIAL["gly"],
+                   "aa": NINEPOOL_INITIAL["aa"], "sto": NINEPOOL_INITIAL["sto"], "paa_pool": NINEPOOL_INITIAL["paa"],
+                   "e11": NINEPOOL_INITIAL["e11"], "e32": NINEPOOL_INITIAL["e32"], "e4": NINEPOOL_INITIAL["e4"],
+                   "pen_capacity": NINEPOOL_INITIAL["v33"], "biomass": args.biomass, "product": 0.0, "growth_rate": 0.0}
+        # one-way: the Monod sink needs substrate, biomass and uptake in one vec4, so x_bio swaps with C_PAA
+        order = list(NINEPOOL_FIELDS)
+        if args.ninepool_one_way:
+            order[1], order[12] = order[12], order[1]
+        for name in order:
+            if name in ("substrate", "paa_ext"):
+                lines.append(f"    - {{name: {name}, diffusivity: {args.substrate_diffusivity:.3e}, turbulent: true, "
+                             f"initial: {initial[name]:.6e}}}")
+            else:
+                lines.append(f"    - {{name: {name}, diffusivity: 0.0, turbulent: false, initial: {initial[name]:.6e}}}")
+    elif args.substrate:
         initial = args.substrate_initial if args.substrate_initial is not None else 10.0 * args.k_s
         lines.append(f"    - {{name: substrate, diffusivity: {args.substrate_diffusivity:.3e}, turbulent: true, "
                      f"initial: {initial:.6e}}}")
@@ -796,7 +819,25 @@ def scalars_block(args, h) -> str:
                      f"turbulent: true, initial: 0.0}}")
     lines += ["  sgs:", f"    enabled: {sgs_flag}", "    smagorinsky_cs: 0.1",
               "    turbulent_schmidt: 0.7"]
-    if args.substrate:
+    if args.ninepool:
+        q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
+        if args.ninepool_one_way:
+            # one-way protocol (Haringa 2018): the field is consumed by a Monod sink with a fixed capacity,
+            # the 9-pool model is integrated offline along the recorded lifelines
+            lines += ["  reactions:",
+                      f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
+                      f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: 0.0}}"]
+        else:
+            lines += ["  reactions:",
+                      "    - {type: ninepool, substrate: substrate, paa: paa_ext, uptake: uptake, product: product, "
+                      "growth_rate: growth_rate, biomass: biomass, gly: gly, aa: aa, sto: sto, paa_pool: paa_pool, "
+                      "e11: e11, e32: e32, e4: e4, pen_capacity: pen_capacity, q_max: 0.0, k_s: 1.0}"]
+        center = args.feed_center if args.feed_center is not None else INJECTION_POINT
+        stop = "" if args.feed_stop is None else f", stop: {args.feed_stop:.4f}"
+        lines += ["  sources:",
+                  f"    - {{field: substrate, center: [{center[0]}, {center[1]}, {center[2]}], radius: {args.feed_radius:.4f}, "
+                  f"rate: {args.feed_rate:.6e}, start: {args.feed_start:.4f}{stop}, record: feed}}"]
+    elif args.substrate:
         q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
         if args.state_limited:
             maintenance = args.maintenance_umol_per_g_h * 1e-6 / 3600.0
@@ -996,6 +1037,15 @@ def main() -> int:
     parser.add_argument("--feed-radius", type=float, default=0.02, help="feed sphere radius, m (0.02)")
     parser.add_argument("--feed-start", type=float, default=0.0, help="feed start, s")
     parser.add_argument("--feed-stop", type=float, default=None, help="feed stop, s (default: never)")
+    parser.add_argument("--ninepool", action="store_true",
+                        help="stage 5 (2026-10-07): 9-pool cell model of Tang et al. 2017 (P. chrysogenum) on the fluid "
+                             "particles, 15 fields, glucose feed sphere as --substrate (implies the substrate setup; "
+                             "--biomass is x_bio in gdw/kg)")
+    parser.add_argument("--ninepool-one-way", action="store_true",
+                        help="with --ninepool: the one-way protocol (Haringa 2018): same 15 fields, but the glucose field "
+                             "is consumed by a fixed-capacity Monod sink (--q-max-umol-per-g-h, --k-s); the pools are "
+                             "integrated offline along the lifelines")
+    parser.add_argument("--paa-initial", type=float, default=NINEPOOL_INITIAL["CPAA"], help="9-pool: initial C_PAA, mol/kg")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
     global PBT_HUB, PBT_COLLAR, RUSHTON_HUB, PBT_TRUE_LENGTH, PBT_TIP_RADIUS
@@ -1291,15 +1341,23 @@ def main() -> int:
     (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity), encoding="utf-8")
     if args.state_limited and (not args.substrate or args.no_uptake or args.growth_yield <= 0.0):
         parser.error("--state-limited needs --substrate, no --no-uptake and --growth-yield > 0")
+    if args.ninepool and (args.state_limited or args.no_uptake):
+        parser.error("--ninepool cannot be combined with --state-limited or --no-uptake")
+    if args.ninepool:
+        args.substrate = True
     if args.tracers > 0 or args.substrate:
-        substrate_fields = (7 if args.state_limited else 4) if args.substrate else 0
+        substrate_fields = (15 if args.ninepool else 7 if args.state_limited else 4) if args.substrate else 0
         if args.tracers + substrate_fields > 16:
             parser.error("at most 16 scalar fields: --substrate uses 4 (7 with --state-limited), so --tracers <= 12 (9)")
         with open(out / "case.yaml", "a", encoding="utf-8") as handle:
             handle.write(scalars_block(args, h))
         print(f"scalars: {args.tracers} tracer(s), pulses from t = {args.injection_start} s every "
               f"{args.injection_interval} s, radius {args.injection_radius:.4f} m, sgs={'on' if args.sgs else 'off'}")
-        if args.substrate:
+        if args.ninepool:
+            print(f"ninepool: {'one-way (Monod sink q_max ' + format(args.q_max_umol_per_g_h, 'g') + ' umol/(g h))' if args.ninepool_one_way else 'two-way (Tang 2017 9-pool)'}, "
+                  f"x_bio {args.biomass:g} g/kg, C_s0 {NINEPOOL_INITIAL['Cs'] if args.substrate_initial is None else args.substrate_initial:.2e}, "
+                  f"C_PAA0 {args.paa_initial:.2e}; feed {args.feed_rate:.3e} mol/s from t = {args.feed_start:g} s, sphere r = {args.feed_radius:g} m")
+        elif args.substrate:
             print(f"substrate: Monod q_max {args.q_max_umol_per_g_h:g} umol/(g h), K_s {args.k_s:.2e} mol/kg, "
                   f"X {args.biomass:g} g/kg, uptake {'off' if args.no_uptake else 'on'}; feed {args.feed_rate:.3e} mol/s "
                   f"from t = {args.feed_start:g} s, sphere r = {args.feed_radius:g} m")

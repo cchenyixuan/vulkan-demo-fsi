@@ -431,7 +431,8 @@ layout(constant_id = 71) const uint  SCALAR_FIELD_COUNT = 0u;
 //     C -= dC,   U += dC (cumulative uptake),   X += Y dC (growth, Y = 0: off)
 // The three fields share one vec4. REACTION_LAYOUT packs
 //     vec4 index | substrate component << 4 | biomass << 8 | uptake << 12
-// (component 4 = no uptake field). REACTION_MODE 0 compiles it out.
+// (component 4 = no uptake field). REACTION_MODE 0 compiles it out; 1 = monod,
+// 2 = state_limited (below), 3 = ninepool (ReactionParameterBuffer, predict.comp).
 layout(constant_id = 79) const uint  REACTION_MODE = 0u;
 layout(constant_id = 89) const uint  REACTION_LAYOUT = 0u;
 layout(constant_id = 90) const float REACTION_Q_MAX = 0.0;            // [substrate] / ([biomass] s)
@@ -1001,6 +1002,28 @@ struct ScalarInjectionSlot {
 
 layout(std430, set = 3, binding = 11) buffer ScalarInjectionBuffer {
     ScalarInjectionSlot scalar_injection[];   // MAX_INJECTION_SLOTS entries
+};
+
+// ----------------------------------------------------------------------------
+// Reaction parameters (2026-10-07, stage 5): the 9-pool cell model of
+// Tang et al. 2017 (REACTION_MODE 3, type `ninepool` in case.py). Numbers that
+// do not select code paths live here instead of in spec constants, so a
+// parameter scan does not rebuild the pipelines. Written once at start-up.
+//   reaction_field_slot[r] : field index (4 v + c) of role r, 0xFFFFFFFF = absent;
+//       roles: 0 C_s, 1 C_PAA, 2 cumulative uptake, 3 cumulative penicillin,
+//              4 mu record, 5 x_bio, 6 X_gly, 7 X_AA, 8 X_sto, 9 X_PAA,
+//              10 X_E11, 11 X_E32, 12 X_E4, 13 v33 (q_p capacity)
+//   reaction_parameter[i]  : NINEPOOL_PARAMETER_ORDER of utils/sph/case.py
+//       (rates per hour, pools umol/gdw, concentrations mol/kg); the shader
+//       multiplies TIMESTEP by 1/3600.
+// ----------------------------------------------------------------------------
+const uint REACTION_SLOT_COUNT      = 16u;
+const uint REACTION_PARAMETER_COUNT = 64u;
+const uint REACTION_SLOT_NONE       = 0xFFFFFFFFu;
+
+layout(std430, set = 3, binding = 14) buffer ReactionParameterBuffer {
+    uint  reaction_field_slot[REACTION_SLOT_COUNT];
+    float reaction_parameter[REACTION_PARAMETER_COUNT];
 };
 
 #if WITH_THIN_PLATES

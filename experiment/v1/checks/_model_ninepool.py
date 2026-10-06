@@ -9,7 +9,7 @@ q_E11,max 1.65e-2 (printed 6.5e-2; calibrated to the stated q_s,max). D <= 0.01 
 import sys
 
 import numpy as np
-from scipy.integrate import solve_ivp
+# scipy only for run() (the solver environment has none; _check_ninepool_box.py uses rhs() with its own RK4)
 
 # qE11max: table A3 prints 6.5e-2; 1.65e-2 reproduces the paper's q_s,max 1.13 mmol/gdw/h at mu 0.033 and C_s ~1e-5 at D 0.05
 P = dict(qE11max=1.65e-2, mu0=5.5e-2, k11=0.10, kdE11=1.46e-2, kE11=0.26, Ks11=9.8e-6,
@@ -59,22 +59,24 @@ def rhs(t, y, D, Cs_f, CPAA_f, feed_on, p=P, atp_dynamic=False):
     X = y[:9]; Cs, CPAA, Cx = y[9], y[10], y[11]
     v, atp = rates(X, Cs, CPAA, p, atp_dynamic)
     mu = v[2]
-    pools = 1e6 / p["Mw"] * (S @ v) - mu * np.array([X[0], X[1], X[2], X[3], atp])
+    # S rows: gly, AA, sto, ATP, PAA (table A1 order); state order gly, aa, sto, paa, ..., atp
+    pools = 1e6 / p["Mw"] * (S @ v) - mu * np.array([X[0], X[1], X[2], atp, X[3]])
     gly, aa, sto, paa, e11, e32, e4, v33 = X[:8]
     de11 = p["qE11max"] * hill(mu + p["mu0"], p["k11"], 5) - (mu + p["kdE11"]) * e11
     de32 = p["alpha32"] + p["beta32"] * mu - p["kdE32"] * e32 - mu * e32
     de4 = p["alpha4"] + p["beta4"] * mu - p["kdE4"] * e4 - mu * e4
     dv33 = p["beta33"] * mu / (1.0 + (gly / p["Kgly33"]) ** p["m33"]) - (p["kdE33"] + mu) * v33
-    datp = pools[4] if atp_dynamic else 0.0
+    datp = pools[3] if atp_dynamic else 0.0           # ATP row (bug until 2026-10-07: rows 3 and 4 were swapped)
     f = feed_on(t)
     Cx_cmol = Cx / p["Mw"]                                     # Cmol/kg
     dCs = -v[0] * Cx_cmol + D * (f * Cs_f - Cs)                # feed_on scales the inflow concentration
     dCPAA = (v[6] - v[5]) * Cx_cmol + D * (f * CPAA_f - CPAA)
     dCx = (mu - p["vd"] - D) * Cx
-    return [pools[0], pools[1], pools[2], pools[3], de11, de32, de4, dv33, datp, dCs, dCPAA, dCx]
+    return [pools[0], pools[1], pools[2], pools[4], de11, de32, de4, dv33, datp, dCs, dCPAA, dCx]
 
 
 def run(D, Cs_f, CPAA_f, hours, y0, feed_on=lambda t: 1.0, t_eval=None, atp_dynamic=False, max_step=np.inf):
+    from scipy.integrate import solve_ivp
     return solve_ivp(rhs, (0.0, hours), y0, args=(D, Cs_f, CPAA_f, feed_on, P, atp_dynamic), method="LSODA",
                      rtol=1e-7, atol=[1e-6] * 9 + [1e-12, 1e-12, 1e-6], t_eval=t_eval, max_step=max_step)
 

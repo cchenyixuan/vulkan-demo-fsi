@@ -261,6 +261,129 @@ void main() {
                 }
                 scalar_delta[state_index] = state_delta;
             }
+            // 9-pool cell model (2026-10-07, stage 5, REACTION_MODE 3): Tang et al. 2017 in the form of
+            // Haringa et al. 2018 supp. A (tables A1-A3, pool balance eq. 1, algebraic ATP). Parameters and
+            // field slots come from ReactionParameterBuffer (common.glsl; order NINEPOOL_PARAMETER_ORDER in
+            // utils/sph/case.py). Applied once per particle, in the pass of the substrate's vec4: every vec4
+            // is gathered here, the increments of the other vec4 are written back to scalar_delta and picked
+            // up by their later passes (case.py checks that they come after the substrate's vec4). Forward
+            // Euler as in Haringa 2018; rates per hour, dt_h = dt / 3600. Pools, x_bio and concentrations are
+            // read clamped at 0. The glucose uptake is linearised implicitly in C_s (dC_s <= C_s) and the
+            // same amount feeds the GLY pool. Every expression is finite for any input (RTX 5090 rule).
+            if (REACTION_MODE == 3u && vec4_index == (reaction_field_slot[0] >> 2u)) {
+                vec4 np_value[MAX_SCALAR_VEC4];
+                vec4 np_delta[MAX_SCALAR_VEC4];
+                for (uint v = 0u; v < MAX_SCALAR_VEC4; v++) {
+                    np_value[v] = vec4(0.0);
+                    np_delta[v] = vec4(0.0);
+                }
+                for (uint v = 0u; v < SCALAR_VEC4_COUNT; v++) {
+                    if (v == vec4_index) {
+                        np_value[v] = value;
+                        np_delta[v] = delta;
+                    } else {
+                        uint k = scalar_index(self_particle_id, v);
+                        np_value[v] = scalar[k];
+                        np_delta[v] = scalar_delta[k];
+                    }
+                }
+#define NP_SLOT(r)  (reaction_field_slot[r])
+#define NP_VEC(r)   (min(NP_SLOT(r) >> 2u, MAX_SCALAR_VEC4 - 1u))
+#define NP_COMP(r)  (NP_SLOT(r) & 3u)
+#define NP_GET(r)   ((NP_SLOT(r) == REACTION_SLOT_NONE) ? 0.0 : max(np_value[NP_VEC(r)][NP_COMP(r)] + np_delta[NP_VEC(r)][NP_COMP(r)], 0.0))
+#define NP_ADD(r, x) if (NP_SLOT(r) != REACTION_SLOT_NONE) { np_delta[NP_VEC(r)][NP_COMP(r)] += (x); }
+#define NP_P(i)     (reaction_parameter[i])
+                float dt_h  = TIMESTEP / 3600.0;
+                float Cs    = NP_GET(0);
+                float CPAA  = NP_GET(1);
+                float xbio  = NP_GET(5);
+                float gly   = NP_GET(6);
+                float aa    = NP_GET(7);
+                float sto   = NP_GET(8);
+                float paa   = NP_GET(9);
+                float e11   = NP_GET(10);
+                float e32   = NP_GET(11);
+                float e4    = NP_GET(12);
+                float v33   = NP_GET(13);
+                float Mw        = NP_P(41);
+                float xbio_cmol = xbio / Mw;                                   // Cmol/kg
+                float gly2 = gly * gly, gly3 = gly2 * gly;
+                float aa2  = aa * aa;
+                float sto2 = sto * sto;
+                float atp_b3 = NP_P(44) * NP_P(44) * NP_P(44);
+                float atp  = NP_P(43) * gly3 / (gly3 + atp_b3);                 // algebraic ATP (Haringa 2018)
+                float atp2 = atp * atp, atp3 = atp2 * atp, atp4 = atp2 * atp2;
+                // v11: glucose uptake, implicit in C_s
+                float a11  = NP_P(4) * e11 * xbio_cmol * dt_h / (Cs + NP_P(5));
+                float dCs  = Cs * a11 / (1.0 + a11);
+                float v11  = dCs / max(xbio_cmol * dt_h, 1.0e-30);             // mol/Cmol/h, consistent with dCs
+                float k2;
+                k2 = NP_P(7) * NP_P(7);
+                float v12 = NP_P(6) * gly2 / (k2 + gly2);
+                k2 = NP_P(8) * NP_P(8);
+                v12 *= k2 / (k2 + aa2);
+                float k3 = NP_P(9) * NP_P(9) * NP_P(9);
+                v12 *= atp3 / (k3 + atp3);
+                k2 = NP_P(11) * NP_P(11);
+                float v13 = NP_P(10) * gly2 / (k2 + gly2);
+                k2 = NP_P(12) * NP_P(12);
+                v13 *= aa2 / (k2 + aa2);
+                k3 = NP_P(13) * NP_P(13) * NP_P(13);
+                v13 *= atp3 / (k3 + atp3);                                     // mu, 1/h
+                k3 = NP_P(15) * NP_P(15) * NP_P(15);
+                float v21 = NP_P(14) * gly3 / (k3 + gly3);
+                float k4 = NP_P(16) * NP_P(16) * NP_P(16) * NP_P(16);
+                v21 *= k4 / (k4 + atp4);
+                float fraction_ext = 1.0 / (1.0 + pow(10.0, NP_P(38) - NP_P(39)));   // undissociated PAA, broth
+                float fraction_int = 1.0 / (1.0 + pow(10.0, NP_P(37) - NP_P(39)));   // undissociated PAA, cytosol
+                float v31 = NP_P(18) * NP_P(19) * (CPAA * NP_P(42) * fraction_ext - paa / 2.5 * fraction_int);
+                float v32 = e32 * paa * Mw * 1.0e-6;
+                float cs41 = Cs / (Cs + NP_P(31));
+                float cs42 = Cs / (Cs + NP_P(34));
+                float v41 = NP_P(30) * e4 * cs41 * (1.0 + 2.0 * cs42) * NP_P(32) / (sto + NP_P(32));
+                k2 = NP_P(35) * NP_P(35);
+                float v42 = NP_P(33) * e4 * (1.0 - cs42) * (1.0 + 2.0 * cs41) * sto2 / (k2 + sto2);
+                k2 = NP_P(36) * NP_P(36);
+                v42 *= atp2 / (k2 + atp2);
+                float mu    = v13;
+                float mu_dt = mu * dt_h;
+                float scale = 1.0e6 / Mw * dt_h;                               // mol/Cmol -> umol/gdw per step
+                // metabolite pools (table A1 stoichiometry)
+                NP_ADD(6, scale * (6.0 * v11 - v12 - 0.578 * v13 - v21 - 4.81 * v33 - 1.07 * v41 + v42) - mu_dt * gly);
+                NP_ADD(7, scale * (v12 - 0.5 * v13 - 6.25 * v33) - mu_dt * aa);
+                NP_ADD(8, scale * (v41 - v42) - mu_dt * sto);
+                NP_ADD(9, scale * (v31 - v32 - v33) - mu_dt * paa);
+                // enzyme pools and the penicillin capacity
+                float r11  = (mu + NP_P(1)) / NP_P(2);
+                float r115 = r11 * r11 * r11 * r11 * r11;
+                NP_ADD(10, NP_P(0) * r115 / (1.0 + r115) * dt_h - (mu_dt + NP_P(3) * dt_h) * e11);
+                NP_ADD(11, (NP_P(20) + NP_P(21) * mu) * dt_h - (NP_P(22) * dt_h + mu_dt) * e32);
+                NP_ADD(12, (NP_P(27) + NP_P(28) * mu) * dt_h - (NP_P(29) * dt_h + mu_dt) * e4);
+                float gly_ratio = pow(max(gly / NP_P(25), 1.0e-30), NP_P(26));
+                NP_ADD(13, NP_P(23) * mu / (1.0 + gly_ratio) * dt_h - (NP_P(24) * dt_h + mu_dt) * v33);
+                // biomass, extracellular fields, records
+                NP_ADD(5, (mu - NP_P(40)) * dt_h * xbio);
+                NP_ADD(0, -dCs);
+                float dCPAA = max((v32 - v31) * xbio_cmol * dt_h, -CPAA);
+                NP_ADD(1, dCPAA);
+                NP_ADD(2, dCs);
+                NP_ADD(3, v33 * xbio_cmol * dt_h);
+                if (NP_SLOT(4) != REACTION_SLOT_NONE) {                        // mu of this step, overwritten
+                    np_delta[NP_VEC(4)][NP_COMP(4)] = mu - np_value[NP_VEC(4)][NP_COMP(4)];
+                }
+                for (uint v = 0u; v < SCALAR_VEC4_COUNT; v++) {
+                    if (v != vec4_index) {
+                        scalar_delta[scalar_index(self_particle_id, v)] = np_delta[v];
+                    }
+                }
+                delta = np_delta[vec4_index];
+#undef NP_SLOT
+#undef NP_VEC
+#undef NP_COMP
+#undef NP_GET
+#undef NP_ADD
+#undef NP_P
+            }
             precise vec4 compensation = vec4(0.0);
             if (USE_SCALAR_COMPENSATED_SUM) {
                 // Kahan (1965): value holds the running sum, compensation the
