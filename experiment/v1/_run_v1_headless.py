@@ -40,6 +40,7 @@ unchanged build, and compare alive counts exactly.
 """
 
 import argparse
+import hashlib
 import json
 import pathlib
 import sys
@@ -130,7 +131,44 @@ def parse_args() -> argparse.Namespace:
                         help="first sample at simulation time >= T (s)")
     parser.add_argument("--flow-statistics-flush", type=int, default=250, metavar="M",
                         help="write the accumulators (and a copy) every M samples")
+    # checkpoint / resume (2026-10-08)
+    parser.add_argument("--checkpoint-dir", type=str, default=None, metavar="DIR",
+                        help="write checkpoints (checkpoint_latest.npz, the previous one kept as "
+                             "checkpoint_previous.npz) into DIR: every --checkpoint-wall-minutes of wall-clock "
+                             "time and/or every --checkpoint-every s of flow time, and at the end of the run")
+    parser.add_argument("--checkpoint-wall-minutes", type=float, default=0.0, metavar="M",
+                        help="checkpoint every M minutes of wall-clock time (0 = off)")
+    parser.add_argument("--checkpoint-every", type=float, default=0.0, metavar="T",
+                        help="checkpoint every T s of flow time (0 = off)")
+    parser.add_argument("--resume", type=str, default=None, metavar="PATH",
+                        help="continue from a checkpoint instead of bootstrapping ('latest' = "
+                             "checkpoint_latest.npz in --checkpoint-dir). Same case and the same sampling "
+                             "options as the interrupted run; --max-steps is the total step count. Lifeline "
+                             "chunks, probe and torque rows written after the checkpoint are discarded, "
+                             "snapshots already taken are skipped. Not supported with --flow-statistics.")
     return parser.parse_args()
+
+
+def truncate_csv_after(path, time_limit: float, time_column: int = 1) -> int:
+    """Drop the rows of an append-mode CSV log whose time column is > time_limit
+    (rows a crashed run wrote after the checkpoint). Returns the number removed."""
+    csv_path = pathlib.Path(path)
+    if not csv_path.exists():
+        return 0
+    lines = csv_path.read_text(encoding="utf-8").splitlines()
+    kept = [lines[0]] if lines else []
+    removed = 0
+    for line in lines[1:]:
+        try:
+            if float(line.split(",")[time_column]) > time_limit + 1e-9:
+                removed += 1
+                continue
+        except (IndexError, ValueError):
+            pass
+        kept.append(line)
+    if removed:
+        csv_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return removed
 
 
 def mixing_metrics(snapshot: dict, mean_value: np.ndarray):
@@ -170,13 +208,44 @@ def main() -> None:
     if args.device is not None:
         create_kwargs["device_index"] = args.device
 
+    # checkpoint / resume (2026-10-08)
+    case_sha1 = hashlib.sha1(pathlib.Path(args.case).read_bytes()).hexdigest()
+    checkpoint_dir = pathlib.Path(args.checkpoint_dir) if args.checkpoint_dir else None
+    resume_path = None
+    if args.resume is not None:
+        if args.resume == "latest":
+            if checkpoint_dir is None:
+                raise SystemExit("--resume latest needs --checkpoint-dir")
+            resume_path = checkpoint_dir / "checkpoint_latest.npz"
+        else:
+            resume_path = pathlib.Path(args.resume)
+        if not resume_path.exists():
+            raise SystemExit(f"--resume: {resume_path} does not exist")
+        if args.flow_statistics is not None:
+            raise SystemExit("--resume is not supported together with --flow-statistics")
+    if checkpoint_dir is not None and args.checkpoint_wall_minutes <= 0 and args.checkpoint_every <= 0:
+        print("[v1-headless] --checkpoint-dir without --checkpoint-wall-minutes / --checkpoint-every: "
+              "only the final checkpoint will be written")
+
     with VulkanContext.create(**create_kwargs) as ctx:
         sim = SphSimulatorV1(ctx, case)
         try:
-            sim.bootstrap()
+            resumed = None
+            if resume_path is not None:
+                resumed = sim.restore_checkpoint(resume_path)
+                if resumed.get("case_sha1") not in (None, case_sha1):
+                    raise SystemExit(f"--resume: the checkpoint was written from a different case file "
+                                     f"({resumed.get('case_path')}, sha1 {resumed.get('case_sha1')[:12]}); "
+                                     f"this case has sha1 {case_sha1[:12]}")
+                resume_time = sim.simulation_time
+                print(f"[v1-headless] resumed at step {sim.step_count} t={resume_time:.6f} s from {resume_path}")
+            else:
+                sim.bootstrap()
             start = time.perf_counter()
+            steps_at_start = sim.step_count
             sampling = (args.torque_every > 0 or args.probe_every > 0 or bool(args.scalar_snapshot_times)
-                        or args.lifeline_dir is not None or args.flow_statistics is not None)
+                        or args.lifeline_dir is not None or args.flow_statistics is not None
+                        or checkpoint_dir is not None)
             statistics = None
             if args.flow_statistics is not None:
                 every = (args.flow_statistics_every if args.flow_statistics_every > 0
@@ -194,6 +263,18 @@ def main() -> None:
                     chunk_records=max(1, round(args.lifeline_chunk_seconds / (every * case.timestep))),
                     fields=args.lifeline_fields, aux=args.lifeline_aux, aux_every=args.lifeline_aux_every,
                     release_sphere=args.lifeline_release_sphere)
+                if resumed is not None:
+                    if resumed.get("lifeline") is None:
+                        raise SystemExit("--resume: the checkpoint has no lifeline state but --lifeline-dir is given")
+                    recorder.restore(resumed["lifeline"])
+            elif resumed is not None and resumed.get("lifeline") is not None:
+                raise SystemExit("--resume: the checkpoint has lifeline state; pass the same --lifeline-* options")
+            if resumed is not None:
+                for log_path in (args.torque_log, args.probe_log):
+                    if log_path:
+                        removed = truncate_csv_after(log_path, resume_time)
+                        if removed:
+                            print(f"[v1-headless] {log_path}: removed {removed} row(s) after t={resume_time:.6f} s")
             if args.torque_every > 0 and case.rotor is None:
                 raise SystemExit("--torque-every needs a case with a rotor")
             if args.probe_every > 0 and (case.scalars is None or case.scalars.probes is None):
@@ -240,6 +321,37 @@ def main() -> None:
                     raise SystemExit(f"--scalar-snapshot-fields: unknown field(s) {unknown}")
                 snapshot_field_index = [all_field_names.index(name) for name in snapshot_field_names]
             half_step = 0.5 * case.timestep
+            if resumed is not None and snapshot_times:
+                done = [t for t in snapshot_times if t - half_step <= resume_time]
+                snapshot_times = [t for t in snapshot_times if t - half_step > resume_time]
+                if done:
+                    print(f"[v1-headless] resume: {len(done)} snapshot time(s) already taken, skipped")
+
+            # checkpoint bookkeeping (2026-10-08)
+            last_checkpoint_wall = time.perf_counter()
+            next_checkpoint_time = (sim.simulation_time + args.checkpoint_every) if args.checkpoint_every > 0 else None
+
+            def write_checkpoint(reason: str) -> None:
+                nonlocal last_checkpoint_wall, next_checkpoint_time
+                for handle in (torque_log, probe_log):
+                    if handle is not None:
+                        handle.flush()
+                extra = {"case_path": str(args.case), "case_sha1": case_sha1,
+                         "lifeline": recorder.checkpoint_state() if recorder is not None else None}
+                latest = checkpoint_dir / "checkpoint_latest.npz"
+                previous = checkpoint_dir / "checkpoint_previous.npz"
+                began = time.perf_counter()
+                written = sim.write_checkpoint(checkpoint_dir / "checkpoint_new.npz", extra=extra)
+                if latest.exists():
+                    latest.replace(previous)
+                written.replace(latest)
+                size_mb = latest.stat().st_size / (1024 * 1024)
+                print(f"[v1-headless] checkpoint ({reason}): step={sim.step_count} t={sim.simulation_time:.4f} s "
+                      f"{size_mb:.0f} MB in {time.perf_counter() - began:.1f} s -> {latest}", flush=True)
+                last_checkpoint_wall = time.perf_counter()
+                if next_checkpoint_time is not None:
+                    while next_checkpoint_time - half_step <= sim.simulation_time:
+                        next_checkpoint_time += args.checkpoint_every
 
             split_reported = False
             while sampling and sim.step_count < args.max_steps:
@@ -302,6 +414,14 @@ def main() -> None:
                     recorder.record()
                 if statistics is not None and statistics.due():
                     statistics.sample()
+                if checkpoint_dir is not None and sim.step_count < args.max_steps:
+                    if args.checkpoint_wall_minutes > 0 and \
+                            time.perf_counter() - last_checkpoint_wall >= 60.0 * args.checkpoint_wall_minutes:
+                        write_checkpoint("wall clock")
+                    elif next_checkpoint_time is not None and sim.simulation_time >= next_checkpoint_time - half_step:
+                        write_checkpoint("flow time")
+            if checkpoint_dir is not None:
+                write_checkpoint("end of run")
             if recorder is not None:
                 recorder.close()
             if statistics is not None:
@@ -324,7 +444,7 @@ def main() -> None:
         finally:
             sim.destroy()
 
-    steps_per_second = sim.step_count / elapsed if elapsed > 0 else float("nan")
+    steps_per_second = (sim.step_count - steps_at_start) / elapsed if elapsed > 0 else float("nan")
     print(f"[v1-headless] final: step={sim.step_count} "
           f"alive={status['alive_particle_count']:,} (expected {expected_alive:,})  "
           f"{steps_per_second:.1f} steps/s")

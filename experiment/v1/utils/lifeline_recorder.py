@@ -160,6 +160,32 @@ class LifelineRecorder:
         self.chunk_index += 1
         self._reset_chunk()
 
+    # ------------------------------------------------------------------
+    # checkpoint / resume (2026-10-08): the chunks on disk are the record; the
+    # state to carry is the sample and the counters. checkpoint_state() flushes
+    # first so that every record up to the checkpoint is on disk, and restore()
+    # deletes the chunks a crashed run wrote after the checkpoint.
+    def checkpoint_state(self) -> dict:
+        self.flush()
+        return {"uids": None if self.uids is None else self.uids.tolist(), "count": self.count,
+                "chunk_index": self.chunk_index, "record_count": self.record_count, "lost_total": self.lost_total}
+
+    def restore(self, state: dict):
+        if state.get("uids") is not None:
+            self.uids = np.asarray(state["uids"], dtype=np.uint32)
+            self.count = int(self.uids.size)
+        self.chunk_index = int(state["chunk_index"])
+        self.record_count = int(state["record_count"])
+        self.lost_total = int(state["lost_total"])
+        removed = 0
+        for path in self.directory.glob("lifeline_[0-9][0-9][0-9][0-9].npz"):
+            if int(path.stem.split("_")[1]) >= self.chunk_index:
+                path.unlink()
+                removed += 1
+        self._reset_chunk()
+        print(f"[lifeline] restored: {self.count:,} particles, {self.record_count} records in {self.chunk_index} chunks"
+              + (f", removed {removed} chunk(s) written after the checkpoint" if removed else ""))
+
     def close(self):
         self.flush()
         meta_path = self.directory / "lifeline_meta.json"

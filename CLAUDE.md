@@ -164,6 +164,13 @@ run scripts.
   thin-plate baffles let the fluid at rest drift up in density under a
   background pressure (dummies take no part in the density diffusion), so the
   Rushton tank generator uses solid baffles; `log/2026-10-02_haringa-h1-setup.md`.
+- **Checkpoint / resume (test branch, 2026-10-08)**: `_run_v1_headless.py --checkpoint-dir DIR
+  [--checkpoint-wall-minutes M] [--checkpoint-every T]` saves the raw bytes of every device buffer
+  plus (time, step, rotor angle) to `checkpoint_latest.npz` (previous one kept); `--resume latest|PATH`
+  uploads them into a freshly constructed simulator INSTEAD of `bootstrap()` (no re-voxelization, no
+  half-kick) and continues; `--max-steps` is the total. Lifeline chunks / probe and torque rows written
+  after the checkpoint are discarded, taken snapshots skipped; `--flow-statistics` is not resumable.
+  Details and the 6 mm test: `log/2026-10-08_checkpoint-resume.md`.
 - **Free-slip walls (test branch, 2026-10-02)**: a boundary material with
   `free_slip: true` exerts no viscous force on the fluid (pressure only),
   spec 93 `USE_FREE_SLIP_WALLS`; used for the no-shear lid of the Haringa (2023)

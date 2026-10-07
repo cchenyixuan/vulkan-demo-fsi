@@ -1493,6 +1493,104 @@ class SphSimulatorV1:
     def end_readback_cache(self) -> None:
         self._readback_cache = None
 
+    # ==================================================================
+    # Checkpoint / resume (2026-10-08)
+    # ==================================================================
+    #
+    # The complete solver state lives in the device buffers plus three host
+    # numbers (simulation_time, step_count, rotor_angle): the leapfrog keeps
+    # v_{n-1/2} in velocity_mass and a_n in acceleration, the continuity
+    # equation keeps rho in density_pressure, the scalars keep their
+    # Kahan compensation, and the voxel lists / alive count / uids are plain
+    # buffers. A checkpoint is therefore the raw bytes of every buffer in
+    # self.buffers (the defrag scratch set and the injection staging are
+    # rewritten every step and are not saved) and a resume uploads them back
+    # into a freshly constructed simulator of the same case *instead of*
+    # bootstrap(): no re-voxelization, no half-kick, the next step() continues
+    # exactly where the saved run stopped (up to the usual run-to-run atomics
+    # noise of the following steps).
+
+    CHECKPOINT_FORMAT = 1
+
+    def checkpoint_arrays(self) -> dict:
+        """Raw bytes of every device buffer as uint8 arrays, keyed 'buffer:<name>'."""
+        arrays = {}
+        for name, buffer in self.buffers.items():
+            if name in self._mapped:
+                raw = bytes(self._mapped[name][0:buffer.size])
+            else:
+                raw = self._readback_buffer_uncached(buffer)
+            arrays[f"buffer:{name}"] = np.frombuffer(raw, dtype=np.uint8)
+        return arrays
+
+    def checkpoint_host_state(self) -> dict:
+        return {"format": self.CHECKPOINT_FORMAT,
+                "simulation_time": float(self.simulation_time),
+                "step_count": int(self.step_count),
+                "rotor_angle": float(self.rotor_angle),
+                "timestep": float(self.case.timestep),
+                "buffer_sizes": {name: int(buffer.size) for name, buffer in self.buffers.items()}}
+
+    def write_checkpoint(self, path, extra: Optional[dict] = None) -> pathlib.Path:
+        """Save the state to PATH (.npz, uncompressed). The file is written next
+        to PATH and renamed into place, so an interrupted write never replaces a
+        good checkpoint. `extra` (JSON-serialisable) is stored under 'extra' for
+        the caller's own state (recorders, logs)."""
+        import json
+        import os
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        host = self.checkpoint_host_state()
+        payload = self.checkpoint_arrays()
+        payload["host"] = np.array(json.dumps(host))
+        payload["extra"] = np.array(json.dumps(extra or {}))
+        temporary = path.with_name(path.name + ".tmp.npz")
+        with open(temporary, "wb") as handle:
+            np.savez(handle, **payload)
+        os.replace(temporary, path)
+        return path
+
+    def restore_checkpoint(self, path) -> dict:
+        """Upload a checkpoint written by write_checkpoint() into this (freshly
+        constructed, not bootstrapped) simulator and set the host state.
+        Returns the 'extra' dict. The case must be the same: every buffer size
+        and the time step are checked."""
+        import json
+        path = pathlib.Path(path)
+        with np.load(path) as data:
+            host = json.loads(str(data["host"]))
+            extra = json.loads(str(data["extra"]))
+            if host.get("format") != self.CHECKPOINT_FORMAT:
+                raise ValueError(f"{path}: checkpoint format {host.get('format')} != {self.CHECKPOINT_FORMAT}")
+            if abs(host["timestep"] - float(self.case.timestep)) > 1e-12 * max(1.0, abs(host["timestep"])):
+                raise ValueError(f"{path}: checkpoint time step {host['timestep']} != case {self.case.timestep}")
+            sizes = host["buffer_sizes"]
+            missing = [name for name in self.buffers if name not in sizes]
+            if missing or set(sizes) != set(self.buffers):
+                raise ValueError(f"{path}: checkpoint buffers {sorted(sizes)} != simulator buffers "
+                                 f"{sorted(self.buffers)}")
+            for name, buffer in self.buffers.items():
+                if sizes[name] != buffer.size:
+                    raise ValueError(f"{path}: buffer {name} has {sizes[name]} B in the checkpoint, "
+                                     f"{buffer.size} B in this case (different case or capacities)")
+            vkQueueWaitIdle(self.ctx.compute_queue)
+            for name, buffer in self.buffers.items():
+                raw = data[f"buffer:{name}"].tobytes()
+                if len(raw) != buffer.size:
+                    raise ValueError(f"{path}: buffer {name}: {len(raw)} B stored, {buffer.size} B expected")
+                if name in self._mapped:
+                    self._mapped[name][0:buffer.size] = raw
+                else:
+                    self._staging_upload(buffer, raw)
+        self.simulation_time = float(host["simulation_time"])
+        self.step_count = int(host["step_count"])
+        self.rotor_angle = float(host["rotor_angle"])
+        self._readback_cache = None
+        status = self.readback_global_status()
+        print(f"[SimV1] restored checkpoint {path.name}: step={self.step_count} t={self.simulation_time:.6f} s "
+              f"alive={status['alive_particle_count']:,}")
+        return extra
+
     def _readback_buffer(self, buffer: Buffer) -> bytes:
         cache = self._readback_cache
         if cache is not None and id(buffer) in cache:
