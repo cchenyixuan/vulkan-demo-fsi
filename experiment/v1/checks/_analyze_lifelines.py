@@ -505,6 +505,59 @@ def command_selftest(arguments):
     return 0 if failures == 0 else 1
 
 
+def command_frozen(arguments):
+    """Haringa 2017/2018 track parcels through a FROZEN, time-averaged substrate field. Test of that approximation
+    (2026-10-08): bin the recorded (position, C_s) samples from --start on into a Cartesian grid of --cell m to get
+    the time-averaged field, read it back along the same trajectories ("frozen" lifelines) and compare with the
+    recorded transient lifelines: distributions, the variance split (spatial mean field vs temporal fluctuation
+    about it) and the regime statistics of both. Bins with fewer than --min-samples samples are left out."""
+    data = load_lifelines(arguments.dir, with_aux=False)
+    names = data.get("field_names", [])
+    time = data["time"].astype(np.float64)
+    keep = time >= arguments.start
+    time = time[keep]
+    position = data["position"][keep].astype(np.float64)                    # (n, K, 3)
+    concentration = data["scalars"][keep][:, :, names.index(arguments.field)].astype(np.float64)
+    valid = np.isfinite(position[..., 0]) & np.isfinite(concentration)
+    cell = float(arguments.cell)
+    lower = np.nanmin(position.reshape(-1, 3), axis=0) - 0.5 * cell
+    index = np.floor((position - lower) / cell).astype(np.int64)
+    shape = tuple(int(v) for v in (index.reshape(-1, 3)[valid.reshape(-1)].max(axis=0) + 1))
+    flat = np.ravel_multi_index([index[..., k][valid] for k in range(3)], shape)
+    count = np.bincount(flat, minlength=int(np.prod(shape))).astype(np.float64)
+    total = np.bincount(flat, weights=concentration[valid], minlength=int(np.prod(shape)))
+    mean_field = np.where(count >= arguments.min_samples, total / np.maximum(count, 1.0), np.nan)
+    frozen = np.full(concentration.shape, np.nan)
+    frozen[valid] = mean_field[flat]
+    both = valid & np.isfinite(frozen)
+    print(f"{arguments.dir}: {time.size} records x {position.shape[1]} lifelines from t = {time[0]:.2f} s, cell {cell:g} m, "
+          f"{int((count >= arguments.min_samples).sum()):,} bins with >= {arguments.min_samples} samples "
+          f"(median {np.median(count[count > 0]):.0f} samples per bin), {100 * both.mean():.1f} % of the records covered")
+    transient = concentration[both]
+    frozen_values = frozen[both]
+    residual = transient - frozen_values
+    print(f"{'':12s} {'mean':>10s} {'p5':>10s} {'p50':>10s} {'p95':>10s}")
+    for label, values in (("transient", transient), ("frozen", frozen_values)):
+        q = np.percentile(values, [5, 50, 95])
+        print(f"{label:12s} {values.mean():10.4g} {q[0]:10.4g} {q[1]:10.4g} {q[2]:10.4g}")
+    var_total = float(transient.var())
+    var_spatial = float(frozen_values.var())
+    var_residual = float(residual.var())
+    print(f"variance along the lifelines: total {var_total:.3e}; frozen (spatial) {var_spatial:.3e} = {100 * var_spatial / max(var_total, 1e-300):.1f} %; "
+          f"temporal fluctuation about the mean field {var_residual:.3e} = {100 * var_residual / max(var_total, 1e-300):.1f} %")
+    q_max, k_s = arguments.monod
+    q_transient = np.where(both, concentration / (k_s + np.maximum(concentration, 0.0)), np.nan)
+    q_frozen = np.where(both, frozen / (k_s + np.maximum(frozen, 0.0)), np.nan)
+    print_regime(regime_analysis(q_transient, time), "transient")
+    print_regime(regime_analysis(q_frozen, time), "frozen   ")
+    if arguments.out:
+        np.savez_compressed(arguments.out, mean_field=mean_field.reshape(shape), count=count.reshape(shape),
+                            lower=lower, cell=cell, time=time, frozen=frozen.astype(np.float32),
+                            transient=concentration.astype(np.float32))
+        print(f"wrote {arguments.out}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -516,9 +569,14 @@ def main():
     p = sub.add_parser("regime"); p.add_argument("dir"); p.add_argument("--field", default=None)
     p.add_argument("--q-field", default=None); p.add_argument("--monod", type=float, nargs=2, default=(1.0, 7.8e-6), metavar=("QMAX", "KS"))
     p = sub.add_parser("selftest"); p.add_argument("--out", default=None)
+    p = sub.add_parser("frozen", help="frozen time-averaged field vs transient lifelines (Haringa's one-way approximation)")
+    p.add_argument("dir"); p.add_argument("--field", default="substrate"); p.add_argument("--start", type=float, default=0.0)
+    p.add_argument("--cell", type=float, default=0.012, help="bin size of the mean field, m")
+    p.add_argument("--min-samples", type=int, default=20); p.add_argument("--out", default=None)
+    p.add_argument("--monod", type=float, nargs=2, default=(1.0, 9.8e-6), metavar=("QMAX", "KS"))
     arguments = parser.parse_args()
     return {"integrity": command_integrity, "passive": command_passive, "tracer": command_tracer,
-            "regime": command_regime, "selftest": command_selftest}[arguments.command](arguments)
+            "regime": command_regime, "selftest": command_selftest, "frozen": command_frozen}[arguments.command](arguments)
 
 
 if __name__ == "__main__":
