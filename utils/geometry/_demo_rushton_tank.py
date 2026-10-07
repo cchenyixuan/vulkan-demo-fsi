@@ -481,8 +481,9 @@ def main() -> int:
     parser.add_argument("--feed-stop", type=float, default=None, help="s (default: never)")
     parser.add_argument("--feed-cycle", type=float, nargs=3, default=None, metavar=("PERIOD", "ON", "COUNT"),
                         help="periodic feed (2026-10-08): COUNT windows of ON s every PERIOD s from --feed-start")
-    parser.add_argument("--q-max-umol-per-g-h", type=float, default=HARINGA_Q_MAX_UMOL_PER_G_H,
-                        help="Monod capacity of --substrate / --ninepool-one-way (1600)")
+    parser.add_argument("--q-max-umol-per-g-h", type=float, default=None,
+                        help="Monod capacity of --substrate (default 1600) / --ninepool-one-way (default k_E11 X_E11,0 of the "
+                             "initial pools = the two-way capacity, 2026-10-08)")
     # 9-pool cell model (2026-10-08): the options of utils/geometry/_demo_stirred_tank_30l.py
     parser.add_argument("--ninepool", action="store_true",
                         help="9-pool cell model of Tang et al. 2017 on the fluid particles (15 fields, implies the feed)")
@@ -502,6 +503,10 @@ def main() -> int:
     parser.add_argument("--rpm", type=float, default=None, help="diagnostics: override the preset's speed (0 = at rest)")
     parser.add_argument("--no-snap-disks", action="store_true", help="diagnostics: keep the nominal disk heights")
     parser.add_argument("--no-plates", action="store_true", help="diagnostics: no blades, disks or baffles (shaft only)")
+    parser.add_argument("--shaft-stop-at-lid", action="store_true",
+                        help="end the shaft at the lid plane and fill the lid hole with static lid particles (2026-10-08: "
+                             "the rotating shaft inside the lid hole leaked top-layer fluid particles in the 54 m3 tank "
+                             "at 25 mm); default: the shaft runs through the lid shell as before")
     parser.add_argument("--baffle-extension", choices=("all", "lid", "none"), default="none",
                         help="diagnostics: how far the baffle outline continues into the shells")
     parser.add_argument("--only-plates", default=None, help="diagnostics: keep only plates whose name contains this")
@@ -567,7 +572,13 @@ def main() -> int:
     interior = Cylinder([0.0, 0.0, 0.0], [0.0, top, 0.0], radius)
     lowest = min(impeller["center_height"] - 0.5 * rushton_dimensions(impeller)["blade_height"]
                  for impeller in preset["impellers"])
-    shaft = y_cylinder(shaft_radius, lowest, top + shell)
+    # Shaft top (2026-10-08): by default the shaft runs through the lid shell (rotating lattice cylinder inside a
+    # matching hole of static lid sites). At 25 mm in the 54 m3 tank the jagged shaft surface (1.4 m/s at r = 0.135)
+    # sweeping past the jagged hole rim squeezed top-layer fluid particles into the lid and out of the grid (7 of
+    # 3.9M lost in 0.34 s, correction fallbacks). --shaft-stop-at-lid ends the shaft at the lid plane; the hole is
+    # then filled with static lid particles and the fluid never sees a moving solid next to a static one.
+    shaft_top = top if args.shaft_stop_at_lid else top + shell
+    shaft = y_cylinder(shaft_radius, lowest, shaft_top)
     sdf_interior = interior.signed_distance(sites)
     is_rotor = shaft.signed_distance(sites) <= 0.0
 
@@ -656,7 +667,8 @@ def main() -> int:
     max_per_voxel = max(64, int(2 ** math.ceil(math.log2(bound * 1.3))))
     volume = math.pi * radius ** 2 * top
     timestep = args.cfl * h / c0
-    print(f"fluid={n_fluid:,} wall={n_wall:,} lid={n_lid:,} rotor={n_rotor:,} total={total:,} pool={pool_size:,}")
+    print(f"fluid={n_fluid:,} wall={n_wall:,} lid={n_lid:,} rotor={n_rotor:,} total={total:,} pool={pool_size:,}"
+          + (" (shaft stops at the lid, hole filled)" if args.shaft_stop_at_lid else " (shaft through the lid)"))
     print(f"fluid volume check: {n_fluid * dx ** 3:.6g} m3 of lattice cells vs {volume:.6g} m3 cylinder")
     print(f"U_tip = {tip_speed:.4f} m/s, c0 = {c0:.3f} m/s, p_b = {background_pressure:.1f} Pa, dt = {timestep:.4e} s, "
           f"{1.0 / timestep:,.0f} steps per second of flow")
@@ -699,8 +711,13 @@ def main() -> int:
             NINEPOOL_INITIAL.update(overrides)
         if args.paa_initial is None:
             args.paa_initial = NINEPOOL_INITIAL["CPAA"]
+        if args.q_max_umol_per_g_h is None and args.ninepool_one_way:
+            from utils.geometry._demo_stirred_tank_30l import ninepool_one_way_capacity
+            args.q_max_umol_per_g_h = ninepool_one_way_capacity()     # = k_E11 X_E11,0, the two-way capacity
         if args.tracers > 1:
             parser.error("--ninepool uses 15 of the 16 scalar fields: at most one tracer")
+    if args.q_max_umol_per_g_h is None:
+        args.q_max_umol_per_g_h = HARINGA_Q_MAX_UMOL_PER_G_H
     if args.tracers > 0 or args.substrate:
         case_text += scalars_block(args, preset, h)
     (out / "case.yaml").write_text(case_text, encoding="utf-8")

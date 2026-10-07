@@ -767,6 +767,13 @@ NINEPOOL_INITIAL = dict(gly=20.0, aa=928.0, sto=2650.0, paa=2.7, e11=0.131, e32=
 NINEPOOL_FIELDS = ("substrate", "paa_ext", "uptake", "feed", "gly", "aa", "sto", "paa_pool",
                    "e11", "e32", "e4", "pen_capacity", "biomass", "product", "growth_rate")
 NINEPOOL_DEFAULT_KE11 = 0.26      # utils/sph/case.py NINEPOOL_DEFAULTS["kE11"], mol glucose / Cmol / h per unit X_E11
+NINEPOOL_MW = 28.05               # gdw / Cmol
+
+
+def ninepool_one_way_capacity() -> float:
+    """Monod capacity of the one-way protocol that equals the two-way uptake capacity k_E11 X_E11,0 of the initial
+    pools, in umol / (gdw h): 0.26 x 0.131 -> 1214, 0.26 x 0.146 -> 1354 (2026-10-08)."""
+    return NINEPOOL_DEFAULT_KE11 * NINEPOOL_INITIAL["e11"] * 1e6 / NINEPOOL_MW
 
 
 def parse_assignments(text: str) -> dict:
@@ -1060,8 +1067,9 @@ def main() -> int:
     parser.add_argument("--substrate", action="store_true",
                         help="stage 3 (2026-10-01): fields substrate, biomass, uptake, feed with Monod uptake and a "
                              "continuous feed sphere (see the --q-max ... --feed-* options)")
-    parser.add_argument("--q-max-umol-per-g-h", type=float, default=HARINGA_Q_MAX_UMOL_PER_G_H,
-                        help="Monod maximum uptake rate, umol / (g h) (default Haringa 2023: 1600)")
+    parser.add_argument("--q-max-umol-per-g-h", type=float, default=None,
+                        help="Monod maximum uptake rate, umol / (g h) (default Haringa 2023: 1600; with --ninepool-one-way "
+                             "the default is k_E11 X_E11,0 of the initial pools, i.e. the two-way capacity, 2026-10-08)")
     parser.add_argument("--k-s", type=float, default=HARINGA_K_S, help="Monod half-saturation, mol / kg (7.8e-6)")
     parser.add_argument("--biomass", type=float, default=HARINGA_BIOMASS, help="biomass, g / kg (55)")
     parser.add_argument("--growth-yield", type=float, default=0.0, help="g biomass / mol substrate (0: no growth)")
@@ -1120,6 +1128,11 @@ def main() -> int:
         NINEPOOL_INITIAL.update(overrides)
     if args.paa_initial is None:
         args.paa_initial = NINEPOOL_INITIAL["CPAA"]
+    if args.q_max_umol_per_g_h is None:
+        # one-way capacity consistent with the two-way pools: q_max = k_E11 X_E11,0 (2026-10-08). D1 was generated with
+        # 1354 (e11 0.146) while its pools started at e11 0.131: the one-way sink was 11.5 % stronger than the two-way's.
+        args.q_max_umol_per_g_h = (ninepool_one_way_capacity() if args.ninepool and args.ninepool_one_way
+                                   else HARINGA_Q_MAX_UMOL_PER_G_H)
     global PBT_HUB, PBT_COLLAR, RUSHTON_HUB, PBT_TRUE_LENGTH, PBT_TIP_RADIUS
     if args.pbt_tip_radius is not None:
         # shortened PBT blades (diagnostic): the thin plates end at R, the lattice blades (with or without
