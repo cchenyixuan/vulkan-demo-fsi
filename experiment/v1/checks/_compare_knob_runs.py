@@ -118,7 +118,7 @@ def main():
         out.mkdir(parents=True, exist_ok=True)
     summary = {}
 
-    print("1. probes: mean C_s (mol/kg), cumulative uptake (mol/kg of broth), uptake rate (mol/kg/s)")
+    print("1. probes: mean C_s (mol/kg), cumulative uptake (mol, whole tank), uptake rate (mol/s, whole tank)")
     probes = {name: probe_series(path) for name, path in runs.items()}
     marks = sorted({round(t, 1) for p in probes.values() for t in np.percentile(p["time"], [0, 25, 50, 75, 100])})
     for name, p in probes.items():
@@ -179,7 +179,7 @@ def main():
                 if rows and "gly_mean" in rows[0]:
                     axes[2].plot([r["time"] for r in rows], [r["gly_p95"] for r in rows], "o-", label=f"{name} p95")
                     axes[2].plot([r["time"] for r in rows], [r["gly_mean"] for r in rows], "s--", label=f"{name} mean")
-            axes[0].set_ylabel("mean C_s (umol/kg)"); axes[1].set_ylabel("uptake rate (umol/kg/s)"); axes[2].set_ylabel("X_gly (umol/gdw)")
+            axes[0].set_ylabel("mean C_s (umol/kg)"); axes[1].set_ylabel("uptake rate, whole tank (umol/s)"); axes[2].set_ylabel("X_gly (umol/gdw)")
             for axis in axes:
                 axis.set_xlabel("t (s)"); axis.legend(fontsize=8); axis.grid(alpha=0.3)
             figure.tight_layout()
