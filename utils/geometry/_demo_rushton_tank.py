@@ -353,13 +353,51 @@ impeller:
 """
 
 
+def feed_source_lines(args, injection) -> list:
+    """`sources:` entries of the glucose feed in the preset's injection sphere: one window (--feed-start /
+    --feed-stop) or, with --feed-cycle PERIOD ON COUNT (2026-10-08), COUNT windows of ON s every PERIOD s."""
+    centre = injection["center"]
+    if args.feed_cycle is not None:
+        period, on, count = args.feed_cycle
+        if period <= 0.0 or on <= 0.0 or on > period or count < 1:
+            raise SystemExit("--feed-cycle PERIOD ON COUNT needs 0 < ON <= PERIOD and COUNT >= 1")
+        windows = [(args.feed_start + k * period, args.feed_start + k * period + on) for k in range(int(round(count)))]
+    else:
+        windows = [(args.feed_start, args.feed_stop)]
+    lines = ["  sources:"]
+    for start, stop in windows:
+        stop_text = "" if stop is None else f", stop: {stop:.4f}"
+        lines.append(f"    - {{field: substrate, center: [{centre[0]}, {centre[1]}, {centre[2]}], "
+                     f"radius: {injection['radius']:.4f}, rate: {args.feed_rate:.6e}, start: {start:.4f}{stop_text}, "
+                     f"record: feed}}")
+    return lines
+
+
 def scalars_block(args, preset, h) -> str:
-    """`scalars:` block: tracer pulses (--tracers) and the substrate setup (--substrate) at the
-    preset's injection sphere, probes at the preset's probe points (Shepard radius = h)."""
+    """`scalars:` block: tracer pulses (--tracers), the substrate setup (--substrate, Monod) or the 9-pool
+    cell model (--ninepool, 2026-10-08, same fields / options as the 30 L generator) at the preset's
+    injection sphere, probes at the preset's probe points (Shepard radius = h)."""
     injection = preset["injection"]
     lines = ["", "# Scalars (Haringa 2023 section 2.3): tracer pulses and the glucose feed in the injection",
              "# sphere, Monod uptake by biomass on the fluid particles.", "scalars:", "  fields:"]
-    if args.substrate:
+    if args.ninepool:
+        from utils.geometry._demo_stirred_tank_30l import NINEPOOL_INITIAL, NINEPOOL_FIELDS, ninepool_knob
+        lines.insert(3, "# 9-pool cell model of Tang et al. 2017 (2026-10-08): 15 fields in 4 vec4, C_s and C_PAA diffuse.")
+        initial = {"substrate": NINEPOOL_INITIAL["Cs"], "paa_ext": args.paa_initial, "uptake": 0.0, "feed": 0.0,
+                   "gly": NINEPOOL_INITIAL["gly"], "aa": NINEPOOL_INITIAL["aa"], "sto": NINEPOOL_INITIAL["sto"],
+                   "paa_pool": NINEPOOL_INITIAL["paa"], "e11": NINEPOOL_INITIAL["e11"], "e32": NINEPOOL_INITIAL["e32"],
+                   "e4": NINEPOOL_INITIAL["e4"], "pen_capacity": NINEPOOL_INITIAL["v33"], "biomass": args.biomass,
+                   "product": 0.0, "growth_rate": 0.0}
+        order = list(NINEPOOL_FIELDS)
+        if args.ninepool_one_way:
+            order[1], order[12] = order[12], order[1]      # substrate, biomass, uptake in one vec4 for the Monod sink
+        for name in order:
+            if name in ("substrate", "paa_ext"):
+                lines.append(f"    - {{name: {name}, diffusivity: {args.substrate_diffusivity:.3e}, turbulent: true, "
+                             f"initial: {initial[name]:.6e}}}")
+            else:
+                lines.append(f"    - {{name: {name}, diffusivity: 0.0, turbulent: false, initial: {initial[name]:.6e}}}")
+    elif args.substrate:
         initial = 10.0 * args.k_s
         lines.append(f"    - {{name: substrate, diffusivity: {args.substrate_diffusivity:.3e}, turbulent: true, "
                      f"initial: {initial:.6e}}}")
@@ -372,15 +410,33 @@ def scalars_block(args, preset, h) -> str:
     lines += ["  sgs:", f"    enabled: {'true' if args.sgs else 'false'}", "    smagorinsky_cs: 0.1",
               "    turbulent_schmidt: 0.7"]
     centre = injection["center"]
-    if args.substrate:
-        q_max = HARINGA_Q_MAX_UMOL_PER_G_H * 1e-6 / 3600.0
+    if args.ninepool:
+        q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
+        knob = ninepool_knob(args)
+        if args.ninepool_one_way:
+            if knob["mode"] != "off":
+                lines.append(f"  # uptake-inhibition knob for the offline integration (_integrate_ninepool_lifelines.py --ki "
+                             f"{args.ninepool_ki:g}); the Monod capacity is unchanged by construction")
+            lines += ["  reactions:",
+                      f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
+                      f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: 0.0}}"]
+        else:
+            extra = ""
+            if knob["params"]:
+                extra += ", ninepool: {" + ", ".join(f"{key}: {value:.6e}" for key, value in knob["params"].items()) + "}"
+            if knob["mode"] != "off":
+                extra += f", uptake_inhibition: {knob['mode']}"
+            lines += ["  reactions:",
+                      "    - {type: ninepool, substrate: substrate, paa: paa_ext, uptake: uptake, product: product, "
+                      "growth_rate: growth_rate, biomass: biomass, gly: gly, aa: aa, sto: sto, paa_pool: paa_pool, "
+                      "e11: e11, e32: e32, e4: e4, pen_capacity: pen_capacity, q_max: 0.0, k_s: 1.0" + extra + "}"]
+        lines += feed_source_lines(args, injection)
+    elif args.substrate:
+        q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
         lines += ["  reactions:",
                   f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
-                  f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: 0.0}}",
-                  "  sources:",
-                  f"    - {{field: substrate, center: [{centre[0]}, {centre[1]}, {centre[2]}], "
-                  f"radius: {injection['radius']:.4f}, rate: {args.feed_rate:.6e}, start: {args.feed_start:.4f}, "
-                  f"record: feed}}"]
+                  f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: 0.0}}"]
+        lines += feed_source_lines(args, injection)
     lines.append("  injections:" if args.tracers > 0 else "  injections: []")
     for index in range(args.tracers):
         start = args.injection_start + index * args.injection_interval
@@ -422,6 +478,22 @@ def main() -> int:
     parser.add_argument("--substrate-diffusivity", type=float, default=6.0e-10)
     parser.add_argument("--feed-rate", type=float, default=HARINGA_FEED_RATE, help="mol/s (0.37)")
     parser.add_argument("--feed-start", type=float, default=0.0, help="s")
+    parser.add_argument("--feed-stop", type=float, default=None, help="s (default: never)")
+    parser.add_argument("--feed-cycle", type=float, nargs=3, default=None, metavar=("PERIOD", "ON", "COUNT"),
+                        help="periodic feed (2026-10-08): COUNT windows of ON s every PERIOD s from --feed-start")
+    parser.add_argument("--q-max-umol-per-g-h", type=float, default=HARINGA_Q_MAX_UMOL_PER_G_H,
+                        help="Monod capacity of --substrate / --ninepool-one-way (1600)")
+    # 9-pool cell model (2026-10-08): the options of utils/geometry/_demo_stirred_tank_30l.py
+    parser.add_argument("--ninepool", action="store_true",
+                        help="9-pool cell model of Tang et al. 2017 on the fluid particles (15 fields, implies the feed)")
+    parser.add_argument("--ninepool-one-way", action="store_true",
+                        help="with --ninepool: one-way protocol (fixed-capacity Monod sink, pools offline)")
+    parser.add_argument("--paa-initial", type=float, default=None, help="9-pool: initial C_PAA, mol/kg")
+    parser.add_argument("--ninepool-ki", type=float, default=None, metavar="K",
+                        help="uptake-inhibition knob K_i (umol/gdw, numerical experiment; k_E11 rescaled, see the 30 L generator)")
+    parser.add_argument("--ninepool-ki-mean", action="store_true", help="knob with the population-mean X_gly")
+    parser.add_argument("--ninepool-initial", default="", metavar="K=V,...", help="override gly aa sto paa e11 e32 e4 v33 Cs CPAA")
+    parser.add_argument("--ninepool-param", default="", metavar="K=V,...", help="raw 9-pool parameter overrides")
     parser.add_argument("--out", default=None, help="output directory (default cases/rushton_<preset>_<dx mm>mm)")
     parser.add_argument("--wall-convention", choices=("surface", "30l"), default="surface",
                         help="diagnostics: '30l' = fluid where sdf <= -dx/2 and four shell layers, as the 30 L generator")
@@ -616,6 +688,19 @@ def main() -> int:
                                   "    - {file: rotor.obj, material: impeller}\n" + entries)
     if plates:
         case_text += thin_plates_block(plates)
+    if args.ninepool:
+        from utils.geometry._demo_stirred_tank_30l import NINEPOOL_INITIAL, parse_assignments
+        args.substrate = True
+        if args.ninepool_initial:
+            overrides = parse_assignments(args.ninepool_initial)
+            unknown = sorted(set(overrides) - set(NINEPOOL_INITIAL))
+            if unknown:
+                parser.error(f"--ninepool-initial: unknown keys {unknown}")
+            NINEPOOL_INITIAL.update(overrides)
+        if args.paa_initial is None:
+            args.paa_initial = NINEPOOL_INITIAL["CPAA"]
+        if args.tracers > 1:
+            parser.error("--ninepool uses 15 of the 16 scalar fields: at most one tracer")
     if args.tracers > 0 or args.substrate:
         case_text += scalars_block(args, preset, h)
     (out / "case.yaml").write_text(case_text, encoding="utf-8")
