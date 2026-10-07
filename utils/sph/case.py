@@ -706,7 +706,8 @@ NINEPOOL_PARAMETER_ORDER = (
     "beta33", "kdE33", "Kgly33", "m33",
     "alpha4", "beta4", "kdE4",
     "k41", "Ks41", "Ksto41", "k42", "Ks42", "Ksto42", "KATP42",
-    "pHint", "pHext", "pKPAA", "vd", "Mw", "rho", "ATP_A", "ATP_B")
+    "pHint", "pHext", "pKPAA", "vd", "Mw", "rho", "ATP_A", "ATP_B",
+    "Ki11", "glyMean11")   # 45, 46: uptake-inhibition knob (2026-10-08), Ki11 = inf -> factor exactly 1
 NINEPOOL_DEFAULTS = dict(
     qE11max=1.65e-2, mu0=5.5e-2, k11=0.10, kdE11=1.46e-2, kE11=0.26, Ks11=9.8e-6,
     v12max=0.18, Kgly12=31.38, KAA12=870.23, KATP12=2.01,
@@ -716,7 +717,9 @@ NINEPOOL_DEFAULTS = dict(
     beta33=6.5e-4, kdE33=1.47e-2, Kgly33=30.76, m33=6.0,
     alpha4=8.01e-4, beta4=0.289, kdE4=0.29,
     k41=1.01, Ks41=1e-8, Ksto41=4.25e3, k42=3.99, Ks42=1e-4, Ksto42=7.99e3, KATP42=6.48,
-    pHint=7.20, pHext=6.50, pKPAA=4.31, vd=5e-3, Mw=28.05, rho=1000.0, ATP_A=8.5, ATP_B=10.5)
+    pHint=7.20, pHext=6.50, pKPAA=4.31, vd=5e-3, Mw=28.05, rho=1000.0, ATP_A=8.5, ATP_B=10.5,
+    Ki11=float("inf"), glyMean11=0.0)
+NINEPOOL_UPTAKE_INHIBITION_MODES = {"off": 0, "own": 1, "mean": 2}   # spec 105 (2026-10-08)
 # roles of ReactionParameterBuffer.reaction_field_slot, in order (common.glsl)
 NINEPOOL_ROLES = ("substrate", "paa", "uptake", "product", "growth_rate", "biomass",
                   "gly", "aa", "sto", "paa_pool", "e11", "e32", "e4", "pen_capacity")
@@ -775,6 +778,10 @@ class ScalarReactionConfig:
     e4: Optional[str] = None
     pen_capacity: Optional[str] = None
     ninepool: Optional[dict] = None
+    # uptake-inhibition knob (2026-10-08, ninepool only, NUMERICAL EXPERIMENT): v11 *= 1 / (1 + X_gly / Ki11);
+    # "off" (Tang 2017 as published, compiled out), "own" (the particle's X_gly, local two-way), "mean" (the
+    # population-mean X_gly, written by the host into glyMean11 every few steps: Haringa 2018's coupling)
+    uptake_inhibition: str = "off"
 
     def __post_init__(self):
         if self.type not in ("monod", "state_limited", "ninepool"):
@@ -811,7 +818,16 @@ class ScalarReactionConfig:
                     raise ValueError(f"scalars.reactions: ninepool parameter {key} must be > 0")
             if values["Mw"] <= 0.0 or values["rho"] <= 0.0 or values["ATP_B"] <= 0.0:
                 raise ValueError("scalars.reactions: ninepool Mw, rho and ATP_B must be > 0")
+            if self.uptake_inhibition not in NINEPOOL_UPTAKE_INHIBITION_MODES:
+                raise ValueError(f"scalars.reactions: uptake_inhibition must be one of "
+                                 f"{sorted(NINEPOOL_UPTAKE_INHIBITION_MODES)}, got {self.uptake_inhibition!r}")
+            if self.uptake_inhibition != "off" and not math.isfinite(values["Ki11"]):
+                raise ValueError("scalars.reactions: uptake_inhibition needs a finite ninepool Ki11")
+            if self.uptake_inhibition == "off" and math.isfinite(values["Ki11"]):
+                raise ValueError("scalars.reactions: ninepool Ki11 is set but uptake_inhibition is off")
             self.ninepool = values
+        elif self.uptake_inhibition != "off":
+            raise ValueError("scalars.reactions: uptake_inhibition belongs to type ninepool")
         elif self.growth_rate or self.product or self.maintenance:
             raise ValueError("scalars.reactions: growth_rate / product / maintenance belong to type state_limited")
 
@@ -823,6 +839,11 @@ class ScalarReactionConfig:
     def ninepool_values(self) -> list:
         """parameters in NINEPOOL_PARAMETER_ORDER (ninepool only)"""
         return [self.ninepool[name] for name in NINEPOOL_PARAMETER_ORDER]
+
+    @property
+    def uptake_inhibition_mode(self) -> int:
+        """NINEPOOL_UPTAKE_INHIBITION spec constant (105): 0 off, 1 own X_gly, 2 population mean."""
+        return NINEPOOL_UPTAKE_INHIBITION_MODES[self.uptake_inhibition] if self.type == "ninepool" else 0
 
 
 @dataclass
@@ -1436,6 +1457,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (102, lambda case: case.scalars.reactions[0].product_rate[1] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (103, lambda case: case.scalars.reactions[0].product_rate[2] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (104, lambda case: case.scalars.diffusing_vec4_mask() if case.scalars is not None else 0xF, 'I'),  # SCALAR_DIFFUSING_VEC4_MASK (2026-10-07)
+    (105, lambda case: case.scalars.reactions[0].uptake_inhibition_mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),  # NINEPOOL_UPTAKE_INHIBITION (2026-10-08)
     (93,  lambda case: 1 if any(material.free_slip for material in case.materials) else 0, 'I'),  # USE_FREE_SLIP_WALLS
     (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED

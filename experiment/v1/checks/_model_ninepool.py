@@ -20,7 +20,8 @@ P = dict(qE11max=1.65e-2, mu0=5.5e-2, k11=0.10, kdE11=1.46e-2, kE11=0.26, Ks11=9
          beta33=6.5e-4, kdE33=1.47e-2, Kgly33=30.76, m33=6.0,
          alpha4=8.01e-4, beta4=0.289, kdE4=0.29,
          k41=1.01, Ks41=1e-8, Ksto41=4.25e3, k42=3.99, Ks42=1e-4, Ksto42=7.99e3, KATP42=6.48,
-         pHint=7.20, pHext=6.50, pKPAA=4.31, vd=5e-3, Mw=28.05, rho=1000.0)
+         pHint=7.20, pHext=6.50, pKPAA=4.31, vd=5e-3, Mw=28.05, rho=1000.0,
+         Ki11=np.inf)   # uptake-inhibition knob (2026-10-08, numerical experiment): v11 /= 1 + X_gly / Ki11; inf = off
 # stoichiometry (rows gly, AA, sto, ATP, PAA; columns v11 v12 v13 v21 v22 v31 v32 v33 v41 v42)
 S = np.array([[6, -1, -0.578, -1, 0, 0, 0, -4.81, -1.07, 1],
               [0, 1, -0.5, 0, 0, 0, 0, -6.25, 0, 0],
@@ -39,7 +40,7 @@ def rates(X, Cs, CPAA, p=P, atp_dynamic=False):
     atp = X[8] if atp_dynamic else ATP_A * gly ** 3 / (gly ** 3 + ATP_B ** 3)
     gly, aa, sto, paa, atp = (max(v, 0.0) for v in (gly, aa, sto, paa, atp))
     Cs = max(Cs, 0.0)
-    v11 = p["kE11"] * e11 * Cs / (Cs + p["Ks11"])
+    v11 = p["kE11"] * e11 * Cs / (Cs + p["Ks11"]) / (1.0 + gly / p.get("Ki11", np.inf))
     v12 = p["v12max"] * hill(gly, p["Kgly12"], 2) * (1.0 - hill(aa, p["KAA12"], 2)) * hill(atp, p["KATP12"], 3)
     v13 = p["v13max"] * hill(gly, p["Kgly13"], 2) * hill(aa, p["KAA13"], 2) * hill(atp, p["KATP13"], 3)
     v21 = p["v21max"] * hill(gly, p["Kgly21"], 3) * (1.0 - hill(atp, p["KATP21"], 4))

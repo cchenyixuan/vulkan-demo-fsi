@@ -55,7 +55,7 @@ def fields(cs, cpaa, x_bio, state=STEADY):
     return out
 
 
-def rk4(y0, seconds, samples):
+def rk4(y0, seconds, samples, p=model.P):
     """numpy RK4 of the 0-D model (D = 0, no feed), state order of _model_ninepool.rhs; returns (times_s, Y)"""
     y = np.array(y0, dtype=np.float64)
     out = [y.copy()]
@@ -66,8 +66,8 @@ def rk4(y0, seconds, samples):
     t = 0.0
     for _ in range(samples):
         for _ in range(per_sample):
-            k1 = np.array(model.rhs(t, y, *args)); k2 = np.array(model.rhs(t + 0.5 * step, y + 0.5 * step * k1, *args))
-            k3 = np.array(model.rhs(t + 0.5 * step, y + 0.5 * step * k2, *args)); k4 = np.array(model.rhs(t + step, y + step * k3, *args))
+            k1 = np.array(model.rhs(t, y, *args, p=p)); k2 = np.array(model.rhs(t + 0.5 * step, y + 0.5 * step * k1, *args, p=p))
+            k3 = np.array(model.rhs(t + 0.5 * step, y + 0.5 * step * k2, *args, p=p)); k4 = np.array(model.rhs(t + step, y + step * k3, *args, p=p))
             y = y + step / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4); t += step
         out.append(y.copy())
     return np.linspace(0.0, seconds, samples + 1), np.asarray(out)
@@ -82,21 +82,32 @@ def means(series, name):
     return np.array([s["values"][:, COLUMN[name]].mean() for s in series])
 
 
-def check_n1n2(out, seconds, do_n2):
+def check_n1n2(out, seconds, do_n2, ki=None):
+    """N1 (ki None): glucose pulse, GPU vs RK4 of the 0-D model. N4 (ki = K_i): the same pulse with the
+    uptake-inhibition knob (2026-10-08) v11 /= 1 + X_gly / K_i and k_E11 scaled by (1 + X_gly0 / K_i), on the
+    GPU (`uptake_inhibition: own`) and in the 0-D model (P with Ki11)."""
     cs0, cpaa0, x0 = 350e-6, STEADY["CPAA"], STEADY["Cx"]
-    case_path, _ = box.build_case(out / "n1", c0=2.0, fields=fields(cs0, cpaa0, x0), reaction=REACTION)
+    p = dict(model.P)
+    reaction = dict(REACTION)
+    label = "N1"
+    if ki is not None:
+        p["Ki11"] = float(ki)
+        p["kE11"] = model.P["kE11"] * (1.0 + STEADY["gly"] / float(ki))
+        reaction = dict(reaction, ninepool={"Ki11": p["Ki11"], "kE11": p["kE11"]}, uptake_inhibition="own")
+        label = "N4"
+    case_path, _ = box.build_case(out / label.lower(), c0=2.0, fields=fields(cs0, cpaa0, x0), reaction=reaction)
     from utils.sph.case import load_case
     dt = load_case(str(case_path)).timestep
     steps = int(round(seconds / dt))
     samples = 36
     case, series, status = box.run_box(case_path, steps, samples)
     times = np.array([s["time"] for s in series])
-    ref_t, ref = rk4(reference_state(cs0, cpaa0, x0), seconds, samples)
+    ref_t, ref = rk4(reference_state(cs0, cpaa0, x0), seconds, samples, p=p)
     # reference columns of model.rhs state: 0 gly 1 aa 2 sto 3 paa 4 e11 5 e32 6 e4 7 v33 8 atp 9 Cs 10 CPAA 11 Cx
     pairs = (("substrate", 9), ("gly", 0), ("sto", 2), ("paa_pool", 3), ("pen_capacity", 7), ("biomass", 11), ("paa_ext", 10))
     gpu = {name: means(series, name) for name, _ in pairs}
     mu_gpu = means(series, "growth_rate")
-    mu_ref = np.array([model.rates(ref[k, :9], ref[k, 9], ref[k, 10])[0][2] for k in range(ref.shape[0])])
+    mu_ref = np.array([model.rates(ref[k, :9], ref[k, 9], ref[k, 10], p)[0][2] for k in range(ref.shape[0])])
     spread = max(float(series[-1]["values"][:, COLUMN[name]].max() - series[-1]["values"][:, COLUMN[name]].min())
                  / max(abs(gpu[name][-1]), 1e-30) for name, _ in pairs[:5])
     errors = {}
@@ -105,7 +116,9 @@ def check_n1n2(out, seconds, do_n2):
         scale = np.maximum(np.abs(reference), 1e-3 * np.abs(reference).max() + 1e-30)
         errors[name] = float(np.abs(gpu[name] - reference).max() / np.abs(reference).max())
     errors["mu"] = float(np.abs(mu_gpu[1:] - mu_ref[1:]).max() / np.abs(mu_ref).max())
-    print(f"N1 glucose pulse: dt {dt:.3e} s, {steps} steps, {seconds:.0f} s; GPU particle means vs RK4 of the 0-D model")
+    knob_text = "" if ki is None else f" with the uptake-inhibition knob K_i {ki:g} (k_E11 {p['kE11']:.4f})"
+    print(f"{label} glucose pulse{knob_text}: dt {dt:.3e} s, {steps} steps, {seconds:.0f} s; "
+          f"GPU particle means vs RK4 of the 0-D model")
     for k in range(0, len(times), max(1, len(times) // 9)):
         print(f"   t {times[k]:6.1f} s: C_s {gpu['substrate'][k]*1e6:7.2f} ({ref[k, 9]*1e6:7.2f}) umol/kg  X_gly {gpu['gly'][k]:6.2f} ({ref[k, 0]:6.2f})  "
               f"X_sto {gpu['sto'][k]:7.1f} ({ref[k, 2]:7.1f})  mu {mu_gpu[k]:.4f} ({mu_ref[k]:.4f})  q_p {gpu['pen_capacity'][k]:.3e} ({ref[k, 7]:.3e})  "
@@ -114,7 +127,7 @@ def check_n1n2(out, seconds, do_n2):
     passed = worst < 5e-3 and spread < 1e-5
     print("   max |GPU - RK4| / max|RK4|: " + ", ".join(f"{k} {v:.2e}" for k, v in errors.items())
           + f"; particle spread {spread:.1e}; overflow {status['overflow_inside_count']}/{status['overflow_incoming_count']} -> {'PASS' if passed else 'FAIL'}")
-    results = [{"name": "N1", "passed": bool(passed), "errors": errors, "spread": float(spread)}]
+    results = [{"name": label, "passed": bool(passed), "errors": errors, "spread": float(spread)}]
     if do_n2:
         glucose = np.array([np.sum(s["mass"] * (s["values"][:, COLUMN["substrate"]] + s["values"][:, COLUMN["uptake"]])) for s in series])
         paa = np.array([np.sum(s["mass"] * (s["values"][:, COLUMN["paa_ext"]]
@@ -159,7 +172,7 @@ def check_n3(out, seconds):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--only", default="N1,N2,N3")
+    parser.add_argument("--only", default="N1,N2,N3,N4", help="N4 (2026-10-08) = N1 with the uptake-inhibition knob K_i = 2 X_gly,ss")
     parser.add_argument("--out", default="output/ninepool_checks")
     parser.add_argument("--seconds", type=float, default=360.0, help="N1 duration (default 360 = one feast-famine cycle)")
     arguments = parser.parse_args()
@@ -173,6 +186,8 @@ def main():
         results += check_n1n2(out, arguments.seconds, "N2" in only)
     if "N3" in only:
         results.append(check_n3(out, 60.0))
+    if "N4" in only:
+        results += check_n1n2(out, min(arguments.seconds, 120.0), False, ki=2.0 * STEADY["gly"])
     (out / "summary.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
     return 0 if all(result["passed"] for result in results) else 1
 

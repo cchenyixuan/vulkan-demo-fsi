@@ -132,6 +132,7 @@ SPEC_ID_REACTION_PRODUCT_P0                 = 101
 SPEC_ID_REACTION_PRODUCT_P1                 = 102
 SPEC_ID_REACTION_PRODUCT_P2                 = 103
 SPEC_ID_SCALAR_DIFFUSING_VEC4_MASK          = 104  # 2026-10-07
+SPEC_ID_NINEPOOL_UPTAKE_INHIBITION          = 105  # 2026-10-08
 SPEC_ID_USE_FREE_SLIP_WALLS                 = 93
 SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
 SPEC_ID_USE_SGS_WALL_DAMPING                = 94
@@ -699,15 +700,16 @@ class SphSimulatorV1:
                 values = np.zeros(REACTION_PARAMETER_COUNT, dtype=np.float32)
                 ordered = scalars.reactions[0].ninepool_values()
                 values[:len(ordered)] = ordered
+                self._reaction_parameter_values = values      # kept for update_reaction_parameter()
                 data["reaction_parameters"] = slots.tobytes() + values.tobytes()
 
         return data
 
-    def _staging_upload(self, dest: Buffer, payload: bytes) -> None:
+    def _staging_upload(self, dest: Buffer, payload: bytes, offset: int = 0) -> None:
         self._readback_cache = None
-        if len(payload) > dest.size:
+        if offset + len(payload) > dest.size:
             raise ValueError(
-                f"upload payload ({len(payload)} B) > dest buffer ({dest.size} B)")
+                f"upload payload ({len(payload)} B at offset {offset}) > dest buffer ({dest.size} B)")
         staging = self._allocate_buffer(
             size=len(payload),
             usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -722,7 +724,7 @@ class SphSimulatorV1:
             cmd = self._allocate_oneshot_cmd()
             vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo(
                 flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT))
-            region = VkBufferCopy(srcOffset=0, dstOffset=0, size=len(payload))
+            region = VkBufferCopy(srcOffset=0, dstOffset=offset, size=len(payload))
             vkCmdCopyBuffer(cmd, staging.handle, dest.handle, 1, [region])
             vkEndCommandBuffer(cmd)
             self.ctx.submit_and_wait(cmd)
@@ -1021,6 +1023,7 @@ class SphSimulatorV1:
             (SPEC_ID_REACTION_PRODUCT_P1,          float(case.scalars.reactions[0].product_rate[1]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_REACTION_PRODUCT_P2,          float(case.scalars.reactions[0].product_rate[2]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_SCALAR_DIFFUSING_VEC4_MASK,   case.scalars.diffusing_vec4_mask() if case.scalars is not None else 0xF, 'I'),
+            (SPEC_ID_NINEPOOL_UPTAKE_INHIBITION,   case.scalars.reactions[0].uptake_inhibition_mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),
             (SPEC_ID_USE_FREE_SLIP_WALLS,          1 if any(material.free_slip for material in case.materials) else 0, 'I'),
             (SPEC_ID_USE_SCALAR_BOUNDS_LIMITER,    1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
             (SPEC_ID_SCALAR_FIELD_COUNT,           0 if case.scalars is None else len(case.scalars.fields), 'I'),
@@ -1944,6 +1947,17 @@ class SphSimulatorV1:
     def readback_shift(self) -> np.ndarray:
         raw = self._readback_buffer(self.buffers["shift"])
         return np.frombuffer(raw, dtype=np.float32).reshape(-1, 4)
+
+    def update_reaction_parameter(self, index: int, value: float) -> None:
+        """Overwrite one float of ReactionParameterBuffer.reaction_parameter at run time (2026-10-08:
+        the population-mean X_gly of the uptake-inhibition knob, NINEPOOL_PARAMETER_ORDER index of
+        glyMean11). Call between steps (after step(wait=True)); the whole 64-float block is re-uploaded."""
+        values = getattr(self, "_reaction_parameter_values", None)
+        if values is None:
+            raise RuntimeError("update_reaction_parameter: the case has no ninepool reaction")
+        values[index] = np.float32(value)
+        vkQueueWaitIdle(self.ctx.compute_queue)
+        self._staging_upload(self.buffers["reaction_parameters"], values.tobytes(), offset=REACTION_SLOT_COUNT * 4)
 
     def write_initial_velocities(self, velocities: np.ndarray, first_slot: int = 1) -> None:
         """Overwrite the velocity of the slots [first_slot, first_slot + n) with

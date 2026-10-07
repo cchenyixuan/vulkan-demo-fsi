@@ -46,7 +46,7 @@ def step(state, cs, cpaa, p, dt_h):
     e11, e32, e4, v33, xbio = (np.maximum(state[k], 0.0) for k in ("e11", "e32", "e4", "v33", "xbio"))
     cs = np.maximum(cs, 0.0)
     atp = p["ATP_A"] * gly ** 3 / (gly ** 3 + p["ATP_B"] ** 3)
-    v11 = p["kE11"] * e11 * cs / (cs + p["Ks11"])
+    v11 = p["kE11"] * e11 * cs / (cs + p["Ks11"]) / (1.0 + gly / p.get("Ki11", np.inf))   # knob (2026-10-08), inf = off
     v12 = p["v12max"] * hill(gly, p["Kgly12"], 2) * (1.0 - hill(aa, p["KAA12"], 2)) * hill(atp, p["KATP12"], 3)
     v13 = p["v13max"] * hill(gly, p["Kgly13"], 2) * hill(aa, p["KAA13"], 2) * hill(atp, p["KATP13"], 3)
     v21 = p["v21max"] * hill(gly, p["Kgly21"], 3) * (1.0 - hill(atp, p["KATP21"], 4))
@@ -117,6 +117,9 @@ def main():
     parser.add_argument("--init", default="", help="initial pools, e.g. gly=20,aa=928 (default: generator values)")
     parser.add_argument("--xbio", type=float, default=55.0, help="initial x_bio, gdw/kg")
     parser.add_argument("--param", default="", help="parameter overrides, e.g. qE11max=1.65e-2")
+    parser.add_argument("--ki", type=float, default=None,
+                        help="uptake-inhibition knob K_i (umol/gdw, 2026-10-08): v11 /= 1 + X_gly / K_i, with k_E11 scaled by "
+                             "(1 + X_gly0 / K_i) so that the chemostat steady state is unchanged (X_gly0 = initial gly)")
     parser.add_argument("--init-from-record", action="store_true", help="start from the recorded pools of the first record")
     parser.add_argument("--check", action="store_true", help="compare with the recorded gly / growth_rate / pen_capacity")
     parser.add_argument("--start", type=float, default=None, help="use records from this time on, s")
@@ -134,6 +137,10 @@ def main():
     p.update(parse_assignments(arguments.param))
     initial = dict(INITIAL, xbio=arguments.xbio)
     initial.update(parse_assignments(arguments.init))
+    if arguments.ki is not None:
+        p["Ki11"] = arguments.ki
+        p["kE11"] = p["kE11"] * (1.0 + float(initial["gly"]) / arguments.ki)
+        print(f"uptake-inhibition knob: Ki11 {arguments.ki:g} umol/gdw, k_E11 scaled to {p['kE11']:.4f} (X_gly0 {initial['gly']:g})")
     if arguments.init_from_record:
         for key, name in (("gly", "gly"), ("aa", "aa"), ("sto", "sto"), ("paa", "paa_pool"), ("e11", "e11"), ("e32", "e32"),
                           ("e4", "e4"), ("v33", "pen_capacity"), ("xbio", "biomass")):

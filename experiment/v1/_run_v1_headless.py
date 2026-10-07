@@ -52,7 +52,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 
-from utils.sph.case import load_case
+from utils.sph.case import load_case, NINEPOOL_PARAMETER_ORDER
 from utils.sph.vulkan_context import VulkanContext
 
 from experiment.v1 import compile_shaders_v1
@@ -131,6 +131,10 @@ def parse_args() -> argparse.Namespace:
                         help="first sample at simulation time >= T (s)")
     parser.add_argument("--flow-statistics-flush", type=int, default=250, metavar="M",
                         help="write the accumulators (and a copy) every M samples")
+    parser.add_argument("--population-mean-gly-every", type=float, default=0.0, metavar="T",
+                        help="9-pool cases with `uptake_inhibition: mean` (2026-10-08): every T s of flow time write the "
+                             "mass-weighted mean X_gly of the fluid particles into the reaction parameter glyMean11 "
+                             "(Haringa 2018's population-average coupling)")
     # checkpoint / resume (2026-10-08)
     parser.add_argument("--checkpoint-dir", type=str, default=None, metavar="DIR",
                         help="write checkpoints (checkpoint_latest.npz, the previous one kept as "
@@ -245,7 +249,32 @@ def main() -> None:
             steps_at_start = sim.step_count
             sampling = (args.torque_every > 0 or args.probe_every > 0 or bool(args.scalar_snapshot_times)
                         or args.lifeline_dir is not None or args.flow_statistics is not None
-                        or checkpoint_dir is not None)
+                        or checkpoint_dir is not None or args.population_mean_gly_every > 0)
+
+            # population-mean X_gly for the uptake-inhibition knob (2026-10-08)
+            mean_gly = None
+            reaction = case.scalars.reactions[0] if case.scalars is not None and case.scalars.reactions else None
+            if reaction is not None and reaction.type == "ninepool" and reaction.uptake_inhibition == "mean":
+                if args.population_mean_gly_every <= 0:
+                    raise SystemExit("this case has `uptake_inhibition: mean`: pass --population-mean-gly-every T")
+                mean_gly = {"every": max(1, round(args.population_mean_gly_every / case.timestep)),
+                            "index": NINEPOOL_PARAMETER_ORDER.index("glyMean11"),
+                            "field": case.scalars.field_names.index(reaction.gly), "count": 0}
+            elif args.population_mean_gly_every > 0:
+                raise SystemExit("--population-mean-gly-every needs a ninepool case with `uptake_inhibition: mean`")
+
+            def update_mean_gly() -> None:
+                snapshot = sim.scalar_snapshot()
+                value = float(np.dot(snapshot["mass"], snapshot["scalars"][:, mean_gly["field"]]) / snapshot["mass"].sum())
+                sim.update_reaction_parameter(mean_gly["index"], value)
+                if mean_gly["count"] % 50 == 0:
+                    print(f"[v1-headless] step={sim.step_count} t={sim.simulation_time:.4f}s population-mean X_gly {value:.4f}")
+                mean_gly["count"] += 1
+
+            if mean_gly is not None:
+                update_mean_gly()
+                print(f"[v1-headless] population-mean X_gly written every {mean_gly['every']} steps "
+                      f"= {mean_gly['every'] * case.timestep:.4f} s")
             statistics = None
             if args.flow_statistics is not None:
                 every = (args.flow_statistics_every if args.flow_statistics_every > 0
@@ -414,6 +443,8 @@ def main() -> None:
                     recorder.record()
                 if statistics is not None and statistics.due():
                     statistics.sample()
+                if mean_gly is not None and sim.step_count % mean_gly["every"] == 0:
+                    update_mean_gly()
                 if checkpoint_dir is not None and sim.step_count < args.max_steps:
                     if args.checkpoint_wall_minutes > 0 and \
                             time.perf_counter() - last_checkpoint_wall >= 60.0 * args.checkpoint_wall_minutes:

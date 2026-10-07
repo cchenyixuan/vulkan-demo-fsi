@@ -471,6 +471,13 @@ layout(constant_id = 103) const float REACTION_PRODUCT_P2 = 0.0;      // [produc
 // (the default) reproduces the behaviour before this constant existed.
 layout(constant_id = 104) const uint SCALAR_DIFFUSING_VEC4_MASK = 0xFu;
 
+// 9-pool uptake-inhibition knob (2026-10-08, numerical experiment, not Tang's
+// biology): v11 *= 1 / (1 + X_gly / K_i), K_i = reaction_parameter[45].
+// 0 = off (compiled out, Tang 2017 as published), 1 = the particle's own
+// X_gly (local two-way), 2 = the population-mean X_gly that the host writes
+// into reaction_parameter[46] (Haringa 2018's population-average coupling).
+layout(constant_id = 105) const uint NINEPOOL_UPTAKE_INHIBITION = 0u;
+
 // --- Free-slip walls (2026-10-02, material flag `free_slip: true`) ---
 // A BOUNDARY material with free_slip exerts no viscous force on the fluid and,
 // with USE_SOLID_REACTION_FORCE, receives none back: only the pressure force

@@ -766,6 +766,53 @@ NINEPOOL_INITIAL = dict(gly=20.0, aa=928.0, sto=2650.0, paa=2.7, e11=0.131, e32=
                         Cs=7.4e-6, CPAA=2.3e-3)
 NINEPOOL_FIELDS = ("substrate", "paa_ext", "uptake", "feed", "gly", "aa", "sto", "paa_pool",
                    "e11", "e32", "e4", "pen_capacity", "biomass", "product", "growth_rate")
+NINEPOOL_DEFAULT_KE11 = 0.26      # utils/sph/case.py NINEPOOL_DEFAULTS["kE11"], mol glucose / Cmol / h per unit X_E11
+
+
+def parse_assignments(text: str) -> dict:
+    """'a=1,b=2' -> {'a': 1.0, 'b': 2.0}"""
+    if not text:
+        return {}
+    return {key.strip(): float(value) for key, value in (item.split("=") for item in text.split(","))}
+
+
+def ninepool_knob(args) -> dict:
+    """Parameter overrides of the 9-pool reaction: --ninepool-param plus the uptake-inhibition knob (2026-10-08,
+    numerical experiment): Ki11 = K and k_E11 scaled by (1 + X_gly0 / K), so that at the initial (steady-state)
+    X_gly the uptake capacity k_E11 X_E11 / (1 + X_gly / K) is exactly Tang's and the 0-D chemostat is unchanged;
+    glyMean11 starts at X_gly0. Returns {"params": {...}, "mode": off | own | mean}."""
+    params = parse_assignments(args.ninepool_param)
+    mode = "off"
+    if args.ninepool_ki is not None:
+        if args.ninepool_ki <= 0.0:
+            raise SystemExit("--ninepool-ki must be > 0")
+        k_e11 = params.get("kE11", NINEPOOL_DEFAULT_KE11)
+        params["Ki11"] = args.ninepool_ki
+        params["kE11"] = k_e11 * (1.0 + NINEPOOL_INITIAL["gly"] / args.ninepool_ki)
+        params.setdefault("glyMean11", NINEPOOL_INITIAL["gly"])
+        mode = "mean" if args.ninepool_ki_mean else "own"
+    elif args.ninepool_ki_mean:
+        raise SystemExit("--ninepool-ki-mean needs --ninepool-ki")
+    return {"params": params, "mode": mode}
+
+
+def feed_source_lines(args) -> list:
+    """`sources:` entries of the glucose feed: one window (--feed-start / --feed-stop) or, with --feed-cycle
+    PERIOD ON COUNT (2026-10-08, de Jonge 2011 protocol), COUNT windows of ON s every PERIOD s from --feed-start."""
+    center = args.feed_center if args.feed_center is not None else INJECTION_POINT
+    if args.feed_cycle is not None:
+        period, on, count = args.feed_cycle
+        if period <= 0.0 or on <= 0.0 or on > period or count < 1:
+            raise SystemExit("--feed-cycle PERIOD ON COUNT needs 0 < ON <= PERIOD and COUNT >= 1")
+        windows = [(args.feed_start + k * period, args.feed_start + k * period + on) for k in range(int(round(count)))]
+    else:
+        windows = [(args.feed_start, args.feed_stop)]
+    lines = ["  sources:"]
+    for start, stop in windows:
+        stop_text = "" if stop is None else f", stop: {stop:.4f}"
+        lines.append(f"    - {{field: substrate, center: [{center[0]}, {center[1]}, {center[2]}], radius: {args.feed_radius:.4f}, "
+                     f"rate: {args.feed_rate:.6e}, start: {start:.4f}{stop_text}, record: feed}}")
+    return lines
 
 
 def scalars_block(args, h) -> str:
@@ -821,22 +868,27 @@ def scalars_block(args, h) -> str:
               "    turbulent_schmidt: 0.7"]
     if args.ninepool:
         q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
+        knob = ninepool_knob(args)
         if args.ninepool_one_way:
             # one-way protocol (Haringa 2018): the field is consumed by a Monod sink with a fixed capacity,
             # the 9-pool model is integrated offline along the recorded lifelines
+            if knob["mode"] != "off":
+                lines.append(f"  # uptake-inhibition knob for the offline integration (_integrate_ninepool_lifelines.py --ki "
+                             f"{args.ninepool_ki:g}); the Monod capacity above is unchanged by construction")
             lines += ["  reactions:",
                       f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
                       f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: 0.0}}"]
         else:
+            extra = ""
+            if knob["params"]:
+                extra += ", ninepool: {" + ", ".join(f"{key}: {value:.6e}" for key, value in knob["params"].items()) + "}"
+            if knob["mode"] != "off":
+                extra += f", uptake_inhibition: {knob['mode']}"
             lines += ["  reactions:",
                       "    - {type: ninepool, substrate: substrate, paa: paa_ext, uptake: uptake, product: product, "
                       "growth_rate: growth_rate, biomass: biomass, gly: gly, aa: aa, sto: sto, paa_pool: paa_pool, "
-                      "e11: e11, e32: e32, e4: e4, pen_capacity: pen_capacity, q_max: 0.0, k_s: 1.0}"]
-        center = args.feed_center if args.feed_center is not None else INJECTION_POINT
-        stop = "" if args.feed_stop is None else f", stop: {args.feed_stop:.4f}"
-        lines += ["  sources:",
-                  f"    - {{field: substrate, center: [{center[0]}, {center[1]}, {center[2]}], radius: {args.feed_radius:.4f}, "
-                  f"rate: {args.feed_rate:.6e}, start: {args.feed_start:.4f}{stop}, record: feed}}"]
+                      "e11: e11, e32: e32, e4: e4, pen_capacity: pen_capacity, q_max: 0.0, k_s: 1.0" + extra + "}"]
+        lines += feed_source_lines(args)
     elif args.substrate:
         q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
         if args.state_limited:
@@ -853,11 +905,7 @@ def scalars_block(args, h) -> str:
             lines += ["  reactions:",
                       f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
                       f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: {args.growth_yield:.6e}}}"]
-        center = args.feed_center if args.feed_center is not None else INJECTION_POINT
-        stop = "" if args.feed_stop is None else f", stop: {args.feed_stop:.4f}"
-        lines += ["  sources:",
-                  f"    - {{field: substrate, center: [{center[0]}, {center[1]}, {center[2]}], radius: {args.feed_radius:.4f}, "
-                  f"rate: {args.feed_rate:.6e}, start: {args.feed_start:.4f}{stop}, record: feed}}"]
+        lines += feed_source_lines(args)
     lines.append("  injections:" if args.tracers > 0 else "  injections: []")
     for index in range(args.tracers):
         start = args.injection_start + index * args.injection_interval
@@ -1045,9 +1093,33 @@ def main() -> int:
                         help="with --ninepool: the one-way protocol (Haringa 2018): same 15 fields, but the glucose field "
                              "is consumed by a fixed-capacity Monod sink (--q-max-umol-per-g-h, --k-s); the pools are "
                              "integrated offline along the lifelines")
-    parser.add_argument("--paa-initial", type=float, default=NINEPOOL_INITIAL["CPAA"], help="9-pool: initial C_PAA, mol/kg")
+    parser.add_argument("--paa-initial", type=float, default=None,
+                        help="9-pool: initial C_PAA, mol/kg (default: NINEPOOL_INITIAL['CPAA'] after --ninepool-initial)")
+    parser.add_argument("--ninepool-ki", type=float, default=None, metavar="K",
+                        help="9-pool uptake-inhibition knob (2026-10-08, NUMERICAL EXPERIMENT, not Tang's biology): "
+                             "v11 /= 1 + X_gly / K (umol/gdw); k_E11 is scaled by (1 + X_gly0 / K) so that the chemostat "
+                             "steady state is unchanged. One-way cases: recorded as a comment only (offline integrator --ki K)")
+    parser.add_argument("--ninepool-ki-mean", action="store_true",
+                        help="with --ninepool-ki: inhibit with the population-mean X_gly (Haringa 2018's coupling); the runner "
+                             "must update it: _run_v1_headless.py --population-mean-gly-every T")
+    parser.add_argument("--ninepool-initial", default="", metavar="K=V,...",
+                        help="override the initial pools / concentrations gly aa sto paa e11 e32 e4 v33 Cs CPAA, "
+                             "e.g. gly=24.6,e11=0.146 (default: 0-D steady state near mu 0.035)")
+    parser.add_argument("--ninepool-param", default="", metavar="K=V,...",
+                        help="raw 9-pool parameter overrides written to the case (names of NINEPOOL_PARAMETER_ORDER)")
+    parser.add_argument("--feed-cycle", type=float, nargs=3, default=None, metavar=("PERIOD", "ON", "COUNT"),
+                        help="periodic feed (de Jonge 2011 protocol, 2026-10-08): COUNT windows of ON s every PERIOD s from "
+                             "--feed-start at --feed-rate, one `sources` entry each; --feed-stop is ignored")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
+    if args.ninepool_initial:
+        overrides = parse_assignments(args.ninepool_initial)
+        unknown = sorted(set(overrides) - set(NINEPOOL_INITIAL))
+        if unknown:
+            parser.error(f"--ninepool-initial: unknown keys {unknown} (known: {sorted(NINEPOOL_INITIAL)})")
+        NINEPOOL_INITIAL.update(overrides)
+    if args.paa_initial is None:
+        args.paa_initial = NINEPOOL_INITIAL["CPAA"]
     global PBT_HUB, PBT_COLLAR, RUSHTON_HUB, PBT_TRUE_LENGTH, PBT_TIP_RADIUS
     if args.pbt_tip_radius is not None:
         # shortened PBT blades (diagnostic): the thin plates end at R, the lattice blades (with or without
@@ -1356,7 +1428,11 @@ def main() -> int:
         if args.ninepool:
             print(f"ninepool: {'one-way (Monod sink q_max ' + format(args.q_max_umol_per_g_h, 'g') + ' umol/(g h))' if args.ninepool_one_way else 'two-way (Tang 2017 9-pool)'}, "
                   f"x_bio {args.biomass:g} g/kg, C_s0 {NINEPOOL_INITIAL['Cs'] if args.substrate_initial is None else args.substrate_initial:.2e}, "
-                  f"C_PAA0 {args.paa_initial:.2e}; feed {args.feed_rate:.3e} mol/s from t = {args.feed_start:g} s, sphere r = {args.feed_radius:g} m")
+                  f"C_PAA0 {args.paa_initial:.2e}; feed {args.feed_rate:.3e} mol/s from t = {args.feed_start:g} s, sphere r = {args.feed_radius:g} m"
+                  + (f"; feed cycle {args.feed_cycle[1]:g} s on every {args.feed_cycle[0]:g} s x {int(args.feed_cycle[2])}" if args.feed_cycle else "")
+                  + (f"; uptake-inhibition knob K_i {args.ninepool_ki:g} ({'population mean' if args.ninepool_ki_mean else 'own'} X_gly), "
+                     f"k_E11 {ninepool_knob(args)['params']['kE11']:.4f}" if args.ninepool_ki is not None else "")
+                  + (f"; initial overrides {args.ninepool_initial}" if args.ninepool_initial else ""))
         elif args.substrate:
             print(f"substrate: Monod q_max {args.q_max_umol_per_g_h:g} umol/(g h), K_s {args.k_s:.2e} mol/kg, "
                   f"X {args.biomass:g} g/kg, uptake {'off' if args.no_uptake else 'on'}; feed {args.feed_rate:.3e} mol/s "

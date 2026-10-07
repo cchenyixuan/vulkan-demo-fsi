@@ -315,6 +315,12 @@ void main() {
                 float atp2 = atp * atp, atp3 = atp2 * atp, atp4 = atp2 * atp2;
                 // v11: glucose uptake, implicit in C_s
                 float a11  = NP_P(4) * e11 * xbio_cmol * dt_h / (Cs + NP_P(5));
+                // uptake-inhibition knob (2026-10-08, spec 105, numerical experiment): v11 *= 1 / (1 + X_gly / K_i)
+                // with the particle's own X_gly (1) or the population mean the host writes into parameter 46 (2)
+                if (NINEPOOL_UPTAKE_INHIBITION != 0u) {
+                    float gly_inhibit = (NINEPOOL_UPTAKE_INHIBITION == 2u) ? NP_P(46) : max(gly, 0.0);
+                    a11 *= 1.0 / (1.0 + gly_inhibit / NP_P(45));
+                }
                 float dCs  = Cs * a11 / (1.0 + a11);
                 float v11  = dCs / max(xbio_cmol * dt_h, 1.0e-30);             // mol/Cmol/h, consistent with dCs
                 float k2;
