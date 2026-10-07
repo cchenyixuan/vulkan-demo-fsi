@@ -149,8 +149,10 @@ def main():
     print(f"{cs.shape[1]} lifelines, {cs.shape[0]} records, {time[0]:.2f}..{time[-1]:.2f} s, Euler step <= {arguments.step} s")
     out = integrate(time, cs, cpaa, initial, p, arguments.step)
     np.savez_compressed(arguments.out, time=time, uid=data["uid"], **out)
-    print("distributions over records >= 10 s after the start and all lifelines:")
     late = time >= time[0] + 10.0
+    if not late.any():          # short test runs
+        late[:] = True
+    print(f"distributions over records >= {time[late][0] - time[0]:.1f} s after the start and all lifelines:")
     for key in ("gly", "mu", "q_p", "sto", "atp"):
         describe(key, out[key][late])
     if arguments.check:
