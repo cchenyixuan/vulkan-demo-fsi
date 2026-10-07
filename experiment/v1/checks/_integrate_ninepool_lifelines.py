@@ -125,6 +125,13 @@ def main():
                              "generator's X_gly0, e.g. 24.6) when the integration starts from a non-steady state such as "
                              "the starved pools at the feed start of B1, otherwise k_E11 differs from the GPU case")
     parser.add_argument("--init-from-record", action="store_true", help="start from the recorded pools of the first record")
+    parser.add_argument("--prefeed-probes", default=None, metavar="PROBES.CSV",
+                        help="pre-lifeline phase (2026-10-08): before the first lifeline record the field is uniform (no "
+                             "feed yet or a uniform start), so integrate the initial pools along the probe log's mean C_s "
+                             "(total:substrate / fluid_mass) up to the first record; the B1 runs starved their cells in the "
+                             "40 s of flow development (X_gly 24.6 -> 7.7) and the offline pools must start from that state")
+    parser.add_argument("--prefeed-cs0", type=float, default=None,
+                        help="C_s at t = 0 for --prefeed-probes (default: the first probe row)")
     parser.add_argument("--check", action="store_true", help="compare with the recorded gly / growth_rate / pen_capacity")
     parser.add_argument("--start", type=float, default=None, help="use records from this time on, s")
     arguments = parser.parse_args()
@@ -151,6 +158,29 @@ def main():
                           ("e4", "e4"), ("v33", "pen_capacity"), ("xbio", "biomass")):
             if name in names:
                 initial[key] = scalars[0, :, names.index(name)]
+    if arguments.prefeed_probes:
+        with open(arguments.prefeed_probes, encoding="utf-8") as handle:
+            header = handle.readline().strip().split(",")
+        rows = np.loadtxt(arguments.prefeed_probes, delimiter=",", skiprows=1, ndmin=2)
+        probe_time = rows[:, header.index("time")]
+        probe_cs = rows[:, header.index("total:substrate")] / rows[:, header.index("fluid_mass")]
+        before = probe_time < time[0]
+        cs0 = probe_cs[before][0] if arguments.prefeed_cs0 is None else arguments.prefeed_cs0
+        pre_time = np.concatenate([[0.0], probe_time[before], [time[0]]])
+        pre_cs = np.concatenate([[cs0], probe_cs[before], [probe_cs[before][-1]]])
+        state = {key: np.array([float(initial[key])]) for key in STATE}
+        for i in range(1, pre_time.size):
+            span = pre_time[i] - pre_time[i - 1]
+            sub = max(1, int(np.ceil(span / arguments.step)))
+            dt_h = span / sub / 3600.0
+            for s in range(sub):
+                w = (s + 0.5) / sub
+                state, mu, _, _ = step(state, np.array([pre_cs[i - 1] * (1.0 - w) + pre_cs[i] * w]), np.array([arguments.paa]), p, dt_h)
+        for key in STATE:
+            initial[key] = float(state[key][0])
+        print(f"pre-lifeline phase 0..{time[0]:.2f} s along the probe mean C_s ({before.sum()} rows, C_s {cs0:.3e} -> "
+              f"{pre_cs[-1]:.3e}): pools at the first record " + ", ".join(f"{k} {initial[k]:.5g}" for k in STATE)
+              + f", mu {float(mu[0]):.4f} 1/h")
     print(f"{cs.shape[1]} lifelines, {cs.shape[0]} records, {time[0]:.2f}..{time[-1]:.2f} s, Euler step <= {arguments.step} s")
     out = integrate(time, cs, cpaa, initial, p, arguments.step)
     np.savez_compressed(arguments.out, time=time, uid=data["uid"], **out)
