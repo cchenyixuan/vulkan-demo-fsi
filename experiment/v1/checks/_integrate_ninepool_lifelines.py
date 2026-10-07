@@ -119,7 +119,11 @@ def main():
     parser.add_argument("--param", default="", help="parameter overrides, e.g. qE11max=1.65e-2")
     parser.add_argument("--ki", type=float, default=None,
                         help="uptake-inhibition knob K_i (umol/gdw, 2026-10-08): v11 /= 1 + X_gly / K_i, with k_E11 scaled by "
-                             "(1 + X_gly0 / K_i) so that the chemostat steady state is unchanged (X_gly0 = initial gly)")
+                             "(1 + X_gly,ref / K_i) so that the chemostat steady state is unchanged")
+    parser.add_argument("--ki-reference-gly", type=float, default=None,
+                        help="X_gly,ref of the k_E11 rescale (default: the initial gly). Pass the STEADY-STATE X_gly (the "
+                             "generator's X_gly0, e.g. 24.6) when the integration starts from a non-steady state such as "
+                             "the starved pools at the feed start of B1, otherwise k_E11 differs from the GPU case")
     parser.add_argument("--init-from-record", action="store_true", help="start from the recorded pools of the first record")
     parser.add_argument("--check", action="store_true", help="compare with the recorded gly / growth_rate / pen_capacity")
     parser.add_argument("--start", type=float, default=None, help="use records from this time on, s")
@@ -138,9 +142,10 @@ def main():
     initial = dict(INITIAL, xbio=arguments.xbio)
     initial.update(parse_assignments(arguments.init))
     if arguments.ki is not None:
+        reference = float(initial["gly"]) if arguments.ki_reference_gly is None else arguments.ki_reference_gly
         p["Ki11"] = arguments.ki
-        p["kE11"] = p["kE11"] * (1.0 + float(initial["gly"]) / arguments.ki)
-        print(f"uptake-inhibition knob: Ki11 {arguments.ki:g} umol/gdw, k_E11 scaled to {p['kE11']:.4f} (X_gly0 {initial['gly']:g})")
+        p["kE11"] = p["kE11"] * (1.0 + reference / arguments.ki)
+        print(f"uptake-inhibition knob: Ki11 {arguments.ki:g} umol/gdw, k_E11 scaled to {p['kE11']:.4f} (X_gly,ref {reference:g})")
     if arguments.init_from_record:
         for key, name in (("gly", "gly"), ("aa", "aa"), ("sto", "sto"), ("paa", "paa_pool"), ("e11", "e11"), ("e32", "e32"),
                           ("e4", "e4"), ("v33", "pen_capacity"), ("xbio", "biomass")):
