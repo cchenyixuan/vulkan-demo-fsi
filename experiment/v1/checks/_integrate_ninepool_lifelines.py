@@ -96,6 +96,79 @@ def integrate(time, cs, cpaa, initial, p, step_seconds):
     return out
 
 
+def stitch(time, cs, cpaa, initial, p, hours, count, segment_seconds, seed, step_seconds, report_hours, out_path):
+    """Haringa et al. 2018 (2026-10-09): long lifelines by joining randomly chosen recorded lifelines (or random
+    segments of them) of a statistically steady run, exploiting that the extra-cellular statistics are stationary.
+    `count` synthetic cells are integrated on the fly through `hours` hours; a segment is one whole recorded window
+    (segment_seconds 0) or a random window of segment_seconds starting at a random record. The reference is the same
+    cell driven by the constant population-mean C_s (and C_PAA): the difference is the effect of the fluctuations at
+    fixed mean. Reports the population mean / p5 / p50 / p95 of gly, mu, q_p, e11, sto, atp every report_hours and
+    saves them (and the final state of every cell) to out_path."""
+    rng = np.random.default_rng(seed)
+    n_records, n_lifelines = cs.shape
+    interval = float(np.median(np.diff(time)))
+    seg = n_records if segment_seconds <= 0 else max(2, int(round(segment_seconds / interval)))
+    seg = min(seg, n_records)
+    sub = max(1, int(np.ceil(interval / step_seconds)))
+    dt_h = interval / sub / 3600.0
+    total_records = int(round(hours * 3600.0 / interval))
+    state = {key: np.full(count, float(initial[key])) for key in STATE}
+    reference = {key: np.array([float(initial[key])]) for key in STATE}
+    # Ideally mixed reference: a cell at the constant C_s whose Monod saturation equals the population mean of
+    # C_s / (C_s + K_s) over the records, i.e. the same mean uptake capacity use (the mean C_s itself is dominated by
+    # the feed plume and would overfeed the reference: Jensen with the saturating Monod term).
+    saturation = np.nanmean(cs / (cs + p["Ks11"]))
+    cs_mean = np.array([p["Ks11"] * saturation / max(1.0 - saturation, 1e-12)])
+    cpaa_mean = np.array([np.nanmean(cpaa)])
+    report_every = max(1, int(round(report_hours * 3600.0 / interval)))
+    rows, labels = [], ("gly", "mu", "q_p", "e11", "sto", "atp")
+    print(f"stitching {count} cells x {hours:g} h from {n_lifelines} lifelines of {n_records} records ({interval:.4f} s): "
+          f"segments of {seg} records, Euler step {interval / sub:.4f} s, {total_records:,} records in total; "
+          f"reference cell at the constant C_s of equal mean saturation {cs_mean[0]:.3e} mol/kg "
+          f"(mean saturation {saturation:.3f}; the arithmetic mean C_s is {np.nanmean(cs):.3e})")
+    done = 0
+    mu = qp = atp = np.zeros(count)
+    next_report = report_every
+    reported = -1
+    while done < total_records:
+        length = min(seg, total_records - done)
+        k = rng.integers(0, n_lifelines, size=count)
+        start = rng.integers(0, n_records - length + 1, size=count) if length < n_records else np.zeros(count, dtype=np.int64)
+        rows_index = start[None, :] + np.arange(length)[:, None]
+        cs_seg = cs[rows_index, k[None, :]]
+        cpaa_seg = cpaa[rows_index, k[None, :]]
+        cs_seg = np.where(np.isfinite(cs_seg), cs_seg, cs_mean[0])      # lost particles: mean value
+        cpaa_seg = np.where(np.isfinite(cpaa_seg), cpaa_seg, cpaa_mean[0])
+        for i in range(length):
+            c_next = cs_seg[i]
+            c_prev = cs_seg[i - 1] if i > 0 else c_next
+            pa_next, pa_prev = cpaa_seg[i], (cpaa_seg[i - 1] if i > 0 else cpaa_seg[i])
+            for s in range(sub):
+                w = (s + 0.5) / sub
+                state, mu, qp, atp = step(state, c_prev * (1.0 - w) + c_next * w, pa_prev * (1.0 - w) + pa_next * w, p, dt_h)
+                reference, mu_ref, qp_ref, atp_ref = step(reference, cs_mean, cpaa_mean, p, dt_h)
+            done += 1
+            if (done >= next_report or done == total_records) and done != reported:
+                reported = done
+                values = {"gly": state["gly"], "mu": mu, "q_p": qp, "e11": state["e11"], "sto": state["sto"], "atp": atp}
+                row = [done * interval / 3600.0]
+                for key in labels:
+                    q = np.percentile(values[key], [5, 50, 95])
+                    row += [float(values[key].mean()), q[0], q[1], q[2]]
+                row += [float(reference["gly"][0]), float(mu_ref[0]), float(qp_ref[0]), float(reference["e11"][0])]
+                rows.append(row)
+                print(f"   t {row[0]:6.2f} h: gly {row[1]:6.2f} [{row[2]:5.2f} {row[3]:5.2f} {row[4]:5.2f}]  mu {row[5]:.4f}  "
+                      f"q_p {row[9]:.3e} [{row[10]:.3e} .. {row[12]:.3e}]  e11 {row[13]:.4f}  | reference gly {row[-4]:.2f} "
+                      f"mu {row[-3]:.4f} q_p {row[-2]:.3e} e11 {row[-1]:.4f}  -> q_p loss {100 * (row[9] / row[-2] - 1):+.1f} %", flush=True)
+                next_report += report_every
+    header = ["hours"] + [f"{key}_{stat}" for key in labels for stat in ("mean", "p5", "p50", "p95")] + \
+             ["ref_gly", "ref_mu", "ref_qp", "ref_e11"]
+    np.savez_compressed(out_path, table=np.array(rows), header=np.array(header),
+                        **{f"final_{key}": state[key] for key in STATE}, final_mu=mu, final_qp=qp, final_atp=atp,
+                        cs_mean=cs_mean, seed=seed, segment_records=seg, interval=interval)
+    print(f"wrote {out_path}")
+
+
 def parse_assignments(text):
     if not text:
         return {}
@@ -134,6 +207,14 @@ def main():
                         help="C_s at t = 0 for --prefeed-probes (default: the first probe row)")
     parser.add_argument("--check", action="store_true", help="compare with the recorded gly / growth_rate / pen_capacity")
     parser.add_argument("--start", type=float, default=None, help="use records from this time on, s")
+    parser.add_argument("--stitch-hours", type=float, default=None,
+                        help="Haringa 2018 stitching (2026-10-09): instead of integrating the recorded lifelines, join randomly "
+                             "chosen recorded lifelines into --stitch-count synthetic lifelines of this many hours and integrate "
+                             "the pools on the fly (use --start to keep the statistically steady part; --step 0.03 is enough)")
+    parser.add_argument("--stitch-count", type=int, default=2500)
+    parser.add_argument("--stitch-segment", type=float, default=0.0, help="segment length, s (0 = one whole recorded window)")
+    parser.add_argument("--stitch-seed", type=int, default=1)
+    parser.add_argument("--stitch-report", type=float, default=1.0, help="report interval, hours")
     arguments = parser.parse_args()
     data = load_lifelines(arguments.dir, with_aux=False)
     names = data["field_names"]
@@ -182,6 +263,10 @@ def main():
               f"{pre_cs[-1]:.3e}): pools at the first record " + ", ".join(f"{k} {initial[k]:.5g}" for k in STATE)
               + f", mu {float(mu[0]):.4f} 1/h")
     print(f"{cs.shape[1]} lifelines, {cs.shape[0]} records, {time[0]:.2f}..{time[-1]:.2f} s, Euler step <= {arguments.step} s")
+    if arguments.stitch_hours:
+        stitch(time, cs, cpaa, initial, p, arguments.stitch_hours, arguments.stitch_count, arguments.stitch_segment,
+               arguments.stitch_seed, arguments.step, arguments.stitch_report, arguments.out)
+        return 0
     out = integrate(time, cs, cpaa, initial, p, arguments.step)
     np.savez_compressed(arguments.out, time=time, uid=data["uid"], **out)
     late = time >= time[0] + 10.0
