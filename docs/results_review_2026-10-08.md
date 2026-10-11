@@ -132,3 +132,27 @@ Paratera：五个算例并行约 3 天墙钟，约 235 卡时；Mahuika：免费
 | 子午环流弱 20 % | 已知差别，可估计对驻留时间的影响 |
 | 单相、无氧 | 局限，Haringa 2018 基准算例同样单相 |
 | 转轴漏点 | 已修，54 m³ 算例全部带选项 |
+
+## 7. 记下待考虑：Jahoda 单桨槽的排出流剖面对 LDA 数据（2026-10-11）
+
+Haringa 2023 图 1 用来验证 LB-LES 的实验数据全是 LDA，没有 PIV，而且只在图里（无表）：
+
+| 来源 | 技术 | 罐与工况 | 量 |
+|---|---|---|---|
+| Haringa, Vandewijer, Mudde 2018 CERD 136:870 | 二分量 LDA | T 0.26 m 玻璃罐，两个 Rushton，C T/3，ΔC T，N 5.78 s⁻¹ | 叶轮盘面高度 6 个径向位置的 U_rad、k_t（宏观不稳定能量用自相关拟合分离） |
+| Wu & Patterson 1989 CES | LDA | T 0.27 m 单 Rushton | U_rad、k，ε 由量纲分析 |
+| Murthy & Joshi 2008 CES | LDA，三个分量 | 单 Rushton | U_rad、k |
+| Ducci & Yianneskis 2005 AIChE J | 两点 LDA | T 0.294 m 单 Rushton | 直接测 ε，ε/N³D² 约 5 到 10 |
+| Ranade & Joshi 1990 | 文献汇总 | 标准 Rushton | U_rad 包络 |
+
+全文：`reference/Haringa Vandewijer Mudde - 2018 - ...(CERD 136).pdf`，`reference/biology model/Haringa Noorman Mudde - 2017 - ...(CES 157).pdf`。
+
+现状：H1（`--preset jahoda`，3 mm 和 2 mm，Mahuika 9459467/9459468，60 s，统计从 20 s）已完成，Po 4.60 / 5.31 对实验 4.6 到 6.0；
+`_analyze_flow_statistics.py` 已输出 U_rad/U_tip、k/U_tip²（总值与扣除叶片周期分量）、ε/(N³D²) 剖面，但还没有和上表的数据画在一起。
+要做的只是把 Haringa 2023 图 1 的点数字化后叠图（原始论文的图更准，但 2023 图 1 已把五组放在同一坐标里）。
+
+价值：54 m³ 是 Rushton 罐，除循环时间 19.3 s 外没有任何测量，Jahoda 槽是 Rushton 叶轮实现的通用检验（无量纲剖面）。能看的硬指标是 U_rad 剖面
+（峰 0.75 到 0.85 U_tip）、ε 峰值的位置（实验在 (r − r_tip)/(R − r_tip) ≈ 0.2，Haringa 2023 的 LB-LES 跑到叶尖）和 Po；k 各家散得开，只看包络。
+顺带可做单桨混合时间 θ95 ≈ 33 到 34（Kukukova 2005、Jahoda 2007，电导探头），用 P1 的示踪流程。
+
+决定：和 54 m³ 批次一起讨论后再定是否补做；不新增算例，先用现有 H1 结果叠图。
