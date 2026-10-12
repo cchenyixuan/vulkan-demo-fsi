@@ -129,7 +129,7 @@ run scripts.
 - **Spec constants**: ids and ranges are listed in `common.glsl` and mirrored by
   `_global_spec_entries()` in `simulator_v1.py` (and `_SPEC_CONSTANT_MAPPING` in
   `utils/sph/case.py`); all must be edited together.
-  Free ranges for new constants: 106+ (105 = NINEPOOL_UPTAKE_INHIBITION, 2026-10-08; 104 = SCALAR_DIFFUSING_VEC4_MASK, 2026-10-07; 96-103 = level-2 cell model `state_limited`, 2026-10-06; 94, 95 = SGS wall damping, 2026-10-05; 93 = USE_FREE_SLIP_WALLS, 2026-10-02; 79, 89–92 = Monod reaction, 2026-10-01; 73 = SOLID_DENSITY_FLOOR, 76 = SHIFT_TRANSPORT_MODE, 77 = USE_MOMENTUM_SGS, 78 = MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01), 49, 72, 74, 75 = thin plates, 2026-09-30; 34 = BACKGROUND_PRESSURE,
+  Free ranges for new constants: 108+ (106, 107 = SOLID_PAIR_VISCOSITY_MODE, WALL_LAW_INCLUDES_ROTOR, 2026-10-13; 105 = NINEPOOL_UPTAKE_INHIBITION, 2026-10-08; 104 = SCALAR_DIFFUSING_VEC4_MASK, 2026-10-07; 96-103 = level-2 cell model `state_limited`, 2026-10-06; 94, 95 = SGS wall damping, 2026-10-05; 93 = USE_FREE_SLIP_WALLS, 2026-10-02; 79, 89–92 = Monod reaction, 2026-10-01; 73 = SOLID_DENSITY_FLOOR, 76 = SHIFT_TRANSPORT_MODE, 77 = USE_MOMENTUM_SGS, 78 = MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01), 49, 72, 74, 75 = thin plates, 2026-09-30; 34 = BACKGROUND_PRESSURE,
   35 = SOLID_PRESSURE_MODE, 36 = USE_SOLID_REACTION_FORCE, 37 = SOLID_PRESSURE_OFFSET, 38 = USE_DENSITY_DIFFUSION_GRADIENT_TERM, 39 = PST_NEAR_SOLID_MODE, 48 = PAIR_CORRECTION_MODE, added 2026-09-29; 47 = USE_NEIGHBOR_LIST,
   62 = MAX_NEIGHBORS, 63–71 = scalar transport, all added on the test branch).
 - **Scalar transport (test branch, 2026-09-27)**: optional case.yaml block
@@ -171,6 +171,11 @@ run scripts.
   half-kick) and continues; `--max-steps` is the total. Lifeline chunks / probe and torque rows written
   after the checkpoint are discarded, taken snapshots skipped; `--flow-statistics` is not resumable.
   Details and the 6 mm test: `log/2026-10-08_checkpoint-resume.md`.
+- **Fluid-solid pair viscosity (test branch, 2026-10-13)**: `numerics.solid_pair_viscosity`
+  self (default, original) | harmonic | arithmetic | solid | wall_law (Werner-Wengle nu_eff of the
+  fluid particle from density.comp, set 0 binding 15), `numerics.wall_law_rotor`; materials keep their own
+  `viscosity`, the tank generator has `--wall-viscosity`, `--rotor-viscosity`, `--solid-pair-viscosity`.
+  Formulas in `common.glsl` (spec 106, 107), log `2026-10-13_wall-viscosity-and-wall-law.md`.
 - **Free-slip walls (test branch, 2026-10-02)**: a boundary material with
   `free_slip: true` exerts no viscous force on the fluid (pressure only),
   spec 93 `USE_FREE_SLIP_WALLS`; used for the no-shear lid of the Haringa (2023)

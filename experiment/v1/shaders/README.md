@@ -161,6 +161,7 @@ Reads (R) and Writes (W) per kernel. See `common.glsl` for binding numbers.
 | `scalar_compensation` (binding 12) | — | R/W (FLUID) | — | — | — | — |
 | `scalar_delta` (binding 13) | — | R | — | — | — | W (FLUID) |
 | `turbulent_viscosity` (binding 14) | — | — | — | — | W (FLUID, SGS) | R (self + FLUID nbrs, SGS) |
+| `wall_viscosity` (binding 15, 2026-10-13) | — | — | — | — | W (FLUID, wall law) | R (self; fluid nbrs of a solid in the reaction path) |
 | `correction_inverse[2i+1].z` = tr M | — | — | — | W | — | R (scalars) |
 | `scalar_parameters` (set 3, 10) | — | — | — | — | — | R |
 | `scalar_injection` (set 3, 11) | — | R (injection on) | — | — | — | — |
@@ -311,6 +312,9 @@ compile `_test_common.comp` by hand as a regression check after
            REACTION_TAU_DOWN, REACTION_PRODUCT_P0..P2 (2026-10-06, stage 5 level-2 cell model,
            reaction type state_limited = REACTION_MODE 2; predict.comp)
 104      : SCALAR_DIFFUSING_VEC4_MASK (2026-10-07; vec4 without diffusion skip the pair loop of force.comp)
+106, 107 : SOLID_PAIR_VISCOSITY_MODE, WALL_LAW_INCLUDES_ROTOR (2026-10-13; viscosity of fluid-solid pairs:
+           self / harmonic / arithmetic / solid material / Werner-Wengle wall law nu_eff from density.comp,
+           set 0 binding 15; log/2026-10-13_wall-viscosity-and-wall-law.md)
            (2026-10-01; Monod uptake in predict.comp, log/2026-10-01_reaction-and-feed.md)
 77, 78   : USE_MOMENTUM_SGS, MOMENTUM_SGS_LENGTH_SQUARED (2026-10-01; Smagorinsky nu_t added to the viscosity of
            fluid-fluid pairs in force.comp, nu_t from density.comp; log/2026-10-01_momentum-sgs.md)
@@ -325,7 +329,7 @@ compile `_test_common.comp` by hand as a regression check after
 75       : USE_THIN_PLATE_VISCOSITY (2026-09-30, plates builds only)
 56 - 79  : free except 62 - 72, 74, 75
 80 - 81  : ghost voxel counts (multi-GPU remnant, pinned 0)
-82 - 127 : free (90-94 were the removed ghost_send / install_migrations ids)
+82 - 127 : free from 108 (90-94 were the removed ghost_send / install_migrations ids)
 ```
 
 New constants for boundary conditions / FSI go into the free ranges; add the

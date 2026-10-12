@@ -44,7 +44,7 @@ from vulkan._vulkancache import ffi
 
 from utils.sph.case import (Case, KIND_BOUNDARY, KIND_FLUID, KIND_ROTOR, MAX_THIN_PLATE_GROUPS,
                             PAIR_CORRECTION_MODES, PST_NEAR_SOLID_MODES, SHIFT_TRANSPORT_MODES, SOLID_PRESSURE_MODES,
-                            THIN_PLATE_FRAMES, THIN_PLATE_SHAPES)
+                            SOLID_PAIR_VISCOSITY_MODES, THIN_PLATE_FRAMES, THIN_PLATE_SHAPES)
 from utils.sph.vulkan_context import VulkanContext
 
 
@@ -137,6 +137,8 @@ SPEC_ID_USE_FREE_SLIP_WALLS                 = 93
 SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED         = 78
 SPEC_ID_USE_SGS_WALL_DAMPING                = 94
 SPEC_ID_SGS_WALL_DISTANCE_OFFSET            = 95
+SPEC_ID_SOLID_PAIR_VISCOSITY_MODE           = 106  # 2026-10-13
+SPEC_ID_WALL_LAW_INCLUDES_ROTOR             = 107  # 2026-10-13
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
 SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM = 38
@@ -382,6 +384,8 @@ class SphSimulatorV1:
         scalar_bytes = 16 * scalar_vec4 * pool_capacity if scalar_vec4 > 0 else 16
         sgs_on = (case.scalars is not None and case.scalars.sgs.enabled) or case.numerics.momentum_sgs
         turbulent_bytes = 4 * pool_capacity if sgs_on else 16
+        # wall-law viscosity of the fluid particles (2026-10-13, numerics.solid_pair_viscosity: wall_law)
+        wall_viscosity_bytes = 4 * pool_capacity if case.numerics.solid_pair_viscosity == "wall_law" else 16
         correction_bytes = 32 * pool_capacity
         thin_plate_bytes = (MAX_THIN_PLATE_GROUPS * THIN_PLATE_GROUP_BYTES
                             + THIN_PLATE_BYTES * max(case.thin_plate_count, 1))
@@ -411,6 +415,7 @@ class SphSimulatorV1:
             _BufferSpec("scalar_compensation",          0, 12, scalar_bytes,       BSU | TRANSFER),
             _BufferSpec("scalar_delta",                 0, 13, scalar_bytes,       BSU | TRANSFER),
             _BufferSpec("turbulent_viscosity",          0, 14, turbulent_bytes,    BSU | TRANSFER),
+            _BufferSpec("wall_viscosity",               0, 15, wall_viscosity_bytes, BSU | TRANSFER),
 
             # ---- Set 1: voxel cells -----------------------------------------
             _BufferSpec("inside_particle_count",        1, 0,  4 * voxel_capacity,                  BSU | TRANSFER),
@@ -624,6 +629,10 @@ class SphSimulatorV1:
                                         group.first, group.count, THIN_PLATE_FRAMES[group.frame], 0)
                 else:
                     blob += b"\x00" * THIN_PLATE_GROUP_BYTES
+            # material group of every plate's particles (2026-10-13): the solid viscosity of
+            # SOLID_PAIR_VISCOSITY_MODE 1-3 for the wall dummies of the plate (ThinPlate.flags.z)
+            plate_material_group = {source.thin_plate_name: source.material_group_id
+                                    for source in case.particle_sources if source.thin_plate_name is not None}
             for plate in case.thin_plates:
                 axis_b = plate.axis_b
                 blob += struct.pack(
@@ -632,7 +641,8 @@ class SphSimulatorV1:
                     plate.normal[0], plate.normal[1], plate.normal[2], plate.extent[1],
                     plate.axis_a[0], plate.axis_a[1], plate.axis_a[2], 0.5 * plate.thickness,
                     axis_b[0], axis_b[1], axis_b[2], plate.point_measure,
-                    THIN_PLATE_SHAPES[plate.shape], THIN_PLATE_FRAMES[plate.frame], 0, 0)
+                    THIN_PLATE_SHAPES[plate.shape], THIN_PLATE_FRAMES[plate.frame],
+                    int(plate_material_group.get(plate.name, 0)), 0)
             assert len(blob) == MAX_THIN_PLATE_GROUPS * THIN_PLATE_GROUP_BYTES + THIN_PLATE_BYTES * case.thin_plate_count
             data["thin_plates"] = bytes(blob)
 
@@ -969,6 +979,8 @@ class SphSimulatorV1:
             (SPEC_ID_MOMENTUM_SGS_LENGTH_SQUARED,  float(case.momentum_sgs_length_squared),   'f'),
             (SPEC_ID_USE_SGS_WALL_DAMPING,         1 if (numerics.momentum_sgs and numerics.momentum_sgs_wall_damping) else 0, 'I'),
             (SPEC_ID_SGS_WALL_DISTANCE_OFFSET,     float(case.physics.particle_radius),      'f'),
+            (SPEC_ID_SOLID_PAIR_VISCOSITY_MODE,    int(SOLID_PAIR_VISCOSITY_MODES[numerics.solid_pair_viscosity]), 'I'),
+            (SPEC_ID_WALL_LAW_INCLUDES_ROTOR,      1 if numerics.wall_law_rotor else 0,       'I'),
             (SPEC_ID_SOLID_PRESSURE_OFFSET,        float(numerics.solid_pressure_offset),     'f'),
             (SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM, 1 if numerics.density_diffusion_gradient_term else 0, 'I'),
             (SPEC_ID_PST_NEAR_SOLID_MODE,          int(PST_NEAR_SOLID_MODES[numerics.pst_near_solid]), 'I'),
@@ -1112,8 +1124,9 @@ class SphSimulatorV1:
             0, 1, [barrier], 0, None, 0, None)
 
     def _record_density_scratch_to_primary_copy(self, cmd) -> None:
-        if (self.case.scalars is not None and self.case.scalars.sgs.enabled) or self.case.numerics.momentum_sgs:
-            # density.comp also wrote turbulent_viscosity (2026-09-27), which
+        if ((self.case.scalars is not None and self.case.scalars.sgs.enabled) or self.case.numerics.momentum_sgs
+                or self.case.numerics.solid_pair_viscosity == "wall_law"):
+            # density.comp also wrote turbulent_viscosity (2026-09-27) or wall_viscosity (2026-10-13), which
             # force.comp reads; the compute→transfer→compute chain below only
             # names the transfer accesses, so add an explicit compute→compute
             # dependency for that shader write.
@@ -1938,6 +1951,14 @@ class SphSimulatorV1:
         if (self.case.scalars is None or not self.case.scalars.sgs.enabled) and not self.case.numerics.momentum_sgs:
             raise RuntimeError("case has no SGS (scalars.sgs.enabled or numerics.momentum_sgs)")
         raw = self._readback_buffer(self.buffers["turbulent_viscosity"])
+        return np.frombuffer(raw, dtype=np.float32)
+
+    def readback_wall_viscosity(self) -> np.ndarray:
+        """Wall-law viscosity nu_eff of every slot (2026-10-13, numerics.solid_pair_viscosity: wall_law);
+        nu_f where no wall is in the support, 0 for slots never written (solids, dead)."""
+        if self.case.numerics.solid_pair_viscosity != "wall_law":
+            raise RuntimeError("case has no wall law (numerics.solid_pair_viscosity: wall_law)")
+        raw = self._readback_buffer(self.buffers["wall_viscosity"])
         return np.frombuffer(raw, dtype=np.float32)
 
     def readback_particle_uid(self) -> np.ndarray:

@@ -111,6 +111,27 @@
 // ============================================================================
 
 // ============================================================================
+// Viscosity of a fluid-solid pair (2026-10-13, SOLID_PAIR_VISCOSITY_MODE, see
+// common.glsl): nu_f of the fluid particle, nu_s of the solid particle's
+// material, nu_eff of the fluid particle from the wall law (mode 4 only).
+//     mode 1  2 nu_f nu_s / (nu_f + nu_s)      mode 2  (nu_f + nu_s) / 2
+//     mode 3  nu_s                               mode 4  nu_eff (rotor: nu_f unless
+//     mode 0  nu_f                                       WALL_LAW_INCLUDES_ROTOR)
+// ============================================================================
+float solid_pair_viscosity(float fluid_viscosity, float solid_viscosity,
+                           float fluid_wall_law_viscosity, bool solid_is_rotor) {
+    if (SOLID_PAIR_VISCOSITY_MODE == 1u) {
+        return 2.0 * fluid_viscosity * solid_viscosity / max(fluid_viscosity + solid_viscosity, 1.0e-30);
+    }
+    if (SOLID_PAIR_VISCOSITY_MODE == 2u) return 0.5 * (fluid_viscosity + solid_viscosity);
+    if (SOLID_PAIR_VISCOSITY_MODE == 3u) return solid_viscosity;
+    if (SOLID_PAIR_VISCOSITY_MODE == 4u) {
+        return (solid_is_rotor && !WALL_LAW_INCLUDES_ROTOR) ? fluid_viscosity : fluid_wall_law_viscosity;
+    }
+    return fluid_viscosity;
+}
+
+// ============================================================================
 // Reaction force on a solid particle (2026-09-29, USE_SOLID_REACTION_FORCE).
 // For every FLUID neighbour i of the solid particle j the acceleration that i
 // receives from j is evaluated exactly as in the fluid particle's own loop
@@ -128,6 +149,10 @@ vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 sel
     float morris_coefficient = 2.0 * (float(DIMENSION) + 2.0);
     // free-slip wall (2026-10-02): no viscous force between this solid particle and the fluid
     bool self_free_slip = USE_FREE_SLIP_WALLS && material_parameters[material[self_particle_id]].free_slip != 0u;
+    // fluid-solid pair viscosity (2026-10-13): nu_s of this solid, read only in modes 1-3
+    float self_solid_viscosity = (SOLID_PAIR_VISCOSITY_MODE != 0u)
+        ? material_parameters[material[self_particle_id]].viscosity : 0.0;
+    bool self_is_rotor = (self_kind == MATERIAL_ROTOR);
     uint cell_count = USE_NEIGHBOR_LIST ? 1u : (NEIGHBOR_Z_RANGE == 0u ? 9u : 27u);
     for (uint cell = 0u; cell < cell_count; cell++) {
         uint candidate_count;
@@ -193,8 +218,13 @@ vec3 solid_reaction_acceleration(uint self_particle_id, uint self_kind, vec3 sel
             vec3 fluid_acceleration_from_solid =
                 -solid_volume_dynamic * pressure_combined / fluid_density * kernel_gradient_corrected;
             if (!self_free_slip) {
+                // the same pair viscosity as in the fluid particle's own loop (2026-10-13)
+                float fluid_wall_law_viscosity = (SOLID_PAIR_VISCOSITY_MODE == 4u)
+                    ? wall_viscosity[fluid_particle_id] : 0.0;
+                float pair_viscosity = solid_pair_viscosity(
+                    fluid_params.viscosity, self_solid_viscosity, fluid_wall_law_viscosity, self_is_rotor);
                 fluid_acceleration_from_solid +=
-                    morris_coefficient * fluid_params.viscosity * solid_volume_dynamic
+                    morris_coefficient * pair_viscosity * solid_volume_dynamic
                     * dot(fluid_velocity_mass.xyz - self_velocity, position_difference_solid_to_fluid)
                     / (distance_squared + EPS_H_SQUARED)
                     * kernel_gradient_corrected;
@@ -381,6 +411,10 @@ void main() {
     // momentum SGS (2026-10-01): nu_t of this particle, written by density.comp this step (0 for solids)
     float self_turbulent_viscosity_momentum =
         (USE_MOMENTUM_SGS && self_params.kind == MATERIAL_FLUID) ? turbulent_viscosity[self_particle_id] : 0.0;
+    // wall law (2026-10-13, SOLID_PAIR_VISCOSITY_MODE 4): nu_eff of this fluid particle, written by
+    // density.comp this step; used for its pairs with wall particles and static plate dummies
+    float self_wall_law_viscosity =
+        (SOLID_PAIR_VISCOSITY_MODE == 4u && self_params.kind == MATERIAL_FLUID) ? wall_viscosity[self_particle_id] : 0.0;
     float pst_base_factor     = CFL_NUMBER * PST_MAIN_SHIFT_COEFFICIENT * 2.0 * (SMOOTHING_LENGTH * SMOOTHING_LENGTH);
 
     // V0-uniform pair quantities
@@ -513,6 +547,26 @@ void main() {
                     pair_is_corrected = true;
                 }
             }
+            // Fluid-solid pair viscosity (2026-10-13, SOLID_PAIR_VISCOSITY_MODE != 0, see
+            // common.glsl): a wall / rotor neighbour, or a thin-plate wall dummy (the
+            // material of its plate, ThinPlate.flags.z), replaces nu_f by nu_ij.
+            if (SOLID_PAIR_VISCOSITY_MODE != 0u && self_params.kind == MATERIAL_FLUID) {
+                uint solid_group_id = material[neighbor_particle_id];
+                bool neighbor_is_solid_pair = false;
+#if WITH_THIN_PLATES
+                if (neighbor_is_wall_dummy) {
+                    solid_group_id = thin_plate[near_thin_plate[thin_plate_safe_slot(wall_slot)].index].flags.z;
+                    neighbor_is_solid_pair = true;
+                }
+#endif
+                MaterialParameters solid_params = material_parameters[solid_group_id];
+                neighbor_is_solid_pair = neighbor_is_solid_pair || is_solid_kind(solid_params.kind);
+                if (neighbor_is_solid_pair) {
+                    pair_viscosity = solid_pair_viscosity(viscosity_uniform, solid_params.viscosity,
+                                                          self_wall_law_viscosity,
+                                                          solid_params.kind == MATERIAL_ROTOR);
+                }
+            }
 
             // ==== Pressure force (TIC) ==============================
             // Symmetric (P_i + P_j) form when self is compressive (P_i > 0);
@@ -556,8 +610,9 @@ void main() {
                 // the force this particle receives from the plate
                 vec3 plate_pair_acceleration = -neighbor_volume_dynamic / self_density * pressure_gradient_pair;
                 if (USE_THIN_PLATE_VISCOSITY) {
+                    // pair_viscosity = viscosity_uniform for a dummy unless SOLID_PAIR_VISCOSITY_MODE != 0
                     plate_pair_acceleration +=
-                        morris_coefficient * viscosity_uniform * pair_volume_viscous
+                        morris_coefficient * pair_viscosity * pair_volume_viscous
                         * dot(self_velocity - neighbor_velocity,
                               position_difference_neighbor_to_self)
                         / (distance * distance + EPS_H_SQUARED)

@@ -308,6 +308,8 @@ MAX_THIN_PLATE_GROUPS = 8          # common.glsl MAX_THIN_PLATE_GROUPS
 SOLID_PRESSURE_MODES = {"increment": 0, "mirror": 1, "mirror_tic": 2, "accumulate": 3, "extrapolate": 4}
 SHIFT_TRANSPORT_MODES = {"none": 0, "density": 1, "momentum": 2, "both": 3}
 PST_NEAR_SOLID_MODES = {"full": 0, "tangential": 1}
+# viscosity of fluid-solid pairs (2026-10-13, SOLID_PAIR_VISCOSITY_MODE in common.glsl)
+SOLID_PAIR_VISCOSITY_MODES = {"self": 0, "harmonic": 1, "arithmetic": 2, "solid": 3, "wall_law": 4}
 
 
 @dataclass
@@ -410,6 +412,16 @@ class NumericsConfig:
     # Near-wall damping of the momentum SGS (2026-10-05, USE_SGS_WALL_DAMPING): L_s = min(0.41 d, C_s Delta)
     # with d the distance to the nearest solid particle or thin-plate dummy minus the particle radius.
     momentum_sgs_wall_damping: bool = False
+    # Viscosity of fluid-solid pairs (2026-10-13, SOLID_PAIR_VISCOSITY_MODE in common.glsl): the Morris
+    # viscous term of a pair (fluid i, wall / rotor particle or thin-plate dummy j) uses
+    #   "self"        nu_f (the original code)       "harmonic"    2 nu_f nu_s / (nu_f + nu_s)
+    #   "arithmetic"  (nu_f + nu_s) / 2              "solid"       nu_s (the solid material's viscosity)
+    #   "wall_law"    the Werner-Wengle viscosity nu_eff of the fluid particle, from its distance to the
+    #                 nearest wall and its tangential velocity relative to it (density.comp)
+    # wall_law_rotor: with wall_law, ROTOR particles and rotor plates count as walls too (default: pairs
+    # with the rotor keep nu_f).
+    solid_pair_viscosity: str = "self"
+    wall_law_rotor: bool = False
     # Mirror modes: constant p_w (Pa) added to the mirrored solid pressure, a
     # repulsive layer on fluid-solid pairs only (see common.glsl).
     solid_pressure_offset: float = 0.0
@@ -427,6 +439,10 @@ class NumericsConfig:
         self.momentum_sgs = bool(self.momentum_sgs)
         self.momentum_sgs_cs = float(self.momentum_sgs_cs)
         self.momentum_sgs_wall_damping = bool(self.momentum_sgs_wall_damping)
+        self.wall_law_rotor = bool(self.wall_law_rotor)
+        if self.solid_pair_viscosity not in SOLID_PAIR_VISCOSITY_MODES:
+            raise ValueError(f"numerics.solid_pair_viscosity must be one of {list(SOLID_PAIR_VISCOSITY_MODES)}, "
+                             f"got {self.solid_pair_viscosity!r}")
         if self.momentum_sgs_filter_width is not None:
             self.momentum_sgs_filter_width = float(self.momentum_sgs_filter_width)
         if self.shift_transport not in SHIFT_TRANSPORT_MODES:
@@ -1463,6 +1479,8 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED
     (94,  lambda case: 1 if (case.numerics.momentum_sgs and case.numerics.momentum_sgs_wall_damping) else 0, 'I'),  # USE_SGS_WALL_DAMPING
     (95,  lambda case: case.physics.particle_radius,                   'f'),  # SGS_WALL_DISTANCE_OFFSET
+    (106, lambda case: SOLID_PAIR_VISCOSITY_MODES[case.numerics.solid_pair_viscosity], 'I'),  # SOLID_PAIR_VISCOSITY_MODE (2026-10-13)
+    (107, lambda case: 1 if case.numerics.wall_law_rotor else 0,       'I'),  # WALL_LAW_INCLUDES_ROTOR (2026-10-13)
     (37,  lambda case: case.numerics.solid_pressure_offset,            'f'),  # SOLID_PRESSURE_OFFSET
     (38,  lambda case: 1 if case.numerics.density_diffusion_gradient_term else 0, 'I'),
     (39,  lambda case: PST_NEAR_SOLID_MODES[case.numerics.pst_near_solid], 'I'),  # PST_NEAR_SOLID_MODE

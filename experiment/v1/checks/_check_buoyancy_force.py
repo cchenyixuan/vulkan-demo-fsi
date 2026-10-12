@@ -54,7 +54,7 @@ def write_points(path, points):
 
 
 def build_case(directory, dx, hdx, cells=30, block_cells=8, speed_of_sound=12.0, solid_pressure="increment",
-               hydrostatic=False, reaction=False, gradient_term=False):
+               hydrostatic=False, reaction=False, gradient_term=False, solid_pair_viscosity="self", wall_viscosity=1.0e-6):
     directory.mkdir(parents=True, exist_ok=True)
     half = 0.5 * cells * dx
     centers = (np.arange(cells) + 0.5) * dx - half
@@ -105,10 +105,12 @@ def build_case(directory, dx, hdx, cells=30, block_cells=8, speed_of_sound=12.0,
         case["numerics"]["density_diffusion_gradient_term"] = True
     if hydrostatic:
         case["physics"]["hydrostatic_reference"] = [0.0, float(half), 0.0]
+    if solid_pair_viscosity != "self":    # 2026-10-13, regression of numerics.solid_pair_viscosity
+        case["numerics"]["solid_pair_viscosity"] = solid_pair_viscosity
     (directory / "case.yaml").write_text(yaml.safe_dump(case, sort_keys=False), encoding="utf-8")
     materials = {"schema_version": 1,
                  "box_fluid": {"kind": "fluid", "rest_density": REST_DENSITY, "viscosity": 1.0e-6},
-                 "box_wall": {"kind": "boundary", "rest_density": REST_DENSITY, "viscosity": 1.0e-6},
+                 "box_wall": {"kind": "boundary", "rest_density": REST_DENSITY, "viscosity": float(wall_viscosity)},
                  "block": {"kind": "rotor", "rest_density": REST_DENSITY, "viscosity": 1.0e-6,
                            "rotor_angular_velocity": 0.0}}
     (directory / "materials.yaml").write_text(yaml.safe_dump(materials, sort_keys=False), encoding="utf-8")
@@ -126,6 +128,9 @@ def main():
     parser.add_argument("--reaction", action="store_true", help="numerics.solid_reaction_force")
     parser.add_argument("--gradient-term", action="store_true", help="numerics.density_diffusion_gradient_term")
     parser.add_argument("--hydrostatic", action="store_true", help="hydrostatic initial density")
+    parser.add_argument("--solid-pair-viscosity", default="self",
+                        help="numerics.solid_pair_viscosity (2026-10-13 regression; the buoyancy must not change)")
+    parser.add_argument("--wall-viscosity", type=float, default=1.0e-6, help="viscosity of the box walls, m^2/s")
     arguments = parser.parse_args()
     compile_shaders_v1.compile_v1_shaders()
     out = pathlib.Path(arguments.out)
@@ -134,7 +139,9 @@ def main():
         case_path, block_count, fluid_count = build_case(out / f"hdx_{hdx:g}_{mode}", arguments.dx, hdx,
                                                          solid_pressure=mode, hydrostatic=arguments.hydrostatic,
                                                          reaction=arguments.reaction,
-                                                         gradient_term=arguments.gradient_term)
+                                                         gradient_term=arguments.gradient_term,
+                                                         solid_pair_viscosity=arguments.solid_pair_viscosity,
+                                                         wall_viscosity=arguments.wall_viscosity)
         case = load_case(str(case_path))
         samples = []
         wall_samples = []

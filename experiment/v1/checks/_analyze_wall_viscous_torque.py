@@ -15,7 +15,12 @@ cylinder is about 770 N, and the identity in place of the KCG matrix turns a fra
 it into a torque of the order of the whole wall torque. The pressure part follows as the solver's wall
 torque minus this viscous part.
 
-usage: python experiment/v1/checks/_analyze_wall_viscous_torque.py DUMP_final.npz DX
+usage: python experiment/v1/checks/_analyze_wall_viscous_torque.py DUMP_final.npz DX [--pair-viscosity NU]
+           [--dump-viscosity] [--json OUT.json]
+Fluid-solid pair viscosity (2026-10-13, numerics.solid_pair_viscosity): by default nu = 1e-6 of every pair
+(mode self); --pair-viscosity NU uses the constant NU for every fluid-wall pair (mode solid with the wall
+material at NU); --dump-viscosity uses the wall-law viscosity nu_eff of the fluid particle stored in the
+dump (key wall_viscosity, written by _check_tank_energy.py for mode wall_law). --json also writes the parts.
 """
 import sys
 
@@ -26,7 +31,7 @@ MASS_FACTOR = 1.2187
 KINEMATIC_VISCOSITY = 1.0e-6
 
 
-def main(dump_path, spacing):
+def main(dump_path, spacing, pair_viscosity=None, dump_viscosity=False, json_out=None):
     dump = np.load(dump_path)
     support = 3.0 * spacing
     gradient_coefficient = 495.0 / (32.0 * np.pi * support ** 4)     # Wendland C4, 3D, support h
@@ -44,6 +49,15 @@ def main(dump_path, spacing):
     wall_group = max(groups, key=lambda group: np.median(radius[live & (material == group)]))
     wall = live & (material == wall_group) & (pressure > -1.0e5)          # thin-plate particles are marked < 0
     fluid_index, wall_index = np.nonzero(fluid)[0], np.nonzero(wall)[0]
+    # viscosity of every fluid particle for its pairs with the wall (2026-10-13)
+    viscosity_of_fluid = np.full(x.shape[0], KINEMATIC_VISCOSITY if pair_viscosity is None else pair_viscosity)
+    if dump_viscosity:
+        if "wall_viscosity" not in dump:
+            raise SystemExit(f"{dump_path}: no wall_viscosity array (dump of a wall_law run?)")
+        viscosity_of_fluid = dump["wall_viscosity"].astype(np.float64)
+        wall_law = viscosity_of_fluid[fluid]
+        print(f"  wall-law viscosity of the fluid: median {np.median(wall_law):.3e}, max {wall_law.max():.3e}, "
+              f"{(wall_law > 1.01 * KINEMATIC_VISCOSITY).mean() * 100:.2f} % of the fluid above 1.01 nu")
     tree = cKDTree(x[fluid_index])
     torque = np.zeros(wall_index.size)
     for start in range(0, wall_index.size, 20000):
@@ -63,7 +77,7 @@ def main(dump_path, spacing):
         q = distance / support
         gradient = (gradient_coefficient * (1.0 - q) ** 5 * q * ((-280.0 / 3.0) * q - 56.0 / 3.0)
                     / distance)[:, None] * difference
-        acceleration = (10.0 * KINEMATIC_VISCOSITY * (mass[i] / density[j])
+        acceleration = (10.0 * viscosity_of_fluid[i] * (mass[i] / density[j])
                         * ((velocity[i] - velocity[j]) * difference).sum(axis=1)
                         / (distance_squared + 0.01 * support ** 2))[:, None] * gradient
         force = -mass[i][:, None] * acceleration
@@ -78,9 +92,25 @@ def main(dump_path, spacing):
              "all ordinary wall particles": np.ones(wall_index.size, dtype=bool)}
     print(f"{dump_path}: dx {spacing * 1e3:.0f} mm, {fluid.sum():,} fluid, {wall.sum():,} ordinary wall particles")
     print("  viscous torque about +y, mN m (divided by the mass factor)")
+    result = {}
     for name, mask in parts.items():
-        print(f"  {name:48s} {torque[mask].sum() / MASS_FACTOR * 1e3:8.2f}")
+        result[name] = float(torque[mask].sum() / MASS_FACTOR * 1e3)
+        print(f"  {name:48s} {result[name]:8.2f}")
+    if json_out is not None:
+        import json
+        with open(json_out, "w", encoding="utf-8") as handle:
+            json.dump({"dump": str(dump_path), "dx": spacing, "pair_viscosity": pair_viscosity,
+                       "dump_viscosity": dump_viscosity, "torque_mNm": result}, handle, indent=1)
+    return result
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], float(sys.argv[2]))
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__.split(chr(10))[1])
+    parser.add_argument("dump")
+    parser.add_argument("dx", type=float)
+    parser.add_argument("--pair-viscosity", type=float, default=None, help="constant nu of the fluid-wall pairs, m^2/s")
+    parser.add_argument("--dump-viscosity", action="store_true", help="nu_eff of the fluid particle from the dump")
+    parser.add_argument("--json", default=None)
+    arguments = parser.parse_args()
+    main(arguments.dump, arguments.dx, arguments.pair_viscosity, arguments.dump_viscosity, arguments.json)

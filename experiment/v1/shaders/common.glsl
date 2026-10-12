@@ -478,6 +478,36 @@ layout(constant_id = 104) const uint SCALAR_DIFFUSING_VEC4_MASK = 0xFu;
 // into reaction_parameter[46] (Haringa 2018's population-average coupling).
 layout(constant_id = 105) const uint NINEPOOL_UPTAKE_INHIBITION = 0u;
 
+// --- Viscosity of fluid-solid pairs (2026-10-13, numerics.solid_pair_viscosity) ---
+// The Morris viscous term of a pair (i fluid, j wall / rotor particle or thin-plate
+// wall dummy) uses the pair viscosity nu_ij in place of the fluid particle's nu_f:
+//   0 self        nu_ij = nu_f                               (the original code)
+//   1 harmonic    nu_ij = 2 nu_f nu_s / (nu_f + nu_s)        (at most 2 nu_f)
+//   2 arithmetic  nu_ij = (nu_f + nu_s) / 2
+//   3 solid       nu_ij = nu_s
+//   4 wall_law    nu_ij = nu_eff,i of the fluid particle (WallViscosityBuffer,
+//                 computed by density.comp from the Werner-Wengle wall law):
+//                 with d = distance of the fluid particle to the nearest wall
+//                 particle minus the particle radius (SGS_WALL_DISTANCE_OFFSET),
+//                 u_t = |tangential velocity relative to that wall particle|,
+//                 Re_d = u_t d / nu_f,
+//                   Re_d <= 11.81^2 : u+ = y+        -> nu_eff = nu_f
+//                   Re_d >  11.81^2 : u+ = 8.3 y+^(1/7)
+//                       y+ = (Re_d / 8.3)^(7/8),  nu_eff = u_tau^2 d / u_t = nu_f y+ / u+
+//                                = nu_f (Re_d / 8.3)^(3/4) / 8.3   (>= nu_f, continuous at 11.81)
+//                 so that the SPH wall shear mu_eff u_t / d reproduces the wall-law
+//                 shear stress rho u_tau^2 for the velocity the first fluid particle has.
+// nu_s is the viscosity of the solid particle's material (materials.yaml); for a
+// thin-plate wall dummy it is the material of the plate (ThinPlate.flags.z).
+// The same nu_ij enters the reaction force of the solid (solid_reaction_acceleration),
+// so the force and torque read back on the solids stay the negative of the fluid's.
+// Free-slip walls keep no viscous force at all. Mode 0 compiles every extra read out.
+layout(constant_id = 106) const uint SOLID_PAIR_VISCOSITY_MODE = 0u;
+// wall_law only (numerics.wall_law_rotor): true = ROTOR particles and rotor plates
+// are walls too (candidates for the nearest wall, and their pairs use nu_eff);
+// false (default) = pairs with the rotor keep nu_f and the rotor is not a wall.
+layout(constant_id = 107) const bool WALL_LAW_INCLUDES_ROTOR = false;
+
 // --- Free-slip walls (2026-10-02, material flag `free_slip: true`) ---
 // A BOUNDARY material with free_slip exerts no viscous force on the fluid and,
 // with USE_SOLID_REACTION_FORCE, receives none back: only the pressure force
@@ -713,6 +743,15 @@ layout(std430, set = 0, binding = 14) buffer TurbulentViscosityBuffer {
     // a defrag belong to other particles). Touched only when USE_SCALAR_SGS
     // (a 16 B placeholder otherwise).
     float turbulent_viscosity[];
+};
+
+layout(std430, set = 0, binding = 15) buffer WallViscosityBuffer {
+    // Wall-law viscosity nu_eff (m^2/s) of FLUID particles (SOLID_PAIR_VISCOSITY_MODE 4),
+    // written by density.comp and read by force.comp in the same step (also for the
+    // reaction force of the solid neighbours). Not carried through defrag: it is
+    // recomputed before every read. nu_f for a fluid particle without a wall in
+    // its support. A 16 B placeholder in every other mode.
+    float wall_viscosity[];
 };
 
 // ============================================================================
@@ -1052,7 +1091,9 @@ struct ThinPlate {
     vec4  normal_extent_b;        // xyz unit normal; w = half length along axis_b or inner radius
     vec4  axis_a_half_thickness;  // xyz unit in-plane axis a; w = half the true plate thickness (record, not used)
     vec4  axis_b_measure;         // xyz unit in-plane axis b; w = area (3D) or length (2D) per plate particle (record, not used)
-    uvec4 flags;                  // x = shape (0 rectangle, 1 annulus), y = frame (0 static, 1 rotor)
+    uvec4 flags;                  // x = shape (0 rectangle, 1 annulus), y = frame (0 static, 1 rotor),
+                                  // z = material group of the plate particles (2026-10-13, for the
+                                  // solid viscosity of SOLID_PAIR_VISCOSITY_MODE 1-3)
 };  // 80 B
 
 layout(std430, set = 3, binding = 12) buffer ThinPlateBuffer {

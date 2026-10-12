@@ -706,12 +706,12 @@ tank_water:
 tank_wall:
   kind: boundary
   rest_density: 998.0
-  viscosity: {viscosity:.6e}
+  viscosity: {wall_viscosity:.6e}   # enters the fluid-wall pairs only with numerics.solid_pair_viscosity != self (2026-10-13)
 
 impeller:
   kind: rotor
   rest_density: 998.0
-  viscosity: {viscosity:.6e}
+  viscosity: {rotor_viscosity:.6e}   # same; --rotor-viscosity, default = --viscosity
   rotor_angular_velocity: {omega:.5f}   # rad/s, right-hand sign about +y (= M-Star -200 rpm, CCW from above, PBT down-pumping)
 """
 
@@ -943,6 +943,21 @@ def main() -> int:
                              "term is 0.841 of the exact operator on the h/dx = 3 lattice with xi = 0.01 "
                              "(_check_operator_consistency.py), so 1.0e-6 / 0.8408 = 1.18934e-6 gives an "
                              "effective viscosity of 1.0e-6")
+    parser.add_argument("--wall-viscosity", type=float, default=None, metavar="NU",
+                        help="viscosity of the wall material tank_wall (m^2/s; default = --viscosity). Only the "
+                             "fluid-wall pairs see it, and only with --solid-pair-viscosity other than self (2026-10-13)")
+    parser.add_argument("--rotor-viscosity", type=float, default=None, metavar="NU",
+                        help="viscosity of the rotor material impeller (m^2/s; default = --viscosity, i.e. the blades "
+                             "keep the molecular value whatever --wall-viscosity is)")
+    parser.add_argument("--solid-pair-viscosity", choices=("self", "harmonic", "arithmetic", "solid", "wall_law"),
+                        default="self",
+                        help="numerics.solid_pair_viscosity (2026-10-13): viscosity of the fluid-solid pairs: self "
+                             "(nu_f, the original code), harmonic / arithmetic mean of nu_f and the solid material's nu, "
+                             "solid (the solid material's nu), wall_law (Werner-Wengle equivalent viscosity of the fluid "
+                             "particle next to a wall)")
+    parser.add_argument("--wall-law-rotor", action="store_true",
+                        help="numerics.wall_law_rotor: with wall_law the rotor surfaces are walls too (default: the "
+                             "rotor pairs keep nu_f)")
     parser.add_argument("--no-rotor-bell", action="store_true",
                         help="rotor without the rotating bell at the lower end of the shaft (as until 2026-09-29)")
     parser.add_argument("--no-shaft", action="store_true",
@@ -1390,6 +1405,11 @@ def main() -> int:
             "  use_pst: true",
             f"  momentum_sgs: true\n  momentum_sgs_cs: {args.momentum_sgs:g}\n  momentum_sgs_filter_width: {width:.6g}\n"
             f"{damping}  use_pst: true")
+    if args.solid_pair_viscosity != "self" or args.wall_law_rotor:
+        assert case_text.count("  use_pst: true") == 1
+        rotor_text = "  wall_law_rotor: true\n" if args.wall_law_rotor else ""
+        case_text = case_text.replace("  use_pst: true",
+                                      f"  solid_pair_viscosity: {args.solid_pair_viscosity}\n{rotor_text}  use_pst: true")
     if args.shift_transport != "none":
         case_text = case_text.replace("  use_pst: true", f"  shift_transport: {args.shift_transport}\n  use_pst: true")
     if args.no_solid_density_floor:
@@ -1423,7 +1443,16 @@ def main() -> int:
             case_text = case_text.replace("  use_pst: true",
                                           f"  thin_plate_dashpot: {args.thin_plate_dashpot:g}\n  use_pst: true")
     (out / "case.yaml").write_text(case_text, encoding="utf-8")
-    (out / "materials.yaml").write_text(MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity), encoding="utf-8")
+    wall_viscosity = args.viscosity if args.wall_viscosity is None else args.wall_viscosity
+    rotor_viscosity = args.viscosity if args.rotor_viscosity is None else args.rotor_viscosity
+    (out / "materials.yaml").write_text(
+        MATERIALS_YAML.format(omega=omega, viscosity=args.viscosity, wall_viscosity=wall_viscosity,
+                              rotor_viscosity=rotor_viscosity), encoding="utf-8")
+    if args.solid_pair_viscosity != "self" or args.wall_viscosity is not None or args.rotor_viscosity is not None:
+        print(f"solid pair viscosity: {args.solid_pair_viscosity}"
+              f"{' (rotor surfaces are walls)' if args.wall_law_rotor else ''}; nu fluid {args.viscosity:g}, "
+              f"wall {wall_viscosity:g} ({wall_viscosity / args.viscosity:g} x), rotor {rotor_viscosity:g} "
+              f"({rotor_viscosity / args.viscosity:g} x) m^2/s")
     if args.state_limited and (not args.substrate or args.no_uptake or args.growth_yield <= 0.0):
         parser.error("--state-limited needs --substrate, no --no-uptake and --growth-yield > 0")
     if args.ninepool and (args.state_limited or args.no_uptake):

@@ -78,6 +78,8 @@ def build_case(directory, arguments):
                 "density_diffusion_gradient_term": arguments.gradient_term,
                 "use_pst": not arguments.no_pst, "pst_main": 0.1, "pst_anti": 0.0005,
                 "defrag_enabled": True, "defrag_cadence": 10, "use_prefix_sum_defrag": False}
+    if arguments.solid_pair_viscosity != "self":    # 2026-10-13, regression of numerics.solid_pair_viscosity
+        numerics["solid_pair_viscosity"] = arguments.solid_pair_viscosity
     case = {"schema_version": 2,
             "time": {"total": None, "max_steps": None, "output_cadence": None},
             "physics": physics, "numerics": numerics,
@@ -90,7 +92,7 @@ def build_case(directory, arguments):
     (directory / "case.yaml").write_text(yaml.safe_dump(case, sort_keys=False), encoding="utf-8")
     materials = {"schema_version": 1,
                  "box_fluid": {"kind": "fluid", "rest_density": REST_DENSITY, "viscosity": 1.0e-6},
-                 "box_wall": {"kind": "boundary", "rest_density": REST_DENSITY, "viscosity": 1.0e-6}}
+                 "box_wall": {"kind": "boundary", "rest_density": REST_DENSITY, "viscosity": float(arguments.wall_viscosity)}}
     (directory / "materials.yaml").write_text(yaml.safe_dump(materials, sort_keys=False), encoding="utf-8")
     return directory / "case.yaml", grid.shape[0], height
 
@@ -115,6 +117,9 @@ def main():
     parser.add_argument("--solid-pressure", default="accumulate")
     parser.add_argument("--pair-correction", default="reverse")
     parser.add_argument("--dump", action="store_true", help="write DIR/final.npz")
+    parser.add_argument("--solid-pair-viscosity", default="self",
+                        help="numerics.solid_pair_viscosity (2026-10-13 regression; the box at rest must not change)")
+    parser.add_argument("--wall-viscosity", type=float, default=1.0e-6, help="viscosity of the box walls, m^2/s")
     arguments = parser.parse_args()
 
     from utils.sph.case import load_case

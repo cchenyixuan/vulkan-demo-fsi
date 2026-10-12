@@ -142,6 +142,16 @@ void main() {
     // distance to the nearest solid neighbour (or thin-plate wall dummy); the
     // support radius when there is none. Dead code unless the option is on.
     float nearest_wall_distance = sqrt(smoothing_length_squared());
+    // Wall law (2026-10-13, SOLID_PAIR_VISCOSITY_MODE 4): nearest wall particle
+    // (BOUNDARY without free_slip, ROTOR with WALL_LAW_INCLUDES_ROTOR, thin-plate
+    // wall dummy of a static plate, or of a rotor plate with the flag): its
+    // distance, velocity and direction, and sum_j V_j grad W_ij over those wall
+    // neighbours (the wall normal direction). Dead code unless mode 4. All
+    // initialised finite (see the RTX 5090 note in thin_plates.glsl).
+    float wall_law_nearest_distance  = sqrt(smoothing_length_squared());
+    vec3  wall_law_nearest_velocity  = vec3(0.0);
+    vec3  wall_law_nearest_direction = vec3(0.0, 1.0, 0.0);
+    vec3  wall_law_gradient_sum      = vec3(0.0);
 
     float density_drift     = 0.0;
     float density_diffusion = 0.0;
@@ -234,6 +244,7 @@ void main() {
             // segment to this one crosses the plate) is a dummy particle of the wall:
             // it moves with the plate and takes no part in the density diffusion.
             bool neighbor_is_wall_dummy = false;
+            uint neighbor_wall_slot = MAX_NEAR_THIN_PLATES;   // slot of the plate of a dummy (wall law)
             if (near_thin_plate_count > 0u) {
                 uint wall_slot = thin_plate_wall_slot(self_position, neighbor_position,
                                                       neighbor_density_pressure.y);
@@ -242,6 +253,7 @@ void main() {
                     if (wall_slot != MAX_NEAR_THIN_PLATES) continue;
                 } else if (wall_slot != MAX_NEAR_THIN_PLATES) {
                     neighbor_is_wall_dummy = true;
+                    neighbor_wall_slot = wall_slot;
                     neighbor_velocity = thin_plate_velocity(wall_slot, neighbor_position);
                 } else if (is_thin_plate_particle(neighbor_density_pressure.y)) {
                     continue;
@@ -288,6 +300,29 @@ void main() {
                 neighbor_is_solid = neighbor_is_solid || neighbor_is_wall_dummy;
 #endif
                 if (neighbor_is_solid) nearest_wall_distance = min(nearest_wall_distance, distance);
+            }
+            if (SOLID_PAIR_VISCOSITY_MODE == 4u && self_is_fluid) {
+                // wall law: is this neighbour a wall for the wall law? (see the declarations above)
+                MaterialParameters wall_law_neighbor_params = material_parameters[material[neighbor_particle_id]];
+                bool neighbor_is_wall_law_wall =
+                    (wall_law_neighbor_params.kind == MATERIAL_BOUNDARY && wall_law_neighbor_params.free_slip == 0u)
+                    || (WALL_LAW_INCLUDES_ROTOR && wall_law_neighbor_params.kind == MATERIAL_ROTOR);
+#if WITH_THIN_PLATES
+                if (neighbor_is_wall_dummy) {
+                    // a dummy of a static plate is a wall; of a rotor plate only with the flag
+                    // (neighbor_velocity already holds the plate velocity at x_j)
+                    neighbor_is_wall_law_wall = WALL_LAW_INCLUDES_ROTOR
+                        || near_thin_plate[thin_plate_safe_slot(neighbor_wall_slot)].frame == THIN_PLATE_FRAME_STATIC;
+                }
+#endif
+                if (neighbor_is_wall_law_wall) {
+                    wall_law_gradient_sum += neighbor_volume * raw_gradient;
+                    if (distance < wall_law_nearest_distance) {
+                        wall_law_nearest_distance  = distance;
+                        wall_law_nearest_velocity  = neighbor_velocity;
+                        wall_law_nearest_direction = position_difference_neighbor_to_self / distance;
+                    }
+                }
             }
 
             // --- δ-SPH density diffusion (gated by USE_DENSITY_DIFFUSION) -
@@ -452,5 +487,41 @@ void main() {
             mixing_length_squared = min(mixing_length_squared, wall_length * wall_length);
         }
         turbulent_viscosity[self_particle_id] = mixing_length_squared * sqrt(2.0 * strain_rate_contracted);
+    }
+
+    // ========================================================================
+    // Wall law (2026-10-13, SOLID_PAIR_VISCOSITY_MODE 4, see common.glsl):
+    // Werner-Wengle viscosity of this FLUID particle for its pairs with the
+    // walls, read by force.comp this step.
+    //     d    = |x_i - x_wall| - SGS_WALL_DISTANCE_OFFSET (particle radius)
+    //     n    = direction of sum_j V_j grad W_ij over the wall neighbours
+    //            (the nearest wall particle's direction when that sum vanishes)
+    //     u_t  = |(v_i - v_wall) - ((v_i - v_wall) . n) n|
+    //     Re_d = u_t d / nu_f
+    //     nu_eff = nu_f                                  Re_d <= 11.81^2 (= 139.5)
+    //            = nu_f (Re_d / 8.3)^(3/4) / 8.3          otherwise (>= nu_f)
+    // Every expression is finite for any input (RTX 5090 note): d has a floor,
+    // the normal is unit by construction, pow() gets a positive base.
+    // ========================================================================
+    if (SOLID_PAIR_VISCOSITY_MODE == 4u && self_is_fluid) {
+        float molecular_viscosity = self_params.viscosity;
+        float wall_law_viscosity  = molecular_viscosity;
+        if (wall_law_nearest_distance < sqrt(smoothing_length_squared())) {
+            float wall_distance = max(wall_law_nearest_distance - SGS_WALL_DISTANCE_OFFSET,
+                                      1.0e-3 * SGS_WALL_DISTANCE_OFFSET + 1.0e-9);
+            float gradient_sum_length = length(wall_law_gradient_sum);
+            vec3  wall_normal = (gradient_sum_length > 1.0e-12)
+                ? wall_law_gradient_sum / gradient_sum_length
+                : wall_law_nearest_direction;
+            vec3  relative_velocity   = self_velocity - wall_law_nearest_velocity;
+            vec3  tangential_velocity = relative_velocity - dot(relative_velocity, wall_normal) * wall_normal;
+            float tangential_speed    = length(tangential_velocity);
+            float wall_reynolds       = tangential_speed * wall_distance / molecular_viscosity;
+            float viscosity_ratio     = pow(max(wall_reynolds, 1.0e-6) / 8.3, 0.75) / 8.3;
+            if (wall_reynolds > 139.5) {
+                wall_law_viscosity = molecular_viscosity * max(viscosity_ratio, 1.0);
+            }
+        }
+        wall_viscosity[self_particle_id] = wall_law_viscosity;
     }
 }

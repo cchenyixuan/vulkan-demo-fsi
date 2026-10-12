@@ -154,7 +154,10 @@ def main():
         np.savez(path, positions=simulator.readback_positions(), material=simulator.readback_material(),
                  velocity_mass=simulator.readback_velocity_mass(), particle_uid=simulator.readback_particle_uid(),
                  status=json.dumps(simulator.readback_global_status()),
-                 density_pressure=simulator.readback_density_pressure())
+                 density_pressure=simulator.readback_density_pressure(),
+                 # wall-law viscosity of the fluid particles (2026-10-13, numerics.solid_pair_viscosity: wall_law)
+                 **({"wall_viscosity": simulator.readback_wall_viscosity()}
+                    if case.numerics.solid_pair_viscosity == "wall_law" else {}))
 
     with VulkanContext.create(application_name="tank_energy", enable_validation=False) as context:
         simulator = SphSimulatorV1(context, case)
