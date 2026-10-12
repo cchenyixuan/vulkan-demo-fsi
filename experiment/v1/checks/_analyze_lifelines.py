@@ -29,6 +29,12 @@ Subcommands
                       transitions need to pass the boundary by 0.01; residence times per pattern
                       LEL, LSL, ELE, ELS, SLE, SLS; arcs at q/q_max = 0.05 (duration, maximum)
   selftest            regime / arc analysis of a synthetic telegraph signal with known residence times
+  frozen DIR          frozen time-averaged field vs the transient lifelines (Haringa's one-way approximation)
+  spectrum DIR        Welch spectrum of C_s (or q/q_max with --monod) averaged over the lifelines; variance
+                      split at 1 / --split-period (0.36 s, the moving average of the regime analysis) and the
+                      direct moving-average variance as a cross-check; --out PREFIX writes .npz / .json / .png
+  spectrum-selftest   variance split of a synthetic signal (sinusoids + white noise) against the exact values
+  spectrum-plot NPZ.. overlay several spectra in one figure and print the variance table
 
 Usage (repo root):
     python experiment/v1/checks/_analyze_lifelines.py integrity DIR
@@ -558,6 +564,232 @@ def command_frozen(arguments):
     return 0
 
 
+# ---------------------------------------------------------------------------------------------
+# power spectra of the lifeline signal (2026-10-13): where in frequency the resolution-dependent
+# excess of C_s fluctuation sits, relative to the 0.36 s moving average of the regime analysis
+# ---------------------------------------------------------------------------------------------
+def moving_average_gain(frequency, window, interval):
+    """|H(f)|^2 of the centred moving average over `window` records (Dirichlet kernel); first zero at
+    f = 1 / (window * interval), i.e. at 1 / 0.36 s for the 0.36 s filter of the regime analysis."""
+    x = np.pi * np.asarray(frequency, dtype=np.float64) * interval
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gain = np.where(np.abs(np.sin(x)) < 1e-12, 1.0, np.sin(window * x) / (window * np.sin(x)))
+    return gain ** 2
+
+
+def lifeline_spectrum(signal, interval, segment_seconds=10.0, split_period=0.36, batch=2000):
+    """Welch spectrum (Hann, 50 % overlap, segment of at least `segment_seconds`) of every column of
+    `signal` (n, K) after removing the column mean, averaged over the columns; variance split at
+    f_split = 1 / split_period; cross-check against the direct moving average over split_period."""
+    from scipy.signal import welch
+    n, count = signal.shape
+    fs = 1.0 / interval
+    nperseg = min(n, int(np.ceil(segment_seconds / interval)))
+    window = max(1, round(split_period / interval))
+    f_split = 1.0 / split_period
+    psd_sum = None
+    var_time = np.zeros(count)
+    var_smooth = np.zeros(count)
+    var_residual = np.zeros(count)
+    for lo in range(0, count, batch):
+        block = signal[:, lo:lo + batch].astype(np.float64)
+        block -= block.mean(axis=0, keepdims=True)
+        frequency, psd = welch(block, fs=fs, window="hann", nperseg=nperseg, noverlap=nperseg // 2,
+                               detrend=False, scaling="density", axis=0)
+        psd_sum = psd.sum(axis=1) if psd_sum is None else psd_sum + psd.sum(axis=1)
+        var_time[lo:lo + batch] = block.var(axis=0)
+        smooth = moving_average(block, window)
+        var_smooth[lo:lo + batch] = smooth.var(axis=0)
+        var_residual[lo:lo + batch] = (block - smooth).var(axis=0)
+    psd_mean = psd_sum / count
+    df = float(frequency[1] - frequency[0])
+    var_welch = float(psd_mean.sum() * df)          # one-sided density: sum x df = variance
+    low = frequency < f_split
+    var_low = float(psd_mean[low].sum() * df)
+    var_high = var_welch - var_low
+    # the Welch integral misses the variance of drifts slower than the segment (non-stationary edges under the
+    # Hann window); that part belongs below the split, so the reported low part is the time-domain total minus high
+    var_low_total = float(var_time.mean()) - var_high
+    gain = moving_average_gain(frequency, window, interval)
+    var_smooth_predicted = float((psd_mean * gain).sum() * df)
+    return dict(frequency=frequency, psd=psd_mean, interval=interval, nperseg=nperseg, window=window,
+                f_split=f_split, split_period=split_period, count=count, records=n,
+                var_time=float(var_time.mean()), var_welch=var_welch, var_low=var_low, var_high=var_high,
+                var_low_total=var_low_total,
+                var_smooth=float(var_smooth.mean()), var_residual=float(var_residual.mean()),
+                var_smooth_predicted=var_smooth_predicted,
+                var_time_per_lifeline=var_time, var_smooth_per_lifeline=var_smooth)
+
+
+def print_spectrum(result, label, unit):
+    total = max(result["var_time"], 1e-300)
+    print(f"{label}: {result['count']} lifelines x {result['records']} records, dt {result['interval'] * 1e3:.2f} ms, "
+          f"Welch segment {result['nperseg']} records = {result['nperseg'] * result['interval']:.2f} s (Hann, 50 % overlap)")
+    print(f"  variance about the lifeline mean: time domain {result['var_time']:.4e} ({unit})^2, Welch integral {result['var_welch']:.4e} "
+          f"= {100 * result['var_welch'] / total:.1f} % (the rest is drift slower than the segment)")
+    print(f"  split at f = 1/{result['split_period']} s = {result['f_split']:.3f} Hz:  high {result['var_high']:.4e} = {100 * result['var_high'] / total:.1f} %, "
+          f"low = total - high {result['var_low_total']:.4e} = {100 * result['var_low_total'] / total:.1f} % "
+          f"(Welch bins below the split alone: {result['var_low']:.4e})")
+    print(f"  cross-check, {result['window']}-record ({result['window'] * result['interval']:.3f} s) moving average: variance of the smoothed series "
+          f"{result['var_smooth']:.4e} = {100 * result['var_smooth'] / max(result['var_time'], 1e-300):.1f} % of the time-domain variance "
+          f"(predicted from the spectrum with |H|^2: {result['var_smooth_predicted']:.4e}); residual {result['var_residual']:.4e}")
+
+
+def save_spectrum(result, prefix, label, unit):
+    prefix = pathlib.Path(prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {key: value for key, value in result.items() if isinstance(value, np.ndarray)}
+    scalars = {key: value for key, value in result.items() if not isinstance(value, np.ndarray)}
+    np.savez_compressed(prefix.with_suffix(".npz"), label=label, unit=unit, **arrays, **scalars)
+    prefix.with_suffix(".json").write_text(json.dumps(dict(label=label, unit=unit, **scalars), indent=1), encoding="utf-8")
+    plot_spectra([result], [label], prefix.with_suffix(".png"), unit)
+    print(f"wrote {prefix.with_suffix('.npz')}, .json, .png")
+
+
+def plot_spectra(results, labels, path, unit, title=None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    figure, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    for result, label in zip(results, labels):
+        frequency, psd = result["frequency"], result["psd"]
+        keep = frequency > 0
+        axes[0].loglog(frequency[keep], psd[keep], lw=1.2, label=label)
+        axes[1].semilogx(frequency[keep], frequency[keep] * psd[keep], lw=1.2, label=label)
+    f_split = float(results[0]["f_split"])
+    for axis in axes:
+        axis.axvline(f_split, color="k", ls="--", lw=0.8)
+        axis.set_xlabel("f, Hz")
+        axis.grid(True, which="both", alpha=0.3)
+        axis.legend(fontsize=8)
+    axes[0].set_ylabel(f"S(f), ({unit})$^2$/Hz")
+    axes[0].set_title("Welch spectrum averaged over the lifelines", fontsize=10)
+    axes[1].set_ylabel(f"f S(f), ({unit})$^2$")
+    axes[1].set_title(f"variance-preserving form (area = variance); dashed: 1 / {float(results[0]['split_period'])} s", fontsize=10)
+    if title:
+        figure.suptitle(title, fontsize=10)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def command_spectrum(arguments):
+    """Averaged Welch spectrum of the recorded C_s (or of q/q_max = C_s / (C_s + K_s) with --monod) from --start
+    on, and the split of the variance at 1 / --split-period (default 0.36 s, the moving average of the regime
+    analysis); written as PREFIX.npz / .json / .png with --out."""
+    data = load_lifelines(arguments.dir, with_aux=False)
+    names = data.get("field_names", [])
+    time = data["time"].astype(np.float64)
+    keep = time >= arguments.start
+    time = time[keep]
+    signal = data["scalars"][keep][:, :, names.index(arguments.field)].astype(np.float64)
+    if arguments.max_lifelines:
+        signal = signal[:, :arguments.max_lifelines]
+    step = np.diff(time)
+    interval = float(np.median(step))
+    if step.size and (step.max() > 1.1 * interval or step.min() < 0.9 * interval):
+        print(f"warning: uneven record interval, {step.min():.4f} .. {step.max():.4f} s (median {interval:.4f})")
+    if arguments.monod:
+        q_max, k_s = arguments.monod
+        signal = signal / (k_s + np.maximum(signal, 0.0))
+        unit, label = "-", "q/q_max"
+    else:
+        unit, label = "mol/kg", arguments.field
+    complete = np.isfinite(signal).all(axis=0)
+    if not complete.all():
+        print(f"{(~complete).sum()} lifelines with missing records left out")
+        signal = signal[:, complete]
+    result = lifeline_spectrum(signal, interval, arguments.segment, arguments.split_period)
+    name = arguments.label or pathlib.Path(arguments.dir).name
+    print(f"{label} from t = {time[0]:.2f} to {time[-1]:.2f} s")
+    print_spectrum(result, name, unit)
+    if arguments.out:
+        save_spectrum(result, arguments.out, name, unit)
+    return 0
+
+
+def command_spectrum_selftest(arguments):
+    """Synthetic lifelines with a known variance split: sinusoids below and above f_split with random phases plus
+    white noise (flat spectrum, so a known fraction f_split / f_Nyquist of its variance lies below the split) and a
+    per-lifeline offset (must be removed). Pass: Welch split and moving-average cross-check within 3 % of exact."""
+    rng = np.random.default_rng(arguments.seed)
+    interval, n, count = 0.03, 2000, 200
+    time = np.arange(n) * interval
+    low_tones = ((0.2, 1.0), (0.7, 0.6), (1.5, 0.4))            # (f Hz, amplitude), all below 1 / 0.36 = 2.78 Hz
+    high_tones = ((4.5, 0.5), (8.0, 0.3), (12.0, 0.2))          # above the split, below f_Nyquist = 16.7 Hz
+    sigma = 0.5
+    signal = np.zeros((n, count))
+    for f, amplitude in low_tones + high_tones:
+        signal += amplitude * np.sin(2 * np.pi * f * time[:, None] + rng.uniform(0, 2 * np.pi, (1, count)))
+    signal += sigma * rng.standard_normal((n, count)) + rng.uniform(-1, 1, (1, count))   # noise + per-lifeline offset
+    split_period = 0.36
+    f_split, f_nyquist = 1 / split_period, 0.5 / interval
+    exact_low = sum(a * a / 2 for _, a in low_tones) + sigma ** 2 * f_split / f_nyquist
+    exact_high = sum(a * a / 2 for _, a in high_tones) + sigma ** 2 * (1 - f_split / f_nyquist)
+    window = round(split_period / interval)
+    exact_smooth = (sum(a * a / 2 * moving_average_gain(f, window, interval) for f, a in low_tones + high_tones)
+                    + sigma ** 2 / window)
+    result = lifeline_spectrum(signal, interval, 10.0, split_period)
+    print_spectrum(result, "synthetic", "-")
+    failures = 0
+    for name, got, exact in (("low-frequency variance", result["var_low_total"], exact_low),
+                             ("low-frequency variance, Welch bins only", result["var_low"], exact_low),
+                             ("high-frequency variance", result["var_high"], exact_high),
+                             ("total variance (Welch integral)", result["var_welch"], exact_low + exact_high),
+                             ("moving-average variance, direct", result["var_smooth"], exact_smooth),
+                             ("moving-average variance, from spectrum", result["var_smooth_predicted"], exact_smooth)):
+        error = abs(got / exact - 1)
+        ok = error < 0.03
+        failures += not ok
+        print(f"  {name}: got {got:.4f}, exact {exact:.4f}, error {100 * error:.2f} % -> {'ok' if ok else 'FAIL'}")
+    if arguments.out:
+        save_spectrum(result, arguments.out, "synthetic", "-")
+    print("spectrum selftest:", "PASS" if failures == 0 else f"FAIL ({failures})")
+    return 0 if failures == 0 else 1
+
+
+def command_spectrum_plot(arguments):
+    """Overlay the spectra of several PREFIX.npz files (from `spectrum --out`) in one figure and print the variance
+    split table (markdown)."""
+    results, labels, rows = [], [], []
+    for index, path in enumerate(arguments.npz):
+        with np.load(path, allow_pickle=False) as file:
+            result = {key: file[key] for key in file.files}
+        for key in ("var_welch", "var_low", "var_low_total", "var_high", "var_time", "var_smooth", "var_residual", "var_smooth_predicted",
+                    "f_split", "split_period", "interval", "nperseg", "window", "count", "records"):
+            result[key] = float(result[key])
+        label = arguments.labels[index] if arguments.labels and index < len(arguments.labels) else str(result["label"])
+        results.append(result); labels.append(label)
+        total = result["var_time"]
+        rows.append(f"| {label} | {result['var_time']:.3e} | {result['var_low_total']:.3e} ({100 * result['var_low_total'] / total:.1f} %) | "
+                    f"{result['var_high']:.3e} ({100 * result['var_high'] / total:.1f} %) | {result['var_smooth']:.3e} "
+                    f"({100 * result['var_smooth'] / result['var_time']:.1f} %) | {result['var_residual']:.3e} |")
+    unit = str(results[0]["unit"])
+    print(f"| case | variance ({unit})^2 | f < {results[0]['f_split']:.2f} Hz | f > {results[0]['f_split']:.2f} Hz | "
+          f"{results[0]['split_period']} s moving average | residual |")
+    print("|---|---|---|---|---|---|")
+    print("\n".join(rows))
+    if arguments.bands:
+        edges = [0.0] + sorted(arguments.bands) + [np.inf]
+        print(f"\nvariance per band, % of the time-domain variance (Welch bins; the drift slower than the segment is in the first band)")
+        print("| case | " + " | ".join(f"{lo:g}-{hi:g} Hz" if np.isfinite(hi) else f"> {lo:g} Hz" for lo, hi in zip(edges[:-1], edges[1:])) + " |")
+        print("|---|" + "---|" * (len(edges) - 1))
+        for result, label in zip(results, labels):
+            frequency, psd = result["frequency"], result["psd"]
+            df = float(frequency[1] - frequency[0])
+            parts = []
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                select = (frequency >= lo) & (frequency < hi)
+                value = float(psd[select].sum() * df)
+                if lo == 0.0:
+                    value += result["var_time"] - result["var_welch"]
+                parts.append(f"{100 * value / result['var_time']:.2f}")
+            print(f"| {label} | " + " | ".join(parts) + " |")
+    plot_spectra(results, labels, arguments.out, unit, arguments.title)
+    print(f"wrote {arguments.out}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -574,9 +806,23 @@ def main():
     p.add_argument("--cell", type=float, default=0.012, help="bin size of the mean field, m")
     p.add_argument("--min-samples", type=int, default=20); p.add_argument("--out", default=None)
     p.add_argument("--monod", type=float, nargs=2, default=(1.0, 9.8e-6), metavar=("QMAX", "KS"))
+    p = sub.add_parser("spectrum", help="averaged Welch spectrum of C_s (or q/q_max with --monod) and the variance split at 1/--split-period")
+    p.add_argument("dir"); p.add_argument("--field", default="substrate"); p.add_argument("--start", type=float, default=0.0)
+    p.add_argument("--monod", type=float, nargs=2, default=None, metavar=("QMAX", "KS"), help="analyse q/q_max = C/(C+KS) instead of C")
+    p.add_argument("--split-period", type=float, default=0.36, help="s; the moving average of the regime analysis")
+    p.add_argument("--segment", type=float, default=10.0, help="minimum Welch segment length, s")
+    p.add_argument("--max-lifelines", type=int, default=0); p.add_argument("--label", default=None)
+    p.add_argument("--out", default=None, help="prefix of the .npz / .json / .png written")
+    p = sub.add_parser("spectrum-selftest"); p.add_argument("--seed", type=int, default=1); p.add_argument("--out", default=None)
+    p = sub.add_parser("spectrum-plot", help="overlay several spectrum .npz files and print the variance table")
+    p.add_argument("npz", nargs="+"); p.add_argument("--labels", nargs="*", default=None); p.add_argument("--title", default=None)
+    p.add_argument("--bands", type=float, nargs="*", default=None, help="band edges in Hz for a variance-per-band table")
+    p.add_argument("--out", required=True)
     arguments = parser.parse_args()
     return {"integrity": command_integrity, "passive": command_passive, "tracer": command_tracer,
-            "regime": command_regime, "selftest": command_selftest, "frozen": command_frozen}[arguments.command](arguments)
+            "regime": command_regime, "selftest": command_selftest, "frozen": command_frozen,
+            "spectrum": command_spectrum, "spectrum-selftest": command_spectrum_selftest,
+            "spectrum-plot": command_spectrum_plot}[arguments.command](arguments)
 
 
 if __name__ == "__main__":
