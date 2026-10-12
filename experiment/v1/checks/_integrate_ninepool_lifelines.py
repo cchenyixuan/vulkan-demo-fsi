@@ -16,7 +16,13 @@ same equations with the same C_s; the difference is the time-stepping (GPU dt ~1
 
 usage:
     python experiment/v1/checks/_integrate_ninepool_lifelines.py DIR --out OUT.npz [--init-from-record] [--check]
-        [--step 0.01] [--paa 2.3e-3] [--init gly=20,aa=928,...] [--param qE11max=1.65e-2,...]
+        [--step 0.01] [--paa 2.3e-3] [--init gly=20,aa=928,...] [--param qE11max=1.65e-2,...] [--freeze-e11]
+
+--freeze-e11 (2026-10-13): keep X_E11 at its initial value (dX_E11/dt = 0) in every integration (lifelines, stitching,
+pre-feed phase, reference cell); the other pools evolve as usual. This is Haringa et al. 2018's one-way definition:
+the uptake capacity q_s,max = k_E11 X_E11 is fixed (the one used by the GPU's Monod sink), only the metabolic pools
+respond. Without it X_E11 relaxes with mu (its time constant is ~1/(mu + k_d,E11) ~ 25 h) and after 80 h the pools
+carry an uptake capacity ~18 % below the one the flow field used, which is internally inconsistent.
 """
 import argparse
 import pathlib
@@ -66,8 +72,11 @@ def step(state, cs, cpaa, p, dt_h):
     new["aa"] = aa + scale * (v12 - 0.5 * v13 - 6.25 * v33) - mu_dt * aa
     new["sto"] = sto + scale * (v41 - v42) - mu_dt * sto
     new["paa"] = paa + scale * (v31 - v32 - v33) - mu_dt * paa
-    r11 = ((mu + p["mu0"]) / p["k11"]) ** 5
-    new["e11"] = e11 + p["qE11max"] * r11 / (1.0 + r11) * dt_h - (mu_dt + p["kdE11"] * dt_h) * e11
+    if p.get("freeze_e11", False):
+        new["e11"] = state["e11"]          # --freeze-e11: fixed uptake capacity (Haringa 2018 one-way), dE11/dt = 0
+    else:
+        r11 = ((mu + p["mu0"]) / p["k11"]) ** 5
+        new["e11"] = e11 + p["qE11max"] * r11 / (1.0 + r11) * dt_h - (mu_dt + p["kdE11"] * dt_h) * e11
     new["e32"] = e32 + (p["alpha32"] + p["beta32"] * mu) * dt_h - (p["kdE32"] * dt_h + mu_dt) * e32
     new["e4"] = e4 + (p["alpha4"] + p["beta4"] * mu) * dt_h - (p["kdE4"] * dt_h + mu_dt) * e4
     new["v33"] = v33 + p["beta33"] * mu / (1.0 + (gly / p["Kgly33"]) ** p["m33"]) * dt_h - (p["kdE33"] * dt_h + mu_dt) * v33
@@ -125,7 +134,8 @@ def stitch(time, cs, cpaa, initial, p, hours, count, segment_seconds, seed, step
     print(f"stitching {count} cells x {hours:g} h from {n_lifelines} lifelines of {n_records} records ({interval:.4f} s): "
           f"segments of {seg} records, Euler step {interval / sub:.4f} s, {total_records:,} records in total; "
           f"reference cell at the constant C_s of equal mean saturation {cs_mean[0]:.3e} mol/kg "
-          f"(mean saturation {saturation:.3f}; the arithmetic mean C_s is {np.nanmean(cs):.3e})")
+          f"(mean saturation {saturation:.3f}; the arithmetic mean C_s is {np.nanmean(cs):.3e})"
+          + ("; X_E11 frozen at %.4g" % float(np.mean(initial["e11"])) if p.get("freeze_e11", False) else ""))
     done = 0
     mu = qp = atp = np.zeros(count)
     next_report = report_every
@@ -165,7 +175,8 @@ def stitch(time, cs, cpaa, initial, p, hours, count, segment_seconds, seed, step
              ["ref_gly", "ref_mu", "ref_qp", "ref_e11"]
     np.savez_compressed(out_path, table=np.array(rows), header=np.array(header),
                         **{f"final_{key}": state[key] for key in STATE}, final_mu=mu, final_qp=qp, final_atp=atp,
-                        cs_mean=cs_mean, seed=seed, segment_records=seg, interval=interval)
+                        cs_mean=cs_mean, seed=seed, segment_records=seg, interval=interval,
+                        freeze_e11=bool(p.get("freeze_e11", False)))
     print(f"wrote {out_path}")
 
 
@@ -198,6 +209,9 @@ def main():
                              "generator's X_gly0, e.g. 24.6) when the integration starts from a non-steady state such as "
                              "the starved pools at the feed start of B1, otherwise k_E11 differs from the GPU case")
     parser.add_argument("--init-from-record", action="store_true", help="start from the recorded pools of the first record")
+    parser.add_argument("--freeze-e11", action="store_true",
+                        help="keep X_E11 at its initial value (dX_E11/dt = 0) in every integration, the other pools evolve: "
+                             "Haringa 2018's one-way definition of a fixed uptake capacity (2026-10-13); default off")
     parser.add_argument("--prefeed-probes", default=None, metavar="PROBES.CSV",
                         help="pre-lifeline phase (2026-10-08): before the first lifeline record the field is uniform (no "
                              "feed yet or a uniform start), so integrate the initial pools along the probe log's mean C_s "
@@ -229,6 +243,11 @@ def main():
     p.update(parse_assignments(arguments.param))
     initial = dict(INITIAL, xbio=arguments.xbio)
     initial.update(parse_assignments(arguments.init))
+    if arguments.freeze_e11:
+        p["freeze_e11"] = True
+        e11_0 = float(np.mean(initial["e11"]))      # mean when --init-from-record gives one value per lifeline
+        print(f"X_E11 frozen at its initial value {e11_0:.4g} (dX_E11/dt = 0): fixed uptake capacity "
+              f"q_s,max = k_E11 X_E11 = {p['kE11'] * e11_0 * 1e6 / p['Mw']:.0f} umol/gdw/h")
     if arguments.ki is not None:
         reference = float(initial["gly"]) if arguments.ki_reference_gly is None else arguments.ki_reference_gly
         p["Ki11"] = arguments.ki
