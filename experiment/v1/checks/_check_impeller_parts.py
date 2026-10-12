@@ -21,6 +21,10 @@ Options of 2026-10-04 (PBT study, log/2026-10-04_fluctuation-scales-and-pbt-band
                          (r < 12 mm, 170 < y < 215 mm) and "shaft (lattice)";
   --out PREFIX           window means of every part as PREFIX_parts.json;
   --dump-times T ...     dumps PREFIX_tT.npz in the format of _check_tank_energy.py (needs --out).
+  --reaction-times T ... (2026-10-13, log/2026-10-13_blade-pressure-profiles.md) saves the raw thin-plate reaction
+                         records PREFIX_reactions_tT.npz (position, force, plate in case.thin_plates order, rotor_angle,
+                         time, step, mass_factor) for _analyze_blade_pressure_profiles.py (needs --out). A time given
+                         to both options gives the dump and the records of the same step.
 
 usage (repo root, solver environment):
     python experiment/v1/checks/_check_impeller_parts.py CASE_DIR --time 4 --every 200 \
@@ -134,9 +138,10 @@ def main():
     parser.add_argument("--pbt-bands", type=float, nargs="+", default=None)
     parser.add_argument("--out", default=None)
     parser.add_argument("--dump-times", type=float, nargs="*", default=[])
+    parser.add_argument("--reaction-times", type=float, nargs="*", default=[])
     arguments = parser.parse_args()
-    if arguments.dump_times and not arguments.out:
-        parser.error("--dump-times needs --out")
+    if (arguments.dump_times or arguments.reaction_times) and not arguments.out:
+        parser.error("--dump-times / --reaction-times need --out")
 
     from utils.sph.case import load_case
     from utils.sph.vulkan_context import VulkanContext
@@ -150,6 +155,7 @@ def main():
     rotor_groups = np.asarray([m.group_id for m in case.materials if m.kind == 3], dtype=np.uint32)
     samples = []
     dump_times = sorted(arguments.dump_times)
+    reaction_times = sorted(arguments.reaction_times)
     out = pathlib.Path(arguments.out) if arguments.out else None
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -168,6 +174,13 @@ def main():
                              particle_uid=simulator.readback_particle_uid(),
                              status=json.dumps(simulator.readback_global_status()),
                              density_pressure=simulator.readback_density_pressure())
+                if reaction_times and simulator.simulation_time >= reaction_times[0]:
+                    reactions = simulator.readback_thin_plate_reactions()
+                    np.savez(out.parent / f"{out.name}_reactions_t{reaction_times.pop(0):.3f}.npz",
+                             position=reactions["position"], force=reactions["force"], plate=reactions["plate"],
+                             rotor_angle=float(simulator.rotor_angle), time=float(simulator.simulation_time),
+                             step=int(simulator.step_count),
+                             mass_factor=float(simulator.readback_rotor_torque(0.1, 0.007)["mass_factor"]))
                 if simulator.step_count % arguments.every or simulator.simulation_time < windows[0][0]:
                     continue
                 simulator.begin_readback_cache()
