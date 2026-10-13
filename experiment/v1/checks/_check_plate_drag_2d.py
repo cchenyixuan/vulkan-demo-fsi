@@ -137,7 +137,9 @@ def build_case(directory, arguments, plate_cells):
         "rotor": {"axis": [0.0, 0.0, 1.0], "pivot": [-radius, 0.0, 0.0], "ramp_time": arguments.ramp * arguments.plate_length / speed},
         "thin_plates": [{"name": "paddle", "shape": "rectangle", "frame": "rotor",
                          "centre": [0.0, 0.0, 0.0], "normal": [0.0, 1.0, 0.0], "axis_a": [1.0, 0.0, 0.0],
-                         "extent": [float(half_a_sites * dx), float(dx)],
+                         # outline of the pair cut-off: the particle line plus --edge-extension * h beyond each free
+                         # edge (0 = the geometric plate, the production treatment)
+                         "extent": [float(half_a_sites * dx + arguments.edge_extension * hdx * dx), float(dx)],
                          "thickness": float(arguments.thickness_ratio * arguments.plate_length),
                          "point_measure": float(dx)}],
     }
@@ -246,6 +248,8 @@ def main():
     parser.add_argument("--ramp", type=float, default=0.05, help="spin-up time in units of L / U")
     parser.add_argument("--t-end", type=float, default=3.0, help="end time t* = t U / L")
     parser.add_argument("--report-interval", type=float, default=0.02, help="in units of L / U")
+    parser.add_argument("--edge-extension", type=float, default=0.0,
+                        help="extend the cut-off outline beyond the free edges by this many h (edge treatment test)")
     parser.add_argument("--pst-main", type=float, default=0.1)
     parser.add_argument("--no-pst", action="store_true")
     parser.add_argument("--name-suffix", default="")
