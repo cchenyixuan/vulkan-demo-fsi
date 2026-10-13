@@ -26,6 +26,14 @@ kinetic energy (total and without the periodic blade-passage part) and dissipati
 
 The accumulators are written to `out_path` (.npz) every `flush_every` samples and at the end;
 every flush also keeps a copy <stem>_sNNNNN.npz (NNNNN = samples so far) to judge convergence.
+
+Point time series (2026-10-14, Haringa et al. 2018 mid-plane LDA): an optional `series` list in the
+configuration (entries like the sets: name, points, extra metadata) records, at every sample, the
+Shepard-interpolated velocity (cylindrical components, the same kernel and radius as the sets) at the
+points of each entry, kept in memory and written at every flush and at the end to <stem>_series.npz:
+`time` (samples), `rotor_angle` (samples), `<name>/velocity` (samples, points, 3) float32 and
+`<name>/points`, plus the json `meta` (sample interval, metadata of the entries). Without `series`
+nothing changes (analysis: experiment/v1/checks/_analyze_point_series.py).
 """
 
 from __future__ import annotations
@@ -188,6 +196,55 @@ class PointSet:
         return result
 
 
+def cylindrical_basis(points):
+    """Rows of the cylindrical basis (e_r, e_theta, e_y) at each point, azimuth from +x toward +z."""
+    azimuth = np.arctan2(points[:, 2], points[:, 0])
+    basis = np.zeros((points.shape[0], 3, 3))
+    basis[:, 0, 0], basis[:, 0, 2] = np.cos(azimuth), np.sin(azimuth)
+    basis[:, 1, 0], basis[:, 1, 2] = -np.sin(azimuth), np.cos(azimuth)
+    basis[:, 2, 1] = 1.0
+    return basis
+
+
+def shepard_velocity(points, basis, positions, velocity, radius):
+    """Shepard-interpolated velocity at the points in the cylindrical components of `basis`
+    (the interpolation of PointSet.accumulate); NaN where no particle lies within `radius`."""
+    point, particle = pairs_within(points, positions, radius)
+    count = points.shape[0]
+    offset = positions[particle] - points[point]
+    distance = np.sqrt(np.einsum("ij,ij->i", offset, offset))
+    weight = wendland_c4(np.minimum(distance / radius, 1.0))
+    weight_sum = np.bincount(point, weights=weight, minlength=count)
+    valid = weight_sum > 0.0
+    mean = np.full((count, 3), np.nan)
+    for component in range(3):
+        summed = np.bincount(point, weights=weight * velocity[particle, component], minlength=count)
+        mean[valid, component] = summed[valid] / weight_sum[valid]
+    return np.einsum("pij,pj->pi", basis, mean)
+
+
+class PointSeries:
+    """Velocity time series at the points of one `series` entry (2026-10-14)."""
+
+    def __init__(self, entry):
+        self.name = entry["name"]
+        self.points = np.asarray(entry["points"], dtype=np.float64)
+        self.extra = {key: value for key, value in entry.items() if key not in ("name", "points")}
+        self.basis = cylindrical_basis(self.points)
+        self.records = []
+
+    def bounds(self, margin):
+        return self.points.min(axis=0) - margin, self.points.max(axis=0) + margin
+
+    def record(self, positions, velocity, radius):
+        self.records.append(shepard_velocity(self.points, self.basis, positions, velocity, radius).astype(np.float32))
+
+    def arrays(self):
+        velocity = (np.stack(self.records) if self.records
+                    else np.zeros((0, self.points.shape[0], 3), dtype=np.float32))
+        return {self.name + "/points": self.points, self.name + "/velocity": velocity}
+
+
 class FlowStatisticsSampler:
     """Hooks for the headless runner: due(), sample(), close()."""
 
@@ -204,8 +261,12 @@ class FlowStatisticsSampler:
         self.blades = int(config.get("blades", 1))
         self.blade_azimuth0 = math.radians(float(config.get("blade_azimuth0_deg", 0.0)))
         self.sets = [PointSet(entry, int(config.get("phase_bins", 30))) for entry in config["sets"]]
-        lower = np.min([s.bounds(self.radius)[0] for s in self.sets], axis=0)
-        upper = np.max([s.bounds(self.radius)[1] for s in self.sets], axis=0)
+        self.series = [PointSeries(entry) for entry in config.get("series", [])]
+        self.series_time = []
+        self.series_angle = []
+        groups = self.sets + self.series
+        lower = np.min([s.bounds(self.radius)[0] for s in groups], axis=0)
+        upper = np.max([s.bounds(self.radius)[1] for s in groups], axis=0)
         self.box = (lower, upper)
         self.samples = 0
         self.first_time = None
@@ -213,6 +274,13 @@ class FlowStatisticsSampler:
         self.fluid_groups = np.asarray(simulator.fluid_group_ids(), dtype=np.uint32)
         print(f"[flow-statistics] {sum(s.points.shape[0] for s in self.sets):,} points in {len(self.sets)} sets, "
               f"kernel radius {self.radius:.4g} m, every {self.every} steps from t = {self.start_time:g} s -> {self.out_path}")
+        if self.series:
+            print(f"[flow-statistics] time series at {sum(s.points.shape[0] for s in self.series):,} points in "
+                  f"{len(self.series)} series, every {self.every * simulator.case.timestep:.4g} s -> {self.series_path}")
+
+    @property
+    def series_path(self):
+        return self.out_path.with_name(f"{self.out_path.stem}_series.npz")
 
     def due(self) -> bool:
         simulator = self.simulator
@@ -236,6 +304,13 @@ class FlowStatisticsSampler:
             near = np.all((particle_positions >= lower) & (particle_positions <= upper), axis=1)
             point_set.accumulate(particle_positions[near], particle_velocity[near], self.radius,
                                  phase_angle=phase_angle, blades=self.blades)
+        for series in self.series:
+            lower, upper = series.bounds(self.radius)
+            near = np.all((particle_positions >= lower) & (particle_positions <= upper), axis=1)
+            series.record(particle_positions[near], particle_velocity[near], self.radius)
+        if self.series:
+            self.series_time.append(float(simulator.simulation_time))
+            self.series_angle.append(float(simulator.rotor_angle))
         self.samples += 1
         if self.first_time is None:
             self.first_time = float(simulator.simulation_time)
@@ -256,7 +331,22 @@ class FlowStatisticsSampler:
         np.savez(self.out_path, **arrays)
         if keep_copy:
             np.savez(self.out_path.with_name(f"{self.out_path.stem}_s{self.samples:05d}.npz"), **arrays)
+        if self.series:
+            self.flush_series()
+
+    def flush_series(self) -> None:
+        arrays = {"time": np.asarray(self.series_time), "rotor_angle": np.asarray(self.series_angle)}
+        for series in self.series:
+            arrays.update(series.arrays())
+        meta = dict(samples=len(self.series_time), every=self.every, timestep=float(self.simulator.case.timestep),
+                    interval=self.every * float(self.simulator.case.timestep), kernel_radius=self.radius,
+                    blades=self.blades, blade_azimuth0_deg=math.degrees(self.blade_azimuth0),
+                    series=[dict(name=s.name, **s.extra) for s in self.series])
+        arrays["meta"] = np.array(json.dumps(meta))
+        np.savez(self.series_path, **arrays)
 
     def close(self) -> None:
         self.flush(keep_copy=False)
         print(f"[flow-statistics] {self.samples} samples, t = {self.first_time} .. {self.last_time} s -> {self.out_path}")
+        if self.series:
+            print(f"[flow-statistics] time series: {len(self.series_time)} samples -> {self.series_path}")

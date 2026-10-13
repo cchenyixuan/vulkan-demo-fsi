@@ -424,7 +424,13 @@ def main():
                              "time constant (s); the experiment's probes respond in about 1 s")
     parser.add_argument("--mstar", nargs=2, metavar=("PROBE_1", "PROBE_2"),
                         help="analyse one M-Star trial of the dataset instead of our run")
+    parser.add_argument("--probes", nargs=2, default=None, metavar=("BOTTOM", "TOP"),
+                        help="probe names of the log (default probe_1 probe_2 of the 30 L tank; the 2-impeller "
+                             "Rushton tank of _demo_rushton_tank.py --preset jahoda2 has probe_bottom probe_top)")
     arguments = parser.parse_args()
+    if arguments.probes:
+        global PROBE_NAMES
+        PROBE_NAMES = tuple(arguments.probes)
     if arguments.mstar:
         analyze_mstar(arguments.mstar)
         return 0

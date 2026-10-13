@@ -10,6 +10,23 @@ Presets (section 2.2 and 2.3 of the paper):
                 Rushton at C = 0.9 m, upper 6-blade Rushton 3.0 m higher, both D = 1.3 m, shaft
                 0.27 m, four baffles T/10 over the full height, N = 98 rpm. H2: mixing time,
                 H3: lifelines.
+    jahoda2     (2026-10-14) 2-impeller tank of Haringa, Vandewijer and Mudde (2018), Chem. Eng.
+                Res. Des. 136:870, section 3.1 (the CFD geometry, Jahoda et al. 2007): flat bottom,
+                T = 0.29 m, H = 2T, four baffles T/10 over the full height, two 6-blade Rushtons
+                D = T/3, the lower at C = T/3, the upper T higher (4T/3), shaft 20 mm, N = 5 1/s,
+                no-shear top. Measurements (section 3.2, Figure 1; LDA in a T = 0.26 m tank at
+                N = 5.78 1/s, compared in dimensionless form): the outflow of both impellers at
+                r = 50, 60, 70, 77, 90, 102 mm at the disk height in the baffle plane; the
+                mid-compartment plane (y = 5T/6 between the impellers) on 7 radial positions
+                r/R = 0.200, 0.358, 0.435, 0.512, 0.566, 0.694, 0.765 and 11 axial positions
+                y/T = 0, +-0.019, +-0.038, +-0.077, +-0.154, +-0.231 in the baffle plane; the axial
+                exchange flow Q_ax through the mid plane; the mixing time of Jahoda et al. (2007),
+                tracer in a sphere of radius 12.5 mm at 1.9T height, r = T/4 in the baffle plane,
+                probes at T/4 (bottom) and 1.25T (top) between the baffles, T/20 from the wall.
+                --flow-statistics writes the discharge lines and tip cylinders of both impellers,
+                the LDA outflow points, the 7 x 11 mid-plane grid in the four baffle planes and a
+                polar grid of the whole mid plane (Q_ax); --point-series adds the time series of the
+                4 x 77 mid-plane points (experiment/v1/checks/_analyze_point_series.py).
 The paper does not give the impeller details; the standard Rushton proportions are used:
 blade length D/4 (radial D/4 .. D/2), blade height D/5 centred on the disk, disk diameter 3D/4.
 The 1-impeller shaft (not given) is 12 mm. No hub: the disk starts at the shaft.
@@ -62,6 +79,9 @@ experiment/v1/utils/flow_statistics.py).
 Usage (repo root):
     python utils/geometry/_demo_rushton_tank.py --preset jahoda --dx 0.002 --free-slip-lid --flow-statistics
     python utils/geometry/_demo_rushton_tank.py --preset haringa54 --dx 0.025 --free-slip-lid --tracers 8
+    python utils/geometry/_demo_rushton_tank.py --preset jahoda2 --dx 0.003 --free-slip-lid --flow-statistics --point-series
+    python utils/geometry/_demo_rushton_tank.py --preset jahoda2 --dx 0.003 --free-slip-lid --tracers 5 \
+        --injection-start 25 --injection-interval 25 [--probe NAME X Y Z ...]
 """
 
 from __future__ import annotations
@@ -111,6 +131,25 @@ PRESETS = {
         injection=dict(center=(0.8, 7.35, 0.0), radius=0.2),
         probes=(("probe_bottom", (-0.75, 0.25, 0.0)),),
         release_sphere=dict(center=(0.5, 3.0, 0.0), radius=0.1),
+    ),
+    "jahoda2": dict(
+        title="Haringa, Vandewijer and Mudde (2018) 2-impeller tank, geometry of Jahoda et al. (2007)",
+        tank_diameter=0.29, liquid_height=0.58, baffle_count=4, baffle_width=0.029, baffle_azimuth0_deg=0.0,
+        shaft_diameter=0.020, rpm=300.0, ramp_time=0.1,
+        # both impellers with a blade at 15 deg (the relative blade angle of the two turbines is not given)
+        impellers=(dict(name="lower", blades=6, diameter=0.29 / 3.0, center_height=0.29 / 3.0, azimuth0_deg=15.0),
+                   dict(name="upper", blades=6, diameter=0.29 / 3.0, center_height=4.0 * 0.29 / 3.0, azimuth0_deg=15.0)),
+        # section 3.1: tracer sphere of radius 12.5 mm at 0.551 m (1.9T) height, r = 72.5 mm (T/4) in the baffle
+        # plane theta = 0; probes of Jahoda et al. (2007) between the baffles (theta = 45 deg), T/20 from the wall
+        # (r = R - T/20 = 130.5 mm), at T/4 (bottom) and 1.25T (top) from the bottom
+        injection=dict(center=(0.0725, 0.551, 0.0), radius=0.0125),
+        probes=(("probe_bottom", (0.1305 / math.sqrt(2.0), 0.0725, 0.1305 / math.sqrt(2.0))),
+                ("probe_top", (0.1305 / math.sqrt(2.0), 0.3625, 0.1305 / math.sqrt(2.0)))),
+        release_sphere=None,
+        # section 3.2 and Figure 1: LDA points (baffle plane); the mid-compartment plane at 5T/6
+        lda=dict(outflow_radii_mm=(50.0, 60.0, 70.0, 77.0, 90.0, 102.0), midplane_height=5.0 * 0.29 / 6.0,
+                 midplane_r_over_R=(0.200, 0.358, 0.435, 0.512, 0.566, 0.694, 0.765),
+                 midplane_y_over_T=(-0.231, -0.154, -0.077, -0.038, -0.019, 0.0, 0.019, 0.038, 0.077, 0.154, 0.231)),
     ),
 }
 
@@ -215,34 +254,76 @@ def tank_plates(preset, dx, shell, shaft_radius, baffle_extension="all", baffle_
     return plates
 
 
+def baffle_plane_azimuths(preset):
+    """Azimuths (deg) of the baffle planes and of the planes midway between the baffles."""
+    count = preset["baffle_count"]
+    planes = [preset["baffle_azimuth0_deg"] + index * 360.0 / count for index in range(count)]
+    mid = [preset["baffle_azimuth0_deg"] + (index + 0.5) * 360.0 / count for index in range(count)]
+    return planes, mid
+
+
+def midplane_lda_points(preset):
+    """The 7 x 11 LDA grid of Haringa et al. (2018) Figure 1 in every baffle plane: points (planes * 77, 3)
+    and the index arrays (plane, radial, axial) of every point, radial index along `midplane_r_over_R`,
+    axial along `midplane_y_over_T`."""
+    lda = preset["lda"]
+    radius, diameter = 0.5 * preset["tank_diameter"], preset["tank_diameter"]
+    planes, _ = baffle_plane_azimuths(preset)
+    r_values = np.asarray(lda["midplane_r_over_R"]) * radius
+    y_values = lda["midplane_height"] + np.asarray(lda["midplane_y_over_T"]) * diameter
+    points, plane_index, r_index, y_index = [], [], [], []
+    for plane, azimuth in enumerate(planes):
+        e_r, _, _ = radial_frame(azimuth)
+        for radial, r in enumerate(r_values):
+            for axial, y in enumerate(y_values):
+                points.append(r * e_r + np.array([0.0, y, 0.0]))
+                plane_index.append(plane)
+                r_index.append(radial)
+                y_index.append(axial)
+    return np.asarray(points), np.asarray(plane_index), np.asarray(r_index), np.asarray(y_index)
+
+
 def flow_statistics_sets(preset, dx):
-    """Sample points of the flow statistics (experiment/v1/utils/flow_statistics.py) for the
-    1-impeller tank, Haringa (2023) Figure 1: the impeller discharge at y = C on the four lines
-    midway between the baffles, from the blade tip r_tip to the wall R, at (r - r_tip) / (R - r_tip)
-    = 0, 0.025, ..., 1 (blade-phase resolved, with velocity gradients); a cylinder just outside the
-    blade tips over twice the blade height (pumping number); two r-y planes midway between the
-    baffles at spacing 2 dx (mean flow pattern)."""
+    """Sample points of the flow statistics (experiment/v1/utils/flow_statistics.py), per impeller
+    (Haringa 2023 Figure 1): the impeller discharge at y = C on the four lines midway between the
+    baffles, from the blade tip r_tip to the wall R, at (r - r_tip) / (R - r_tip) = 0, 0.025, ..., 1
+    (blade-phase resolved, with velocity gradients); a cylinder just outside the blade tips over twice
+    the blade height (pumping number); two r-y planes midway between the baffles at spacing 2 dx (mean
+    flow pattern). With one impeller the set names are discharge_<azimuth>, tip_cylinder, plane_<azimuth>
+    (H1); with several, discharge_<impeller>_<azimuth> and tip_cylinder_<impeller>, and every set carries
+    its `impeller`. Presets with an `lda` entry (jahoda2, Haringa et al. 2018 section 3.2) add, in every
+    baffle plane: the outflow points lda_outflow_<impeller>_<azimuth> at the disk height (phase resolved),
+    the 7 x 11 mid-plane grid midplane_<azimuth> (mean and second moments), and one polar grid
+    midplane_disk over the whole mid plane (rings 2 dx apart, about 2 dx along the ring, Q_ax)."""
     radius, top = 0.5 * preset["tank_diameter"], preset["liquid_height"]
-    impeller = preset["impellers"][0]
-    size = rushton_dimensions(impeller)
-    height = impeller["center_height"]
-    mid_baffle = [preset["baffle_azimuth0_deg"] + (index + 0.5) * 360.0 / preset["baffle_count"]
-                  for index in range(preset["baffle_count"])]
+    baffle_planes, mid_baffle = baffle_plane_azimuths(preset)
+    several = len(preset["impellers"]) > 1
     sets = []
     fraction = np.linspace(0.0, 1.0, 41)
-    for azimuth in mid_baffle:
-        e_r, _, _ = radial_frame(azimuth)
-        r = size["tip_radius"] + fraction * (radius - size["tip_radius"])
-        points = r[:, None] * e_r + np.array([0.0, height, 0.0])
-        sets.append(dict(name=f"discharge_{azimuth:05.1f}", points=points.tolist(), gradient=True, phase=True,
-                         coordinate=fraction.tolist(), coordinate_name="(r - r_tip) / (R - r_tip)"))
-    heights = height + np.arange(-size["blade_height"], size["blade_height"] + 0.5 * dx, 0.5 * dx)
-    azimuths = np.arange(72) * 5.0
-    tip = size["tip_radius"] + dx
-    points = np.array([[tip * math.cos(math.radians(a)), y, tip * math.sin(math.radians(a))]
-                       for y in heights for a in azimuths])
-    sets.append(dict(name="tip_cylinder", points=points.tolist(), gradient=False, phase=False,
-                     radius=tip, heights=heights.tolist(), azimuths_deg=azimuths.tolist()))
+    for impeller in preset["impellers"]:
+        size = rushton_dimensions(impeller)
+        height = impeller["center_height"]
+        suffix = f"_{impeller['name']}" if several else ""
+        owner = dict(impeller=impeller["name"]) if several else {}
+        for azimuth in mid_baffle:
+            e_r, _, _ = radial_frame(azimuth)
+            r = size["tip_radius"] + fraction * (radius - size["tip_radius"])
+            points = r[:, None] * e_r + np.array([0.0, height, 0.0])
+            sets.append(dict(name=f"discharge{suffix}_{azimuth:05.1f}", points=points.tolist(), gradient=True,
+                             phase=True, coordinate=fraction.tolist(), coordinate_name="(r - r_tip) / (R - r_tip)",
+                             **owner))
+    for impeller in preset["impellers"]:
+        size = rushton_dimensions(impeller)
+        height = impeller["center_height"]
+        suffix = f"_{impeller['name']}" if several else ""
+        owner = dict(impeller=impeller["name"]) if several else {}
+        heights = height + np.arange(-size["blade_height"], size["blade_height"] + 0.5 * dx, 0.5 * dx)
+        azimuths = np.arange(72) * 5.0
+        tip = size["tip_radius"] + dx
+        points = np.array([[tip * math.cos(math.radians(a)), y, tip * math.sin(math.radians(a))]
+                           for y in heights for a in azimuths])
+        sets.append(dict(name=f"tip_cylinder{suffix}", points=points.tolist(), gradient=False, phase=False,
+                         radius=tip, heights=heights.tolist(), azimuths_deg=azimuths.tolist(), **owner))
     spacing = 2.0 * dx
     r_values = np.arange(0.5 * spacing, radius, spacing)
     y_values = np.arange(0.5 * spacing, top, spacing)
@@ -253,7 +334,53 @@ def flow_statistics_sets(preset, dx):
                                                                 np.zeros(grid_y.size)])
         sets.append(dict(name=f"plane_{azimuth:05.1f}", points=points.tolist(), gradient=False, phase=False,
                          r_values=r_values.tolist(), y_values=y_values.tolist()))
+    lda = preset.get("lda")
+    if lda is None:
+        return sets
+    # LDA outflow points of both impellers, baffle planes (Haringa et al. 2018 section 3.2, Figure 2)
+    outflow_radii = np.asarray(lda["outflow_radii_mm"]) * 1e-3
+    for impeller in preset["impellers"]:
+        height = impeller["center_height"]
+        for azimuth in baffle_planes:
+            e_r, _, _ = radial_frame(azimuth)
+            points = outflow_radii[:, None] * e_r + np.array([0.0, height, 0.0])
+            sets.append(dict(name=f"lda_outflow_{impeller['name']}_{azimuth:05.1f}", points=points.tolist(),
+                             gradient=False, phase=True, radii=outflow_radii.tolist(), impeller=impeller["name"]))
+    # the 7 x 11 mid-plane grid in every baffle plane (Figure 1)
+    points, plane_index, r_index, y_index = midplane_lda_points(preset)
+    for plane, azimuth in enumerate(baffle_planes):
+        chosen = plane_index == plane
+        sets.append(dict(name=f"midplane_{azimuth:05.1f}", points=points[chosen].tolist(), gradient=False, phase=False,
+                         r_over_R=list(lda["midplane_r_over_R"]), y_over_T=list(lda["midplane_y_over_T"]),
+                         r_index=r_index[chosen].tolist(), y_index=y_index[chosen].tolist(),
+                         midplane_height=lda["midplane_height"]))
+    # polar grid over the whole mid plane for the axial exchange flow Q_ax: rings dr = 2 dx apart from the
+    # shaft to the wall, about 2 dx along each ring; area of a point r dr dtheta
+    ring_width = 2.0 * dx
+    shaft_radius = 0.5 * preset["shaft_diameter"]
+    ring_radii = np.arange(shaft_radius + 0.5 * ring_width, radius, ring_width)
+    ring_counts = [max(8, int(round(2.0 * math.pi * r / ring_width))) for r in ring_radii]
+    points = []
+    for r, count in zip(ring_radii, ring_counts):
+        angle = np.arange(count) * (2.0 * math.pi / count)
+        points.append(np.column_stack([r * np.cos(angle), np.full(count, lda["midplane_height"]), r * np.sin(angle)]))
+    sets.append(dict(name="midplane_disk", points=np.vstack(points).tolist(), gradient=False, phase=False,
+                     ring_radii=ring_radii.tolist(), ring_counts=ring_counts, ring_width=ring_width,
+                     midplane_height=lda["midplane_height"]))
     return sets
+
+
+def point_series_sets(preset):
+    """Points of the velocity time series (--point-series, FlowStatisticsSampler `series`): the 7 x 11 LDA
+    grid of the mid plane in every baffle plane (4 x 77 points), with the plane / radial / axial index of
+    every point."""
+    lda = preset["lda"]
+    baffle_planes, _ = baffle_plane_azimuths(preset)
+    points, plane_index, r_index, y_index = midplane_lda_points(preset)
+    return [dict(name="lda_midplane", points=points.tolist(), azimuths_deg=list(baffle_planes),
+                 r_over_R=list(lda["midplane_r_over_R"]), y_over_T=list(lda["midplane_y_over_T"]),
+                 plane_index=plane_index.tolist(), r_index=r_index.tolist(), y_index=y_index.tolist(),
+                 midplane_height=lda["midplane_height"])]
 
 
 CASE_YAML = """\
@@ -464,7 +591,13 @@ def main() -> int:
     parser.add_argument("--max-incoming", type=int, default=32)
     parser.add_argument("--ramp-time", type=float, default=None, help="rotor spin-up time (s, preset default)")
     parser.add_argument("--flow-statistics", action="store_true",
-                        help="write flow_statistics.json (jahoda: discharge lines, tip cylinder, planes)")
+                        help="write flow_statistics.json (discharge lines, tip cylinder and planes per impeller; "
+                             "jahoda2 adds the LDA outflow points, the mid-plane grid and the mid-plane disk)")
+    parser.add_argument("--point-series", action="store_true",
+                        help="with --flow-statistics (jahoda2): velocity time series at the 4 x 77 mid-plane LDA "
+                             "points (every flow-statistics sample, _analyze_point_series.py)")
+    parser.add_argument("--probe", action="append", nargs=4, default=None, metavar=("NAME", "X", "Y", "Z"),
+                        help="scalar probe point (repeatable); replaces the preset's probes")
     parser.add_argument("--tracers", type=int, default=0, help="tracer pulses in the injection sphere")
     parser.add_argument("--injection-start", type=float, default=60.0, help="first pulse (s, the paper: 60)")
     parser.add_argument("--injection-interval", type=float, default=6.0, help="time between pulses (s)")
@@ -532,6 +665,10 @@ def main() -> int:
         preset["baffle_count"] = args.baffle_count
     if args.baffle_width is not None:
         preset["baffle_width"] = args.baffle_width
+    if args.probe:
+        preset["probes"] = [(name, (float(x), float(y), float(z))) for name, x, y, z in args.probe]
+    if args.point_series and not (args.flow_statistics and preset.get("lda")):
+        parser.error("--point-series needs --flow-statistics and a preset with LDA points (jahoda2)")
     dx, h = args.dx, args.hdx * args.dx
     border = args.border if args.border is not None else int(math.ceil(args.hdx))
     shell = border * dx
@@ -733,17 +870,27 @@ def main() -> int:
                 injection=preset["injection"], probes=[dict(name=name, position=list(position))
                                                        for name, position in preset["probes"]],
                 release_sphere=preset["release_sphere"], fluid_particles=n_fluid, volume=volume)
+    if preset.get("lda") is not None:
+        tank["lda"] = preset["lda"]
     (out / "tank.json").write_text(json.dumps(tank, indent=1), encoding="utf-8")
     if args.flow_statistics:
-        if len(preset["impellers"]) != 1:
-            parser.error("--flow-statistics is defined for the 1-impeller tank")
+        # the blade phase of the sampler is one angle for all sets: the impellers must share blade count and
+        # blade azimuth (both Rushtons of jahoda2 do; haringa54 has 8 and 6 blades)
         impeller = preset["impellers"][0]
+        if any(other["blades"] != impeller["blades"] or other["azimuth0_deg"] != impeller["azimuth0_deg"]
+               for other in preset["impellers"][1:]):
+            parser.error("--flow-statistics: the impellers must have the same blade count and blade azimuth "
+                         "(one blade phase for all sets)")
         statistics = dict(kernel_radius=2.0 * dx, axis=[0.0, 1.0, 0.0], pivot=[0.0, 0.0, 0.0],
                           blades=impeller["blades"], blade_azimuth0_deg=impeller["azimuth0_deg"], phase_bins=30,
                           viscosity=args.viscosity, sets=flow_statistics_sets(preset, dx))
+        if args.point_series:
+            statistics["series"] = point_series_sets(preset)
         (out / "flow_statistics.json").write_text(json.dumps(statistics), encoding="utf-8")
         print(f"flow statistics: {sum(len(s['points']) for s in statistics['sets']):,} points in "
-              f"{len(statistics['sets'])} sets")
+              f"{len(statistics['sets'])} sets"
+              + (f"; time series at {sum(len(s['points']) for s in statistics['series']):,} points"
+                 if args.point_series else ""))
     print(f"wrote {out}")
     return 0
 
