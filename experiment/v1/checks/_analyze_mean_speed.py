@@ -31,6 +31,7 @@ import math
 import sys
 
 import numpy as np
+trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")   # numpy 2 removed trapz
 
 REFERENCE = (("M-Star", 0.149463), ("Fluent", 0.156604))
 
@@ -44,7 +45,7 @@ def equivalent_box_width(radius):
     Wendland C4 kernel of support `radius`."""
     q = np.linspace(0.0, 1.0, 20001)
     weight = wendland_c4(q) * q * q                      # radial measure
-    second = np.trapz(weight * q * q, q) / np.trapz(weight, q)     # <r^2> / R^2
+    second = trapezoid(weight * q * q, q) / trapezoid(weight, q)     # <r^2> / R^2
     sigma = radius * math.sqrt(second / 3.0)
     return math.sqrt(12.0) * sigma
 

@@ -47,6 +47,7 @@ import pathlib
 import re
 
 import numpy as np
+trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")   # numpy 2 removed trapz
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import welch
 import matplotlib
@@ -171,7 +172,7 @@ def summarise(results, label):
         bands = {}
         for lo, hi in BANDS:
             mask = (frequency >= lo) & (frequency < hi)
-            bands[f"{lo:g}-{hi:g} Hz"] = float(np.trapz(psd[mask], frequency[mask]))
+            bands[f"{lo:g}-{hi:g} Hz"] = float(trapezoid(psd[mask], frequency[mask]))
         out[probe] = {"n": len(items), "variance_mean": float(variances.mean()), "variance_median": float(np.median(variances)),
                       "variance_std": float(variances.std(ddof=1)) if len(items) > 1 else float("nan"),
                       "variance_first_half": float(np.mean([r["variance_first_half"] for r in items])),

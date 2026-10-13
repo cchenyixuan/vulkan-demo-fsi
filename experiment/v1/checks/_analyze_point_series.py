@@ -47,6 +47,7 @@ import pathlib
 import sys
 
 import numpy as np
+trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")   # numpy 2 removed trapz
 
 COMPONENTS = ("radial", "tangential", "axial")
 FIT_COMPONENTS = ("radial", "axial")
@@ -209,9 +210,9 @@ def analyse_series(time, velocity, meta_entry, speed, tip_speed, args, label, ou
                         frequency, density = welch_spectrum(signal[:, plane], interval, segment)
                         densities.append(density)
                     density = np.mean(densities, axis=0)
-                    total = np.trapz(density[1:], frequency[1:])
+                    total = trapezoid(density[1:], frequency[1:])
                     low = frequency <= f_cut
-                    low_energy = np.trapz(density[low][1:], frequency[low][1:]) if low.sum() > 2 else 0.0
+                    low_energy = trapezoid(density[low][1:], frequency[low][1:]) if low.sum() > 2 else 0.0
                     row[f"P_SI_{component}"] = float(low_energy / total) if total > 0 else float("nan")
                     peak = frequency[1:][np.argmax(density[1:][low[1:]])] if low[1:].any() else float("nan")
                     row[f"f_peak_over_N_{component}"] = float(peak / speed)
