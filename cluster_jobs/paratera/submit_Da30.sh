@@ -11,7 +11,7 @@
 #   Da1k_C / Da1k_E x_bio 55,       feed 2.0e-4,       K_i 24.6 (1 X_ss)   the 54 m3 D low end
 #   Da6_C / Da6_E   x_bio 220,      feed 8.0e-4,       K_i 49.2            Da about 6, close to the 54 m3 value 7
 # B1 reference: C 5.5 h, E 6.2 h on a 5090 at 4 mm 200 s (5,000 lifelines every 0.1 s). Three jobs on
-# gpu_5090/gpu_4090 (default account), three on hp_5090 (-A hp5090); the two partition groups cannot share one -p.
+# gpu_5090/gpu_4090 at first; the user then asked for hp_5090 only (2026-10-14), so all six go there with -A hp5090.
 cd ~/run/sph
 export CODE_DIR=$HOME/run/sph/vulkan-demo-fsi_${CODE_COMMIT:?set CODE_COMMIT, e.g. d27b0e4}
 EXCL="--exclude=wqd10nbj04g3"
@@ -26,7 +26,7 @@ submit() {   # name biomass feed ki mode(own|mean) partition-args...
     if [ "$mode" = mean ]; then GENFLAGS="$GENFLAGS --ninepool-ki-mean"; EXTRA="--population-mean-gly-every 0.05"; fi
     sbatch --export=ALL "$@" $EXCL -c 6 -t 14:00:00 -J $name job_knob_pb.sh $name $ARGS
 }
-G="-p gpu_5090,gpu_4090"; H="-A hp5090 -p hp_5090"
+G="-A hp5090 -p hp_5090"; H="-A hp5090 -p hp_5090"
 submit Da1_C  55  2.0e-4 49.2 own  $G
 submit Da1_E  55  2.0e-4 49.2 mean $H
 submit Da1k_C 55  2.0e-4 24.6 own  $G
