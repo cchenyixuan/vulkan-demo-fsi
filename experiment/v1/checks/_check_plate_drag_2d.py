@@ -127,6 +127,7 @@ def build_case(directory, arguments, plate_cells):
                      "solid_pressure": "accumulate", "solid_reaction_force": True,
                      "density_diffusion_gradient_term": False,
                      "pair_correction": "reverse",
+                     "pst_near_solid": arguments.pst_near_solid,
                      "thin_plate_dashpot": 0.0, "thin_plate_viscosity": True},
         "capacities": {"pool_size": pool, "max_per_voxel": 64, "max_incoming": 32, "workgroup": 128},
         "material_library": "materials.yaml",
@@ -250,6 +251,8 @@ def main():
     parser.add_argument("--report-interval", type=float, default=0.02, help="in units of L / U")
     parser.add_argument("--edge-extension", type=float, default=0.0,
                         help="extend the cut-off outline beyond the free edges by this many h (edge treatment test)")
+    parser.add_argument("--pst-near-solid", default="full", choices=("full", "tangential"),
+                        help="numerics.pst_near_solid: tangential removes the shift component along the solid normal")
     parser.add_argument("--pst-main", type=float, default=0.1)
     parser.add_argument("--no-pst", action="store_true")
     parser.add_argument("--name-suffix", default="")
