@@ -165,3 +165,18 @@ H1 单桨槽 3 mm 的叶尖 U_rad 是 0.65、Po 4.60，与这里的下桨一致�
 - ws8-gpu 不受影响：最后一次开机仍是 10-14 13:34，M3 在目标机 07:41 算到 step 2,464,000（t = 109.5 s），步速 48.5 步/s
   （= (2,464,000 − 995,000) / (07:41:02 − 23:15:54 = 30,308 s)），剩余 910,250 步约 5.2 h，约目标机 12:55 完成，随后 S2 自动开始。
 - `tunnel_ws8.sh` 的日志把退出码总记成 0（`$?` 在 `$(date)` 之后展开），已改为先存退出码；正在运行的守护循环要重启后才用新版。
+
+## 队列调整（2026-10-15 12:26 NZDT，目标机 08:26）：M3 之后先跑 54 m³ 的 E54，J2-S2 排到 E54 之后
+
+用户要求（经主会话转达，用户在本会话确认"按 E54 优先改队列"）：把 Mahuika 上排不到的 54 m³ 算例 E54 搬到 ws8-gpu。M3 不停，算完后接 E54，再接 S2。
+
+| 项目 | 内容 |
+| --- | --- |
+| 原来 | `queue_J2.ps1`（进程 14412）依次 M3、S2 |
+| 改成 | `D:\sph\runs\J2-S2\DONE` 写入内容以 "deferred" 开头的标记，运行中的 J2 队列算完 M3 后跳过 S2 并结束；新队列 `D:\sph\queue_E54.ps1`（WMI 启动，进程 10144）等 J2 队列结束后跑 E54，失败且有检查点时等 10 min 续算（最多 3 次），算完做 `_analyze_lifelines.py integrity`，再删标记、重新运行 `queue_J2.ps1`（跳过 S3、M3，只跑 S2） |
+| E54 参数 | 与 Mahuika 作业 9890106 相同（`cluster_jobs/mahuika/job_54.sh`、`submit_CE54.sh`）：`--preset haringa54 --dx 0.025 --free-slip-lid --sgs --shaft-stop-at-lid --ninepool --biomass 55 --ninepool-initial <D = 0.05 稳态> --feed-rate 0.37 --feed-start 0 --ninepool-ki 49.2 --ninepool-ki-mean`；运行 3,796,000 步（320 s），探针每 5930 步，力矩每 2000 步按 2.4 m、0.14 m 分列，生命线 20,000 条每 1186 步，快照 60、120、180、240、320 s，每小时检查点，`--population-mean-gly-every 0.05`，末态转储；输出全在 `D:\sph\runs\E54\` |
+| 代码 | 已部署的 d47bec0 与 Mahuika 用的 63be0f7 之间只有分析脚本不同（`_analyze_mean_speed`、`_analyze_point_series`、`_compare_probe_fluctuations`、`_plot_da30_scan`、`_reduce_lifelines`），求解器、生成器、运行器、`_analyze_lifelines.py` 相同，不用重新部署 |
+| 生成核对（目标机，15 s） | fluid 3,401,661，total 3,907,706，pool 4,493,952，dt = 8.4325e-05 s；case.yaml 有 `uptake_inhibition: mean` 和 `ninepool: {Ki11: 49.2, kE11: 0.39, glyMean11: 24.6}`；`material_library: materials.yaml` 按 case 目录解析，不用改绝对路径 |
+| 状态脚本 | `D:\sph\lifeline\e54_status.py`（副本 `cluster_jobs/ws8gpu/e54_status.py`）：只读，从 run.log 两次读数算步速，从最新检查点的 `buffer:global_status` 读 alive 和 correction_fallback；在 M3 的检查点上试过（alive 1,647,785，溢出 0） |
+
+M3 预计目标机约 12:50 算完（剩 777,300 步 / 48.5 步/s），E54 随即开始；S2 要等 E54 算完。
