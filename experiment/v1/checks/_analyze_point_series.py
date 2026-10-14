@@ -49,6 +49,28 @@ import sys
 import numpy as np
 trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")   # numpy 2 removed trapz
 
+# Haringa et al. (2018) Tables 5 and 6, LDA in the plane y = 0 (baffle plane), read from the rendered tables
+# (2026-10-15). Velocities in m/s at U_tip = pi D N = pi 0.0867 m 5.78 1/s = 1.574 m/s; u'/U_tip and k/U_tip^2
+# rows are dimensionless; k rows are 1000 k / U_tip^2. kt_fit + kMI_fit = k*; kt_SI + kMI_SI = k* within 1 %.
+REFERENCE_R_OVER_R = (0.200, 0.358, 0.435, 0.512, 0.566, 0.694, 0.765)
+REFERENCE_TABLES = {
+    "u_rad' [m/s]": (0.149, 0.135, 0.127, 0.115, 0.107, 0.091, 0.083),
+    "u_ax' [m/s]": (0.082, 0.098, 0.112, 0.134, 0.154, 0.194, 0.151),
+    "noise eps_rad": (0.015, 0.017, 0.022, 0.032, 0.037, 0.064, 0.317),
+    "noise eps_ax": (0.063, 0.054, 0.045, 0.041, 0.033, 0.027, 0.192),
+    "f1.1,ax/N": (0.020, 0.017, 0.021, 0.020, 0.021, 0.020, 0.020),
+    "f2.1,ax/N": (0.053, 0.062, 0.065, 0.062, 0.062, 0.061, 0.061),
+    "f1.1,rad/N": (0.020, 0.001, 0.015, 0.015, 0.022, 0.017, 0.017),
+    "f2.1,rad/N": (0.049, 0.058, 0.056, 0.053, 0.050, 0.043, 0.062),
+    "1000 kt,fit": (7.73, 7.63, 7.49, 7.54, 8.85, 10.80, 6.17),
+    "1000 kMI,fit": (0.62, 0.41, 0.78, 1.36, 1.23, 2.40, 0.70),
+    "(Ep/Et)rad": (0.409, 0.380, 0.337, 0.267, 0.222, 0.140, 0.029),
+    "(Ep/Et)ax": (0.164, 0.140, 0.200, 0.288, 0.391, 0.546, 0.318),
+    "1000 kt,SI": (5.38, 5.57, 5.91, 6.32, 6.60, 6.77, 4.67),
+    "1000 kMI,SI": (3.04, 2.47, 2.35, 2.58, 3.52, 6.45, 2.22),
+}
+REFERENCE_TIP_SPEED = 1.574
+
 COMPONENTS = ("radial", "tangential", "axial")
 FIT_COMPONENTS = ("radial", "axial")
 
@@ -242,7 +264,11 @@ def analyse_series(time, velocity, meta_entry, speed, tip_speed, args, label, ou
                         spectra_store[radial] = (frequency, density)
                 # energies (1000 k / U_tip^2)
                 scale = 1e3 / tip_speed ** 2
-                noise = {c: row.get(f"epsilon_{c}", float("nan")) for c in FIT_COMPONENTS}
+                # the noise share cannot be negative: a kernel-averaged SPH signal has no white noise, its auto-
+                # correlation starts with zero slope and the exponential of the fit overshoots rho(0) = 1, which gives
+                # a slightly negative epsilon (2026-10-15, J2-S3: -0.09 .. 0); the tables print the fitted value, the
+                # energies use max(epsilon, 0)
+                noise = {c: max(row.get(f"epsilon_{c}", float("nan")), 0.0) for c in FIT_COMPONENTS}
                 row["k_star"] = scale * 0.75 * sum(variances[c] * (1.0 - noise[c]) for c in FIT_COMPONENTS)
                 row["k_raw2"] = scale * 0.75 * sum(variances[c] for c in FIT_COMPONENTS)
                 row["k_raw3"] = scale * 0.5 * sum(variances.values())
@@ -275,9 +301,16 @@ def analyse_series(time, velocity, meta_entry, speed, tip_speed, args, label, ou
             print(f"   {row['r_over_R']:5.3f}   {row['P_SI_radial']:8.3f}   {row['P_SI_axial']:8.3f}     "
                   f"{row['f_peak_over_N_radial']:6.3f}      {row['f_peak_over_N_axial']:6.3f}    {row['k_t_SI']:7.2f}   "
                   f"{row['k_MI_SI']:8.2f}  |   {row['k_raw2']:7.2f}    {row['k_raw3']:7.2f}")
-        print("  reference (LDA, Table 5, N = 5.78 1/s, U_tip 1.574 m/s): u_rad' 0.149 .. 0.083 m/s, u_ax' 0.192 .. 0.055,")
-        print("    f1/N 0.015-0.020, f2/N 0.052-0.061, 1000 k_t,fit/U_tip^2 6.2 .. 10.8, 1000 k_MI,fit 0.4 .. 2.4;")
-        print("    Table 6: (Ep/Et)ax 0.14 .. 0.55, 1000 k_t,SI 4.7 .. 6.8, 1000 k_MI,SI 2.2 .. 6.5")
+        print("  reference: Haringa et al. (2018) LDA at y/T = 0, Tables 5 and 6 (T 0.26 m, N 5.78 1/s, U_tip 1.574 m/s),")
+        print("    columns r/R = " + " ".join(f"{r:.3f}" for r in REFERENCE_R_OVER_R))
+        for key, values in REFERENCE_TABLES.items():
+            print(f"    {key:22s}" + " ".join(f"{value:6.3f}" for value in values))
+        for key in ("u_rad' [m/s]", "u_ax' [m/s]"):
+            print(f"    {key.split()[0] + ' / U_tip':22s}" + " ".join(f"{value / REFERENCE_TIP_SPEED:6.3f}"
+                                                               for value in REFERENCE_TABLES[key])
+                  + "   (ours: column u' / " + f"{tip_speed:.4f})")
+        print("    ours, same columns:    u_rad'/U_tip " + " ".join(f"{row['rms_radial'] / tip_speed:6.3f}" for row in centre))
+        print("                           u_ax'/U_tip  " + " ".join(f"{row['rms_axial'] / tip_speed:6.3f}" for row in centre))
     for key, title in (("k_star", "1000 k* / U_tip^2 (noise removed)"), ("k_t_fit", "1000 k_t,fit / U_tip^2"),
                        ("k_MI_fit", "1000 k_MI,fit / U_tip^2"), ("k_MI_SI", "1000 k_MI,SI / U_tip^2"),
                        ("f_main_over_N_axial", "main f/N of u_ax (fit)")):
