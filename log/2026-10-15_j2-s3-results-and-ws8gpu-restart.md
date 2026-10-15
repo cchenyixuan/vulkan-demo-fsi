@@ -180,3 +180,19 @@ H1 单桨槽 3 mm 的叶尖 U_rad 是 0.65、Po 4.60，与这里的下桨一致�
 | 状态脚本 | `D:\sph\lifeline\e54_status.py`（副本 `cluster_jobs/ws8gpu/e54_status.py`）：只读，从 run.log 两次读数算步速，从最新检查点的 `buffer:global_status` 读 alive 和 correction_fallback；在 M3 的检查点上试过（alive 1,647,785，溢出 0） |
 
 M3 预计目标机约 12:50 算完（剩 777,300 步 / 48.5 步/s），E54 随即开始；S2 要等 E54 算完。
+
+## M3 完成，E54 开始（目标机时间 2026-10-15，比 NZDT 晚 4 h）
+
+| 项目 | 结果 | 定义 |
+| --- | --- | --- |
+| J2-M3 | 12:54:19 完成，exit 0，本次 14.17 h；final step 3,374,250，alive 1,647,785（等于加载数），四个溢出计数 0 | 运行器末行 |
+| E54 开始 | 12:54:31，GPU 按名字选到 [1] RTX 5090；bootstrap alive 3,907,706 | run.log |
+| E54 检查点 | 13:54 step 68,728（t = 5.80 s），14:55 step 136,854（t = 11.54 s），每个 1738 MB、写 13 s；最新检查点的 GlobalStatusBuffer：alive 3,907,706，correction_fallback 0，overflow_inside 0，overflow_incoming 0 | `e54_status.py` 读 `buffer:global_status` |
+| 流体质量 | 前 31 行探针记录全部 6.477611475 × 10⁴ kg，相对变化 0 | 探针 CSV 的 fluid_mass 列 |
+| E54 步速 | 18.86 步/s | (136,854 − 68,728) 步 / (3600 s + 13 s 写检查点)，含生命线、探针、每 0.05 s 的群体平均 X_gly 回读 |
+| E54 预计完成 | 15:37 时在 step 184,000；剩 3,612,000 步 / 18.86 步/s = 53.2 h，约 10-17 20:50（NZDT 10-18 00:50） | |
+| 磁盘 | D: 剩 654 GB，E54 目录 3.6 GB（生命线预计到 2.5 GB，检查点 2 × 1.7 GB） | |
+
+跳板机 12:34 到 19:28（NZDT）又不可达约 7 h，隧道守护按 10 min 间隔重试，19:28 自动恢复；ws8-gpu 本身不受影响（开机时间仍是 10-14 13:34）。
+`e54_status.py` 的步速改为用每小时检查点之间的步数算（原来 2 min 窗口受每 2000 步一行的分辨率限制，给出 31.9 步/s，偏高）。
+J2-S2 在 E54 之后，按约 21 步/s 估 25 到 31 h。
