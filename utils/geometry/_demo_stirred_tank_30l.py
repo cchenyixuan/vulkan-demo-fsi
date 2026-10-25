@@ -907,7 +907,8 @@ def scalars_block(args, h) -> str:
                       f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: {args.growth_yield:.6e}, "
                       f"maintenance_rate: {maintenance:.6e}, demand_margin: {args.demand_margin:.6e}, "
                       f"tau_up: {args.tau_up:.6e}, tau_down: {args.tau_down:.6e}, "
-                      f"product_rate: [{p0:.6e}, {p1:.6e}, {p2:.6e}]}}"]
+                      f"product_rate: [{p0:.6e}, {p1:.6e}, {p2:.6e}]"
+                      + (", state_coupling: mean" if args.state_coupling == "mean" else "") + "}"]
         elif not args.no_uptake:
             lines += ["  reactions:",
                       f"    - {{type: monod, substrate: substrate, biomass: biomass, uptake: uptake, "
@@ -1096,6 +1097,9 @@ def main() -> int:
                              "product, maintenance (needs --substrate and --growth-yield > 0; docs/stage5_pichia_level2_design)")
     parser.add_argument("--maintenance-umol-per-g-h", type=float, default=0.0, help="level 2: maintenance uptake m_s, umol / (g h)")
     parser.add_argument("--demand-margin", type=float, default=0.1, help="level 2: alpha, margin of the demand above mu")
+    parser.add_argument("--state-coupling", choices=("own", "mean"), default="own",
+                        help="level 2 (2026-10-25): the demand follows the particle's own state mu (local two-way) or "
+                             "the population-mean mu the runner writes (--population-mean-state-every)")
     parser.add_argument("--tau-up", type=float, default=60.0, help="level 2: relaxation time of mu upwards, s")
     parser.add_argument("--tau-down", type=float, default=60.0, help="level 2: relaxation time of mu downwards, s")
     parser.add_argument("--product-rate", type=float, nargs=3, default=(0.0, 0.0, 0.0), metavar=("P0", "P1", "P2"),

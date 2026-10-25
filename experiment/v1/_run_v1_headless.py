@@ -135,6 +135,9 @@ def parse_args() -> argparse.Namespace:
                         help="9-pool cases with `uptake_inhibition: mean` (2026-10-08): every T s of flow time write the "
                              "mass-weighted mean X_gly of the fluid particles into the reaction parameter glyMean11 "
                              "(Haringa 2018's population-average coupling)")
+    parser.add_argument("--population-mean-state-every", type=float, default=0.0, metavar="T",
+                        help="state_limited cases with `state_coupling: mean` (2026-10-25): every T s of flow time write the "
+                             "biomass-weighted mean growth-rate state mu of the fluid particles into reaction_parameter[0]")
     # checkpoint / resume (2026-10-08)
     parser.add_argument("--checkpoint-dir", type=str, default=None, metavar="DIR",
                         help="write checkpoints (checkpoint_latest.npz, the previous one kept as "
@@ -249,7 +252,8 @@ def main() -> None:
             steps_at_start = sim.step_count
             sampling = (args.torque_every > 0 or args.probe_every > 0 or bool(args.scalar_snapshot_times)
                         or args.lifeline_dir is not None or args.flow_statistics is not None
-                        or checkpoint_dir is not None or args.population_mean_gly_every > 0)
+                        or checkpoint_dir is not None or args.population_mean_gly_every > 0
+                        or args.population_mean_state_every > 0)
 
             # population-mean X_gly for the uptake-inhibition knob (2026-10-08)
             mean_gly = None
@@ -262,18 +266,31 @@ def main() -> None:
                             "field": case.scalars.field_names.index(reaction.gly), "count": 0}
             elif args.population_mean_gly_every > 0:
                 raise SystemExit("--population-mean-gly-every needs a ninepool case with `uptake_inhibition: mean`")
+            # population-mean state of the state_limited demand (2026-10-25), same mechanism, biomass-weighted
+            if reaction is not None and reaction.type == "state_limited" and reaction.state_coupling == "mean":
+                if args.population_mean_state_every <= 0:
+                    raise SystemExit("this case has `state_coupling: mean`: pass --population-mean-state-every T")
+                mean_gly = {"every": max(1, round(args.population_mean_state_every / case.timestep)), "index": 0,
+                            "field": case.scalars.field_names.index(reaction.growth_rate),
+                            "weight": case.scalars.field_names.index(reaction.biomass), "count": 0, "label": "mu"}
+            elif args.population_mean_state_every > 0:
+                raise SystemExit("--population-mean-state-every needs a state_limited case with `state_coupling: mean`")
 
             def update_mean_gly() -> None:
                 snapshot = sim.scalar_snapshot()
-                value = float(np.dot(snapshot["mass"], snapshot["scalars"][:, mean_gly["field"]]) / snapshot["mass"].sum())
+                weight = snapshot["mass"]
+                if "weight" in mean_gly:                       # state_limited: biomass-weighted
+                    weight = weight * np.maximum(snapshot["scalars"][:, mean_gly["weight"]], 0.0)
+                value = float(np.dot(weight, snapshot["scalars"][:, mean_gly["field"]]) / max(float(weight.sum()), 1.0e-300))
                 sim.update_reaction_parameter(mean_gly["index"], value)
                 if mean_gly["count"] % 50 == 0:
-                    print(f"[v1-headless] step={sim.step_count} t={sim.simulation_time:.4f}s population-mean X_gly {value:.4f}")
+                    print(f"[v1-headless] step={sim.step_count} t={sim.simulation_time:.4f}s population-mean "
+                          f"{mean_gly.get('label', 'X_gly')} {value:.6g}")
                 mean_gly["count"] += 1
 
             if mean_gly is not None:
                 update_mean_gly()
-                print(f"[v1-headless] population-mean X_gly written every {mean_gly['every']} steps "
+                print(f"[v1-headless] population-mean {mean_gly.get('label', 'X_gly')} written every {mean_gly['every']} steps "
                       f"= {mean_gly['every'] * case.timestep:.4f} s")
             statistics = None
             if args.flow_statistics is not None:

@@ -415,9 +415,77 @@ def check_s3(out):
     return {"name": "S3", "passed": bool(passed), "error_up": float(error_up), "error_down": float(error_down)}
 
 
+def run_box_mean_state(case_path, steps, samples, update):
+    """run_box with the population-mean state hook of the runner: update = None (reaction_parameter[0] stays at
+    its initial value) or "every step" (biomass-weighted mean of mu written before every step)."""
+    from utils.sph.case import load_case
+    from utils.sph.vulkan_context import VulkanContext
+    from experiment.v1.utils.simulator_v1 import SphSimulatorV1
+    case = load_case(str(case_path))
+    every = max(1, steps // samples)
+    series = []
+    with VulkanContext.create(application_name="reaction_box", enable_validation=False) as context:
+        simulator = SphSimulatorV1(context, case)
+        try:
+            simulator.bootstrap()
+            def sample():
+                snapshot = simulator.scalar_snapshot()
+                series.append({"time": simulator.simulation_time, "values": snapshot["scalars"].copy(),
+                               "mass": snapshot["mass"].copy(), "positions": snapshot["positions"].copy()})
+                return snapshot
+            snapshot = sample()
+            while simulator.step_count < steps:
+                if update:
+                    snapshot = simulator.scalar_snapshot()
+                    weight = snapshot["mass"] * np.maximum(snapshot["scalars"][:, COLUMN["X"]], 0.0)
+                    value = float(np.dot(weight, snapshot["scalars"][:, COLUMN["mu"]]) / weight.sum())
+                    simulator.update_reaction_parameter(0, value)
+                simulator.step()
+                if simulator.step_count % every == 0:
+                    sample()
+        finally:
+            simulator.destroy()
+    return series
+
+
+def check_s4(out):
+    """S4 (2026-10-25): state_coupling mean. (a) reaction_parameter[0] frozen at mu0 = 0 with C >> K_s: the demand stays
+    at alpha mu_max / Y + m, so mu = alpha mu_max (1 - exp(-t / tau_up)) exactly (first order in dt / tau).
+    (b) the mean written every step in a uniform box equals the particle state, so the run must reproduce the
+    own-state run (S3 up) to float precision."""
+    q_max, k_s, growth_yield, alpha, tau_up, tau_down = 2.0, 0.2, 0.5, 0.1, 0.5, 0.3
+    mu_max = growth_yield * q_max
+    from utils.sph.case import load_case
+    own = state_limited(q_max, k_s, growth_yield, demand_margin=alpha, tau_up=tau_up, tau_down=tau_down)
+    mean = dict(own, state_coupling="mean")
+    case_own, _ = build_case(out / "s4_own", fields=FIELDS_SEVEN(1.0e3, 1.0e-3, 0.0), reaction=own)
+    case_mean, _ = build_case(out / "s4_mean", fields=FIELDS_SEVEN(1.0e3, 1.0e-3, 0.0), reaction=mean)
+    dt = load_case(str(case_mean)).timestep
+    steps = int(round(4.0 / dt))
+    frozen = run_box_mean_state(case_mean, steps, 40, update=False)
+    updated = run_box_mean_state(case_mean, steps, 40, update=True)
+    _, reference, _ = run_box(case_own, steps, 40)
+    times = np.array([s["time"] for s in frozen])
+    (mu_frozen,) = means(frozen, "mu")
+    (mu_updated,) = means(updated, "mu")
+    (mu_own,) = means(reference, "mu")
+    exact = alpha * mu_max * (1.0 - np.exp(-times / tau_up))
+    error_frozen = np.abs(mu_frozen - exact).max() / (alpha * mu_max)
+    difference_updated = np.abs(mu_updated - mu_own).max() / mu_max
+    print(f"S4 state_coupling mean: dt {dt:.3e} s, {steps} steps")
+    for index in range(0, len(times), max(1, len(times) // 6)):
+        print(f"   t {times[index]:6.3f}: frozen mean mu {mu_frozen[index]:.6f} (exact {exact[index]:.6f})   "
+              f"updated mean {mu_updated[index]:.6f}  own {mu_own[index]:.6f}")
+    passed = error_frozen < 3e-3 and difference_updated < 1e-5
+    print(f"   (a) max |mu - exact| / (alpha mu_max) {error_frozen:.2e}; (b) max |mu_mean - mu_own| / mu_max "
+          f"{difference_updated:.2e} -> {'PASS' if passed else 'FAIL'}")
+    return {"name": "S4", "passed": bool(passed), "error_frozen": float(error_frozen),
+            "difference_updated": float(difference_updated)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--only", default="R1,R2,R3,S1,S2,S3")
+    parser.add_argument("--only", default="R1,R2,R3,S1,S2,S3,S4")
     parser.add_argument("--out", default="output/reaction_checks")
     arguments = parser.parse_args()
     from experiment.v1 import compile_shaders_v1
@@ -426,7 +494,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     results = []
     for name, function in (("R1", check_r1), ("R2", check_r2), ("R3", check_r3),
-                           ("S1", check_s1), ("S2", check_s2), ("S3", check_s3)):
+                           ("S1", check_s1), ("S2", check_s2), ("S3", check_s3), ("S4", check_s4)):
         if name in arguments.only.split(","):
             results.append(function(out))
     (out / "summary.json").write_text(json.dumps(results, indent=1), encoding="utf-8")

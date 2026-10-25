@@ -508,6 +508,16 @@ layout(constant_id = 106) const uint SOLID_PAIR_VISCOSITY_MODE = 0u;
 // false (default) = pairs with the rotor keep nu_f and the rotor is not a wall.
 layout(constant_id = 107) const bool WALL_LAW_INCLUDES_ROTOR = false;
 
+// --- Coupling of the state_limited demand (2026-10-25, scalars.reactions[0].state_coupling) ---
+// 0 own  (default, the original model): the demand of a particle uses its own state mu
+//        (local two-way coupling);
+// 1 mean: the demand uses the population-mean state that the host writes into
+//        reaction_parameter[0] (biomass-weighted mean of mu over the fluid, runner option
+//        --population-mean-state-every): the sink seen by the substrate field follows one
+//        tank-wide state (Haringa 2018's population-average coupling). Each particle's mu
+//        still relaxes towards its own realised growth rate.
+layout(constant_id = 108) const uint REACTION_STATE_COUPLING = 0u;
+
 // --- Free-slip walls (2026-10-02, material flag `free_slip: true`) ---
 // A BOUNDARY material with free_slip exerts no viscous force on the fluid and,
 // with USE_SOLID_REACTION_FORCE, receives none back: only the pressure force

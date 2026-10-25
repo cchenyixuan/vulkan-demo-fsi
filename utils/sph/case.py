@@ -736,6 +736,7 @@ NINEPOOL_DEFAULTS = dict(
     pHint=7.20, pHext=6.50, pKPAA=4.31, vd=5e-3, Mw=28.05, rho=1000.0, ATP_A=8.5, ATP_B=10.5,
     Ki11=float("inf"), glyMean11=0.0)
 NINEPOOL_UPTAKE_INHIBITION_MODES = {"off": 0, "own": 1, "mean": 2}   # spec 105 (2026-10-08)
+STATE_COUPLING_MODES = {"own": 0, "mean": 1}                          # spec 108 (2026-10-25), state_limited only
 # roles of ReactionParameterBuffer.reaction_field_slot, in order (common.glsl)
 NINEPOOL_ROLES = ("substrate", "paa", "uptake", "product", "growth_rate", "biomass",
                   "gly", "aa", "sto", "paa_pool", "e11", "e32", "e4", "pen_capacity")
@@ -798,6 +799,9 @@ class ScalarReactionConfig:
     # "off" (Tang 2017 as published, compiled out), "own" (the particle's X_gly, local two-way), "mean" (the
     # population-mean X_gly, written by the host into glyMean11 every few steps: Haringa 2018's coupling)
     uptake_inhibition: str = "off"
+    # state_limited only (2026-10-25): which state sets the demand, "own" (the particle's mu, local two-way, the
+    # original model) or "mean" (the population-mean mu the host writes into reaction_parameter[0])
+    state_coupling: str = "own"
 
     def __post_init__(self):
         if self.type not in ("monod", "state_limited", "ninepool"):
@@ -820,6 +824,9 @@ class ScalarReactionConfig:
                                  "tau_up > 0 and tau_down > 0")
             if len(self.product_rate) != 3:
                 raise ValueError("scalars.reactions: product_rate must be [p0, p1, p2]")
+            if self.state_coupling not in STATE_COUPLING_MODES:
+                raise ValueError(f"scalars.reactions: state_coupling must be one of {sorted(STATE_COUPLING_MODES)}, "
+                                 f"got {self.state_coupling!r}")
         elif self.type == "ninepool":
             missing = [role for role in NINEPOOL_REQUIRED if not getattr(self, role)]
             if missing:
@@ -846,6 +853,8 @@ class ScalarReactionConfig:
             raise ValueError("scalars.reactions: uptake_inhibition belongs to type ninepool")
         elif self.growth_rate or self.product or self.maintenance:
             raise ValueError("scalars.reactions: growth_rate / product / maintenance belong to type state_limited")
+        if self.type != "state_limited" and self.state_coupling != "own":
+            raise ValueError("scalars.reactions: state_coupling belongs to type state_limited")
 
     @property
     def mode(self) -> int:
@@ -860,6 +869,11 @@ class ScalarReactionConfig:
     def uptake_inhibition_mode(self) -> int:
         """NINEPOOL_UPTAKE_INHIBITION spec constant (105): 0 off, 1 own X_gly, 2 population mean."""
         return NINEPOOL_UPTAKE_INHIBITION_MODES[self.uptake_inhibition] if self.type == "ninepool" else 0
+
+    @property
+    def state_coupling_mode(self) -> int:
+        """REACTION_STATE_COUPLING spec constant (108): 0 own state, 1 population-mean state (state_limited)."""
+        return STATE_COUPLING_MODES[self.state_coupling] if self.type == "state_limited" else 0
 
 
 @dataclass
@@ -1474,6 +1488,7 @@ _SPEC_CONSTANT_MAPPING: list[_SpecRow] = [
     (103, lambda case: case.scalars.reactions[0].product_rate[2] if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
     (104, lambda case: case.scalars.diffusing_vec4_mask() if case.scalars is not None else 0xF, 'I'),  # SCALAR_DIFFUSING_VEC4_MASK (2026-10-07)
     (105, lambda case: case.scalars.reactions[0].uptake_inhibition_mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),  # NINEPOOL_UPTAKE_INHIBITION (2026-10-08)
+    (108, lambda case: case.scalars.reactions[0].state_coupling_mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),  # REACTION_STATE_COUPLING (2026-10-25)
     (93,  lambda case: 1 if any(material.free_slip for material in case.materials) else 0, 'I'),  # USE_FREE_SLIP_WALLS
     (77,  lambda case: 1 if case.numerics.momentum_sgs else 0,           'I'),  # USE_MOMENTUM_SGS
     (78,  lambda case: case.momentum_sgs_length_squared,               'f'),  # MOMENTUM_SGS_LENGTH_SQUARED

@@ -235,7 +235,9 @@ void main() {
                 float uptake       = substrate * rate_factor / (1.0 + rate_factor);              // supply
                 float growth_rate_maximum = max(REACTION_YIELD * (REACTION_Q_MAX - REACTION_MAINTENANCE), 0.0);
                 if (REACTION_YIELD > 0.0) {
-                    float demand = ((growth_rate + REACTION_DEMAND_MARGIN * growth_rate_maximum) / REACTION_YIELD
+                    // state that sets the demand: own (local two-way) or the host-written population mean
+                    float demand_state = (REACTION_STATE_COUPLING == 1u) ? max(reaction_parameter[0], 0.0) : growth_rate;
+                    float demand = ((demand_state + REACTION_DEMAND_MARGIN * growth_rate_maximum) / REACTION_YIELD
                                     + REACTION_MAINTENANCE) * biomass_time;
                     uptake = min(uptake, demand);
                 }

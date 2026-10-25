@@ -139,6 +139,7 @@ SPEC_ID_USE_SGS_WALL_DAMPING                = 94
 SPEC_ID_SGS_WALL_DISTANCE_OFFSET            = 95
 SPEC_ID_SOLID_PAIR_VISCOSITY_MODE           = 106  # 2026-10-13
 SPEC_ID_WALL_LAW_INCLUDES_ROTOR             = 107  # 2026-10-13
+SPEC_ID_REACTION_STATE_COUPLING             = 108  # 2026-10-25
 SPEC_ID_USE_SOLID_REACTION_FORCE            = 36
 SPEC_ID_SOLID_PRESSURE_OFFSET               = 37
 SPEC_ID_USE_DENSITY_DIFFUSION_GRADIENT_TERM = 38
@@ -712,6 +713,14 @@ class SphSimulatorV1:
                 values[:len(ordered)] = ordered
                 self._reaction_parameter_values = values      # kept for update_reaction_parameter()
                 data["reaction_parameters"] = slots.tobytes() + values.tobytes()
+            elif scalars.reactions and scalars.reactions[0].type == "state_limited" and scalars.reactions[0].state_coupling == "mean":
+                # population-mean state of the state_limited demand (2026-10-25): reaction_parameter[0], written by
+                # the host (update_reaction_parameter); starts at the initial mu of the growth_rate field
+                slots = np.full(REACTION_SLOT_COUNT, 0xFFFFFFFF, dtype=np.uint32)
+                values = np.zeros(REACTION_PARAMETER_COUNT, dtype=np.float32)
+                values[0] = scalars.fields[scalars.field_names.index(scalars.reactions[0].growth_rate)].initial
+                self._reaction_parameter_values = values
+                data["reaction_parameters"] = slots.tobytes() + values.tobytes()
 
         return data
 
@@ -1036,6 +1045,7 @@ class SphSimulatorV1:
             (SPEC_ID_REACTION_PRODUCT_P2,          float(case.scalars.reactions[0].product_rate[2]) if case.scalars is not None and case.scalars.reactions else 0.0, 'f'),
             (SPEC_ID_SCALAR_DIFFUSING_VEC4_MASK,   case.scalars.diffusing_vec4_mask() if case.scalars is not None else 0xF, 'I'),
             (SPEC_ID_NINEPOOL_UPTAKE_INHIBITION,   case.scalars.reactions[0].uptake_inhibition_mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),
+            (SPEC_ID_REACTION_STATE_COUPLING,      case.scalars.reactions[0].state_coupling_mode if case.scalars is not None and case.scalars.reactions else 0, 'I'),
             (SPEC_ID_USE_FREE_SLIP_WALLS,          1 if any(material.free_slip for material in case.materials) else 0, 'I'),
             (SPEC_ID_USE_SCALAR_BOUNDS_LIMITER,    1 if case.scalars is None or case.scalars.bounds_limiter else 0, 'I'),
             (SPEC_ID_SCALAR_FIELD_COUNT,           0 if case.scalars is None else len(case.scalars.fields), 'I'),
@@ -1975,7 +1985,7 @@ class SphSimulatorV1:
         glyMean11). Call between steps (after step(wait=True)); the whole 64-float block is re-uploaded."""
         values = getattr(self, "_reaction_parameter_values", None)
         if values is None:
-            raise RuntimeError("update_reaction_parameter: the case has no ninepool reaction")
+            raise RuntimeError("update_reaction_parameter: the case has no ninepool or state_coupling: mean reaction")
         values[index] = np.float32(value)
         vkQueueWaitIdle(self.ctx.compute_queue)
         self._staging_upload(self.buffers["reaction_parameters"], values.tobytes(), offset=REACTION_SLOT_COUNT * 4)
