@@ -10,7 +10,6 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
-sys.path.insert(0, "D:/Uni of Auckland Dropbox/Beichen Zhao/CFD Projects/SPH lifeline/vulkan-demo-fsi/experiment/v1/checks")
 import _analyze_axisymmetric_energy as axi            # noqa: E402
 import _analyze_fluctuation_scales as scales          # noqa: E402
 from _analyze_scale_bands import shepard_at                    # noqa: E402
@@ -18,7 +17,7 @@ from _analyze_scale_bands import shepard_at                    # noqa: E402
 RHO = 998.0
 WIDTH = 0.030
 SAMPLES = 200000
-REF = "D:/Uni of Auckland Dropbox/Beichen Zhao/CFD Projects/SPH lifeline/vulkan-demo-fsi/output/kecause/s3_plates_pb2000_newpbt_fluentinit_dense_t0.300.npz"
+REF = str(__import__("pathlib").Path(__file__).resolve().parents[3] / "output/kecause/s3_plates_pb2000_newpbt_fluentinit_dense_t0.300.npz")
 R_BANDS = ((0.0, 0.072, "r < 72"), (0.072, 0.110, "r 72..110"), (0.110, 0.144, "r 110..144"))
 Y_BANDS = ((-0.070, 0.0187, "floor"), (0.0187, 0.0585, "Rushton height"), (0.0585, 0.165, "between"),
            (0.165, 0.225, "PBT height"), (0.225, 0.430, "top"))

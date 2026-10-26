@@ -12,7 +12,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, "D:/Uni of Auckland Dropbox/Beichen Zhao/CFD Projects/SPH lifeline/vulkan-demo-fsi/experiment/v1/checks")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 import _analyze_axisymmetric_energy as axi   # noqa: E402
 import _analyze_pbt_bands as pb              # noqa: E402
 

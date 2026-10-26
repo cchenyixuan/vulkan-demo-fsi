@@ -1,6 +1,6 @@
 #!/bin/bash
 # local 80 h stitching of the Da-scan lifelines (reduced packs), six processes; mirrors ~/run/sph/stitch_Da30.sh on Paratera
-cd "D:/Uni of Auckland Dropbox/Beichen Zhao/CFD Projects/SPH lifeline/vulkan-demo-fsi"
+cd "$(dirname "$0")/../.."
 export PYTHONPATH=$PWD MPLBACKEND=Agg PYTHONIOENCODING=utf-8
 PY="D:/Coding/Anaconda3/python.exe"; L=output/Da30/lifelines; OUT=output/Da30/stitch
 INIT="gly=15.5,aa=931,sto=2652,paa=2.71,e11=0.146,e32=211.9,e4=0.048,v33=4.06e-4"

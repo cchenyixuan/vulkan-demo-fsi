@@ -9,13 +9,13 @@ import time
 import numpy as np
 from scipy.spatial import cKDTree
 
-sys.path.insert(0, "D:/Uni of Auckland Dropbox/Beichen Zhao/CFD Projects/SPH lifeline/vulkan-demo-fsi/experiment/v1/checks")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 import _analyze_axisymmetric_energy as axi            # noqa: E402
 import _analyze_fluctuation_scales as scales          # noqa: E402
 
 WIDTHS = [0.006, 0.009, 0.0135, 0.020, 0.030]
 RHO = 998.0
-REF = "D:/Uni of Auckland Dropbox/Beichen Zhao/CFD Projects/SPH lifeline/vulkan-demo-fsi/output/kecause/s3_plates_pb2000_newpbt_fluentinit_dense_t0.300.npz"
+REF = str(__import__("pathlib").Path(__file__).resolve().parents[3] / "output/kecause/s3_plates_pb2000_newpbt_fluentinit_dense_t0.300.npz")
 
 
 SAMPLES = 120000
