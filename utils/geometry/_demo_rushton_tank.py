@@ -531,6 +531,15 @@ def scalars_block(args, preset, h) -> str:
         lines.append(f"    - {{name: biomass, diffusivity: 0.0, turbulent: false, initial: {args.biomass:.6e}}}")
         lines.append("    - {name: uptake, diffusivity: 0.0, turbulent: false, initial: 0.0}")
         lines.append("    - {name: feed, diffusivity: 0.0, turbulent: false, initial: 0.0}")
+        if args.state_limited:
+            # level-2 cell model (2026-10-25, as utils/geometry/_demo_stirred_tank_30l.py): state vec4 after the substrate vec4
+            q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
+            maintenance = args.maintenance_umol_per_g_h * 1e-6 / 3600.0
+            growth_rate_initial = (args.growth_rate_initial if args.growth_rate_initial is not None
+                                   else max(args.growth_yield * (q_max - maintenance), 0.0))
+            lines.append(f"    - {{name: growth_rate, diffusivity: 0.0, turbulent: false, initial: {growth_rate_initial:.6e}}}")
+            lines.append("    - {name: product, diffusivity: 0.0, turbulent: false, initial: 0.0}")
+            lines.append("    - {name: maintenance, diffusivity: 0.0, turbulent: false, initial: 0.0}")
     for index in range(args.tracers):
         lines.append(f"    - {{name: tracer_{index + 1:02d}, diffusivity: {args.tracer_diffusivity:.3e}, "
                      f"turbulent: true, initial: 0.0}}")
@@ -557,6 +566,19 @@ def scalars_block(args, preset, h) -> str:
                       "    - {type: ninepool, substrate: substrate, paa: paa_ext, uptake: uptake, product: product, "
                       "growth_rate: growth_rate, biomass: biomass, gly: gly, aa: aa, sto: sto, paa_pool: paa_pool, "
                       "e11: e11, e32: e32, e4: e4, pen_capacity: pen_capacity, q_max: 0.0, k_s: 1.0" + extra + "}"]
+        lines += feed_source_lines(args, injection)
+    elif args.substrate and args.state_limited:
+        q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
+        maintenance = args.maintenance_umol_per_g_h * 1e-6 / 3600.0
+        p0, p1, p2 = args.product_rate
+        lines += ["  reactions:",
+                  f"    - {{type: state_limited, substrate: substrate, biomass: biomass, uptake: uptake, "
+                  f"growth_rate: growth_rate, product: product, maintenance: maintenance, "
+                  f"q_max: {q_max:.6e}, k_s: {args.k_s:.6e}, yield: {args.growth_yield:.6e}, "
+                  f"maintenance_rate: {maintenance:.6e}, demand_margin: {args.demand_margin:.6e}, "
+                  f"tau_up: {args.tau_up:.6e}, tau_down: {args.tau_down:.6e}, "
+                  f"product_rate: [{p0:.6e}, {p1:.6e}, {p2:.6e}]"
+                  + (", state_coupling: mean" if args.state_coupling == "mean" else "") + "}"]
         lines += feed_source_lines(args, injection)
     elif args.substrate:
         q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
@@ -617,6 +639,18 @@ def main() -> int:
     parser.add_argument("--q-max-umol-per-g-h", type=float, default=None,
                         help="Monod capacity of --substrate (default 1600) / --ninepool-one-way (default k_E11 X_E11,0 of the "
                              "initial pools = the two-way capacity, 2026-10-08)")
+    # level-2 cell model state_limited (2026-10-25): the options of utils/geometry/_demo_stirred_tank_30l.py
+    parser.add_argument("--state-limited", action="store_true",
+                        help="with --substrate: uptake limited by the growth-rate state mu (level 2, 7 fields)")
+    parser.add_argument("--growth-yield", type=float, default=0.0, help="level 2: g biomass / mol substrate")
+    parser.add_argument("--maintenance-umol-per-g-h", type=float, default=0.0, help="level 2: maintenance m_s, umol / (g h)")
+    parser.add_argument("--demand-margin", type=float, default=0.1, help="level 2: alpha")
+    parser.add_argument("--tau-up", type=float, default=60.0, help="level 2: relaxation time of mu upwards, s")
+    parser.add_argument("--tau-down", type=float, default=60.0, help="level 2: relaxation time of mu downwards, s")
+    parser.add_argument("--product-rate", type=float, nargs=3, default=(0.0, 0.0, 0.0), metavar=("P0", "P1", "P2"))
+    parser.add_argument("--growth-rate-initial", type=float, default=None, help="level 2: initial mu, 1/s")
+    parser.add_argument("--state-coupling", choices=("own", "mean"), default="own",
+                        help="level 2: demand from the particle's own mu or the population mean (--population-mean-state-every)")
     # 9-pool cell model (2026-10-08): the options of utils/geometry/_demo_stirred_tank_30l.py
     parser.add_argument("--ninepool", action="store_true",
                         help="9-pool cell model of Tang et al. 2017 on the fluid particles (15 fields, implies the feed)")
@@ -683,8 +717,10 @@ def main() -> int:
     background_pressure = args.background_pressure_factor * 1000.0 * tip_speed ** 2
     if (args.tracers > 0 or args.substrate) and preset["injection"] is None:
         parser.error(f"preset {args.preset} has no injection point")
-    if args.tracers + (4 if args.substrate else 0) > 12:
-        parser.error("at most 12 scalar fields: --substrate uses 4, so --tracers <= 8")
+    if args.state_limited and (not args.substrate or args.ninepool or args.growth_yield <= 0.0):
+        parser.error("--state-limited needs --substrate, no --ninepool and --growth-yield > 0")
+    if args.tracers + ((7 if args.state_limited else 4) if args.substrate else 0) > 12:
+        parser.error("at most 12 scalar fields: --substrate uses 4 (7 with --state-limited)")
 
     # Lattice: integer multiples of dx shifted by dx / 2 in x, y and z; disks on mid-planes.
     lo = np.array([-(radius + shell), -shell, -(radius + shell)])
