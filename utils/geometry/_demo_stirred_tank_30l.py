@@ -873,6 +873,10 @@ def scalars_block(args, h) -> str:
                      f"turbulent: true, initial: 0.0}}")
     lines += ["  sgs:", f"    enabled: {sgs_flag}", "    smagorinsky_cs: 0.1",
               "    turbulent_schmidt: 0.7"]
+    if args.sgs_filter_width is not None:
+        # 2026-10-29: Delta in units of dx; 2.35 dx = sqrt(12) x the per-direction standard deviation of the
+        # Wendland C4 kernel with support h = 3 dx (the width of a box filter with the kernel's second moment)
+        lines.append(f"    filter_width: {args.sgs_filter_width * h / args.hdx:.6e}")
     if args.ninepool:
         q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
         knob = ninepool_knob(args)
@@ -1077,6 +1081,9 @@ def main() -> int:
                         help="molecular diffusivity of the tracers (m^2/s)")
     parser.add_argument("--sgs", action="store_true",
                         help="enable the Smagorinsky sub-grid diffusivity for the tracers")
+    parser.add_argument("--sgs-filter-width", type=float, default=None, metavar="FACTOR",
+                        help="filter width Delta of the scalar Smagorinsky diffusivity in units of dx (default: dx); "
+                             "2.35 = the box-equivalent width of the h = 3 dx Wendland C4 kernel (2026-10-29)")
     parser.add_argument("--shift-correction", action="store_true",
                         help="interpolate the tracers along the particle shift (scalars.shift_correction; "
                              "default off: the tracers move with the particles)")
