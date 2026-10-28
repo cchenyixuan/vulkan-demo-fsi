@@ -13,6 +13,9 @@ discharge stream is on average in limitation, in RANS in starvation (his Fig. 3,
 3. Exchange through horizontal planes (default y = 2.4 m between the impellers and 5.9 m above the top impeller):
    crossings with a hysteresis band of +-MARGIN, the exchange flow Q = (crossings per direction) / span * V_sample,
    V_sample = fluid volume / lifelines; and the mean residence per visit below the plane (complete visits only).
+4. The same in the plane of the feed (|z| < W, the baffle plane theta = 0 / 180 deg, as Haringa's slice): q(<C_s>)
+   and the fraction of the time a sample in the cell is in starvation (also as an azimuthal map). C_s is skewed, so
+   q(<C_s>) marks a cell "limitation" although most of its samples starve; the time-in-starvation map shows that.
 
 usage (repo root):
     python experiment/v1/checks/_analyze_regime_layout_54m3.py DIR --k-s 7.8e-6 [--start 120] [--planes 2.4 5.9]
@@ -54,6 +57,7 @@ def main():
     parser.add_argument("--planes", type=float, nargs="*", default=[2.4, 5.9], help="exchange planes, m")
     parser.add_argument("--margin", type=float, default=0.1, help="hysteresis half-band of a plane crossing, m")
     parser.add_argument("--cell", type=float, default=0.1, help="(r, y) cell of the time-averaged map, m")
+    parser.add_argument("--slice-half-width", type=float, default=0.15, help="half width of the feed-plane slice, m")
     parser.add_argument("--out", default=None, help="prefix of the NPZ written")
     arguments = parser.parse_args()
 
@@ -146,9 +150,32 @@ def main():
               f"{np.median(stay_below):.2f}, n {stay_below.size:,}), above mean {stay_above.mean():.2f} s; "
               f"V_below / Q = {below_fraction / 100 * fluid_volume / max(flow, 1e-12):.1f} s")
 
+    print(f"\n4. maps in the plane of the feed (|z| < {arguments.slice_half_width:g} m, x > 0 = feed side), "
+          f"{arguments.cell:g} m (x, y) cells: q(<C_s>) and the fraction of the time in starvation")
+    in_slice = np.abs(position[..., 2]) < arguments.slice_half_width
+    x_bins = np.arange(-TANK_RADIUS, TANK_RADIUS + 0.5 * arguments.cell, arguments.cell)
+    slice_x, slice_y = position[..., 0][in_slice], height[in_slice]
+    slice_sums, _, _ = np.histogram2d(slice_x, slice_y, bins=(x_bins, height_bins), weights=concentration[in_slice])
+    slice_counts, _, _ = np.histogram2d(slice_x, slice_y, bins=(x_bins, height_bins))
+    slice_starved, _, _ = np.histogram2d(slice_x, slice_y, bins=(x_bins, height_bins), weights=(states[in_slice] == 0).astype(float))
+    slice_mean = np.where(slice_counts >= 20, slice_sums / np.maximum(slice_counts, 1), np.nan)
+    slice_starved_fraction = np.where(slice_counts >= 20, slice_starved / np.maximum(slice_counts, 1), np.nan)
+    ring_starved, _, _ = np.histogram2d(flat_r, flat_y, bins=(radius_bins, height_bins), weights=(states.ravel() == 0).astype(float))
+    ring_starved_fraction = np.where(counts >= 20, ring_starved / np.maximum(counts, 1), np.nan)
+    slice_q = slice_mean / (slice_mean + arguments.k_s)
+    slice_valid = np.isfinite(slice_q)
+    print(f"   plane cells with >= 20 samples {slice_valid.sum()} of {slice_valid.size}; area fractions of q(<C_s>) S / L / E "
+          + " / ".join(f"{100 * (condition & slice_valid).sum() / slice_valid.sum():.1f}"
+                       for condition in (slice_q < 0.05, (slice_q >= 0.05) & (slice_q <= 0.95), slice_q > 0.95)) + " %")
+    ring_valid = np.isfinite(ring_starved_fraction)
+    print(f"   azimuthal map, volume fraction of cells starving more than half of the time "
+          f"{100 * weights[ring_valid & (ring_starved_fraction > 0.5)].sum() / weights.sum():.1f} %")
+
     if arguments.out:
         np.savez_compressed(f"{arguments.out}.npz", radius_edges=radius_bins, height_edges=height_bins,
-                            mean_substrate=mean_field, samples=counts, k_s=arguments.k_s)
+                            mean_substrate=mean_field, samples=counts, k_s=arguments.k_s,
+                            starved_fraction=ring_starved_fraction, x_edges=x_bins, slice_mean_substrate=slice_mean,
+                            slice_starved_fraction=slice_starved_fraction, slice_samples=slice_counts)
         print(f"\nwrote {arguments.out}.npz")
     return 0
 
