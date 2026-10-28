@@ -35,7 +35,9 @@ Internals: the blades and the disks are thin plates (the paper's "2D sheet bodie
 particles on their mid-plane (case block `thin_plates:`). The baffles are by default solid, three
 layers of wall particles centred on the baffle plane (6 mm at dx = 2 mm; the paper's 3D bodies are
 5 mm thick): thin-plate baffles (--baffles plates) let the fluid at rest drift in density, see
-below. The top is a flat lid at the liquid height (no free surface, as in the paper);
+below. The 30 L production setup (2026-10-29): --baffles sheets (two layers on the lattice planes next to the
+baffle plane, as --conformal-baffles --thin-layers 2 there) and --smooth-walls (the cylinder wall as rings that
+follow the surface; the lattice shell of a cylinder is a staircase). The top is a flat lid at the liquid height (no free surface, as in the paper);
 --free-slip-lid makes it a no-shear wall like the paper's top (material flag free_slip). Fluid
 rho = 1000 kg/m3, nu = 1e-6 m2/s, no gravity, background pressure p_b = factor * rho * U_tip^2
 (factor 2 = the 2000 Pa of the 30 L runs in tip-speed units), c0 = 20 U_tip, accumulate walls
@@ -173,6 +175,24 @@ def closer_than(points, reference, distance):
             difference = block[:, None, :] - reference[None, first:first + 4000, :]
             mask[start:start + 500] |= (np.einsum("ijk,ijk->ij", difference, difference) < distance ** 2).any(axis=1)
     return mask
+
+
+def smooth_cylinder_shell(radius, dx, layers, rows):
+    """Shell of the cylinder wall as rings of particles that follow the surface (2026-10-29, --smooth-walls,
+    the cylinder part of smooth_tank_shell() of the 30 L generator; this tank has a flat floor, which the
+    lattice shell already represents exactly). Layer k = 0 .. layers - 1 lies at r = radius + (k + 0.5) dx,
+    on the lattice rows `rows` (y values), particles about dx apart (count = round(2 pi r / dx)), every
+    other row turned by half a spacing. Taken from the lattice, the shell of the cylinder is a staircase;
+    in the 30 L tank its steps braked the swirl by pressure about twice as hard as Fluent's smooth wall and
+    changed the flow pattern (log/2026-10-03_smooth-walls.md)."""
+    rings = []
+    for k in range(layers):
+        ring_radius = radius + (k + 0.5) * dx
+        count = int(round(2.0 * math.pi * ring_radius / dx))
+        for index, y in enumerate(rows):
+            angle = (np.arange(count) + 0.5 * (index % 2)) * (2.0 * math.pi / count)
+            rings.append(np.column_stack([ring_radius * np.cos(angle), np.full(count, y), ring_radius * np.sin(angle)]))
+    return np.vstack(rings)
 
 
 def rushton_dimensions(impeller):
@@ -677,9 +697,14 @@ def main() -> int:
     parser.add_argument("--baffle-extension", choices=("all", "lid", "none"), default="none",
                         help="diagnostics: how far the baffle outline continues into the shells")
     parser.add_argument("--only-plates", default=None, help="diagnostics: keep only plates whose name contains this")
-    parser.add_argument("--baffles", choices=("solid", "plates"), default="solid",
-                        help="solid: baffles of --baffle-layers layers of wall particles (default); plates: thin plates "
-                             "(the fluid at rest drifts in density, see the module docstring)")
+    parser.add_argument("--baffles", choices=("solid", "sheets", "plates"), default="solid",
+                        help="solid: baffles of --baffle-layers layers of wall particles (default); sheets (2026-10-29): two "
+                             "layers of wall particles on the lattice planes e_t.x = 0 and dx, the baffle plane offset by "
+                             "half a spacing (the 30 L production baffles, --conformal-baffles --thin-layers 2); plates: thin "
+                             "plates (the fluid at rest drifts in density, see the module docstring)")
+    parser.add_argument("--smooth-walls", action="store_true",
+                        help="cylinder wall as rings that follow the surface instead of the lattice staircase (2026-10-29, "
+                             "the 30 L production wall); the flat floor and the lid stay lattice shells")
     parser.add_argument("--baffle-layers", type=int, default=3, help="layers of a solid baffle (odd, centred on its plane)")
     parser.add_argument("--baffle-gap", type=float, default=0.0, help="diagnostics: gap between baffle and wall (m)")
     parser.add_argument("--baffle-bottom", type=float, default=0.0, help="diagnostics: height of the baffles' lower edge (m)")
@@ -761,8 +786,10 @@ def main() -> int:
     # dropped (as in the 30 L generator, which also drops sites on the slab surface).
     plates = [] if args.no_plates else tank_plates(preset, dx, shell, shaft_radius, args.baffle_extension, args.baffle_gap,
                                                     args.baffle_bottom)
-    if args.baffles == "solid":
+    if args.baffles in ("solid", "sheets"):
         plates = [plate for plate in plates if not plate["name"].startswith("baffle")]
+    if args.smooth_walls and args.wall_convention != "surface":
+        parser.error("--smooth-walls sets its own wall convention; leave --wall-convention at surface")
     if args.only_plates:
         plates = [plate for plate in plates if args.only_plates in plate["name"]]
     if args.plate_particles == "lattice":
@@ -805,6 +832,29 @@ def main() -> int:
         is_baffle = (Union(*boxes).signed_distance(sites) < -1e-9 * dx) & ~is_rotor & ~in_plate
         print(f"solid baffles: {args.baffle_layers} layers ({args.baffle_layers * dx * 1e3:.1f} mm), "
               f"{int((is_baffle & (sdf_interior < 0.0)).sum()):,} particles inside the tank")
+    elif args.baffles == "sheets":
+        # Two layers of wall particles, as the 30 L production baffles (--conformal-baffles --thin-layers 2:
+        # two layers dx apart, the fluid one spacing away on both sides). The baffle planes of this tank are
+        # lattice planes, so the two layers are put on the lattice planes e_t.x = 0 and dx (the baffle plane
+        # moves by dx / 2 along e_t, as the disks are snapped to a layer): the lattice sites of those planes
+        # inside the outline become the baffle, the fluid keeps the lattice spacing next to it. Outline:
+        # centres from r0 + dx / 2 to R - dx / 2 (half a cell inside the baffle's radial extent R - W .. R),
+        # over the fluid rows 0 < y < H.
+        tolerance = 1e-6 * dx
+        for index in range(preset["baffle_count"]):
+            e_r, e_t, e_y = (np.where(np.abs(axis) < 1e-12, 0.0, axis) for axis in
+                             radial_frame(preset["baffle_azimuth0_deg"] + index * 360.0 / preset["baffle_count"]))
+            along, across = sites @ e_r, sites @ e_t
+            r0 = radius - preset["baffle_width"]
+            on_layer = (np.abs(across) < tolerance) | (np.abs(across - dx) < tolerance)
+            inside = ((along > r0 + 0.5 * dx - tolerance) & (along < radius - 0.5 * dx + tolerance)
+                      & (sites[:, 1] > 0.0) & (sites[:, 1] < top))
+            if not (on_layer & inside).any():
+                parser.error("--baffles sheets: the baffle planes are not lattice planes (keep --lattice-offset y)")
+            is_baffle |= on_layer & inside
+        is_baffle &= ~is_rotor & ~in_plate
+        print(f"sheet baffles: 2 layers on lattice planes (baffle planes offset by {0.5 * dx * 1e3:.1f} mm along e_t), "
+              f"{int(is_baffle.sum()):,} particles")
     print(f"thin plates: {len(plates)} plates, {kept.shape[0]:,} particles, {int(in_plate.sum()):,} lattice sites dropped")
 
     # Fluid: lattice sites inside the tank; shell: `border` layers outside. Bottom and lid lie half a
@@ -818,10 +868,30 @@ def main() -> int:
     else:
         is_fluid = (sdf_interior < 0.0) & ~is_rotor & ~in_plate & ~is_baffle
         is_shell = ~is_fluid & ~is_rotor & ~in_plate & (sdf_interior >= 0.0) & (sdf_interior < shell)
+    ring_points = np.zeros((0, 3))
+    if args.smooth_walls:
+        # --smooth-walls (2026-10-29), as in the 30 L generator: fluid where r <= R - dx / 2 (between floor and lid
+        # as before), the cylinder shell = rings at R + (k + 1/2) dx on the lattice rows from the lowest floor row
+        # to the highest lid row. Of the lattice shell only the floor and the lid inside r < R + dx / 2 are kept;
+        # ring particles closer than 0.6 dx to a kept lattice shell site are dropped (the corners), and so is every
+        # lattice site (fluid, baffle) closer than 0.6 dx to a ring particle.
+        radial = np.hypot(sites[:, 0], sites[:, 2])
+        tolerance = 1e-9 * dx
+        is_fluid &= radial <= radius - 0.5 * dx + tolerance
+        is_shell &= ((sites[:, 1] < 0.0) | (sites[:, 1] > top)) & (radial < radius + 0.5 * dx - tolerance)
+        rows = np.unique(np.round(sites[(sites[:, 1] > -shell) & (sites[:, 1] < top + shell), 1], 9))
+        ring_points = smooth_cylinder_shell(radius, dx, border, rows)
+        ring_points = ring_points[~closer_than(ring_points, sites[is_shell | is_baffle], 0.6 * dx)]
+        candidates = np.nonzero((is_fluid | is_baffle) & (radial > radius - 2.0 * dx))[0]
+        too_close = candidates[closer_than(sites[candidates], ring_points, 0.6 * dx)]
+        print(f"smooth walls: {ring_points.shape[0]:,} ring particles in {border} layers on {rows.size} rows; "
+              f"{too_close.size} lattice sites closer than 0.6 dx dropped ({int(is_fluid[too_close].sum())} fluid)")
+        is_fluid[too_close] = False
+        is_baffle[too_close] = False
     is_shell |= is_baffle & (sdf_interior < 0.0)
     is_lid = is_shell & (sites[:, 1] > top)
     is_wall = is_shell & ~is_lid
-    fluid, wall, lid, rotor = sites[is_fluid], sites[is_wall], sites[is_lid], sites[is_rotor]
+    fluid, wall, lid, rotor = sites[is_fluid], np.vstack([sites[is_wall], ring_points]), sites[is_lid], sites[is_rotor]
 
     near_count = count_near_plates(fluid, plates, h) if plates else np.zeros(1, dtype=np.int32)
     print(f"thin plates: {int((near_count > 0).sum()):,} fluid particles ({100.0 * (near_count > 0).mean():.2f} %) "
@@ -900,7 +970,8 @@ def main() -> int:
     tank = dict(preset=args.preset, title=preset["title"], tank_radius=radius, liquid_height=top,
                 rpm=preset["rpm"], omega=omega, tip_speed=tip_speed, dx=dx, hdx=args.hdx, c0=c0,
                 background_pressure=background_pressure, timestep=timestep, shaft_radius=shaft_radius,
-                free_slip_lid=bool(args.free_slip_lid), baffle_count=preset["baffle_count"],
+                free_slip_lid=bool(args.free_slip_lid), smooth_walls=bool(args.smooth_walls), baffles=args.baffles,
+                baffle_count=preset["baffle_count"],
                 baffle_width=preset["baffle_width"], baffle_azimuth0_deg=preset["baffle_azimuth0_deg"],
                 impellers=[dict(impeller, **rushton_dimensions(impeller)) for impeller in preset["impellers"]],
                 injection=preset["injection"], probes=[dict(name=name, position=list(position))
