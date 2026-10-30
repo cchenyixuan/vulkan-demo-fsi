@@ -11,7 +11,7 @@
 # feed 0.44 mol/s from t = 0, 240 s = 2,371,800 steps (120 s development, 120 s statistics). COUPLING = own | mean
 # (mean: population-mean mu written every 0.5 s). Lifelines 20,000 every 0.1 s (988 steps), probes 0.5 s (4941),
 # snapshots 60 120 180 240 s, hourly checkpoints. Log: log/2026-10-26_haringa54-state-limited-generator.md
-# usage: CODE_DIR=... COUPLING=own|mean [WALLS="--smooth-walls --baffles sheets"] [RESUME=latest]
+# usage: CODE_DIR=... COUPLING=own|mean [WALLS="--smooth-walls --baffles sheets"] [TAU=20] [RESUME=latest]
 #        sbatch --export=ALL -J P54_own job_P54.sh P54_own
 # WALLS (2026-10-29): generator options of the walls; "--smooth-walls --baffles sheets" = the 30 L production walls
 # (log/2026-10-29_haringa54-production-walls.md); empty = the lattice cylinder and 90 mm solid baffles of P54.
@@ -24,13 +24,13 @@ export VK_DRIVER_FILES=/nesi/project/uoa04509/sph/nvidia_icd.json
 cd $FSI_ROOT
 OUT=/nesi/nobackup/uoa04509/sph/h54; CKPT=$OUT/${NAME}_ckpt; CASE=$OUT/${NAME}_case
 mkdir -p $OUT
-echo "host=$(hostname) job=$SLURM_JOB_ID $(date -Is) code=$FSI_ROOT name=$NAME coupling=$COUPLING walls=${WALLS:-} resume=${RESUME:-}"
+echo "host=$(hostname) job=$SLURM_JOB_ID $(date -Is) code=$FSI_ROOT name=$NAME coupling=$COUPLING tau=${TAU:-20} walls=${WALLS:-} resume=${RESUME:-}"
 nvidia-smi --query-gpu=index,name --format=csv,noheader
 if [ -z "${RESUME:-}" ]; then
     rm -rf "$CASE" "$OUT/${NAME}_lifelines" "$OUT/${NAME}_snapshots" "$CKPT" "$OUT/${NAME}_probes.csv" "$OUT/${NAME}_torque.csv"
     python utils/geometry/_demo_rushton_tank.py --preset haringa54 --dx 0.030 --free-slip-lid --sgs --shaft-stop-at-lid \
         --substrate --state-limited --biomass 10 --q-max-umol-per-g-h 8300 --k-s 1e-5 --growth-yield 90 \
-        --maintenance-umol-per-g-h 222 --demand-margin 0.1 --tau-up 20 --tau-down 20 --growth-rate-initial 6.94e-5 \
+        --maintenance-umol-per-g-h 222 --demand-margin 0.1 --tau-up ${TAU:-20} --tau-down ${TAU:-20} --growth-rate-initial 6.94e-5 \
         --feed-rate 0.44 --feed-start 0 --state-coupling $COUPLING ${WALLS:-} --out "$CASE" | grep -E "fluid=|dt =|smooth|sheet"
     sed -i "s#material_library: materials.yaml#material_library: $CASE/materials.yaml#" "$CASE/case.yaml"
     RESUME_ARGS=""
