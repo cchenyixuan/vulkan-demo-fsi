@@ -133,6 +133,9 @@ PRESETS = {
         injection=dict(center=(0.8, 7.35, 0.0), radius=0.2),
         probes=(("probe_bottom", (-0.75, 0.25, 0.0)),),
         release_sphere=dict(center=(0.5, 3.0, 0.0), radius=0.1),
+        # the ring below the lower impeller in Haringa et al. (2016) Fig. 1 and Haringa (2023) Fig. 3, probably the
+        # sparger; not described in their text, dimensions read from the figures (2026-10-31), section assumed round
+        sparger_ring=dict(outer_diameter=1.3, section_diameter=0.13, center_height=0.35),
     ),
     "jahoda2": dict(
         title="Haringa, Vandewijer and Mudde (2018) 2-impeller tank, geometry of Jahoda et al. (2007)",
@@ -565,6 +568,8 @@ def scalars_block(args, preset, h) -> str:
                      f"turbulent: true, initial: 0.0}}")
     lines += ["  sgs:", f"    enabled: {'true' if args.sgs else 'false'}", "    smagorinsky_cs: 0.1",
               "    turbulent_schmidt: 0.7"]
+    if args.sgs_filter_width is not None:
+        lines.append(f"    filter_width: {args.sgs_filter_width * args.dx:.6e}")
     centre = injection["center"]
     if args.ninepool:
         q_max = args.q_max_umol_per_g_h * 1e-6 / 3600.0
@@ -647,6 +652,8 @@ def main() -> int:
                         help="pulse length (s; the paper's injection is instantaneous)")
     parser.add_argument("--tracer-diffusivity", type=float, default=6.0e-10, help="m2/s (the paper: 6e-10)")
     parser.add_argument("--sgs", action="store_true", help="Smagorinsky diffusion of the scalars")
+    parser.add_argument("--sgs-filter-width", type=float, default=None, metavar="FACTOR",
+                        help="filter width of the scalar Smagorinsky model in units of dx (default: 1, the solver's dx)")
     parser.add_argument("--substrate", action="store_true", help="glucose feed with Monod uptake (Haringa 2023)")
     parser.add_argument("--k-s", type=float, default=HARINGA_K_S, help="Monod half-saturation, mol/kg")
     parser.add_argument("--biomass", type=float, default=HARINGA_BIOMASS, help="g/kg")
@@ -694,6 +701,11 @@ def main() -> int:
                         help="end the shaft at the lid plane and fill the lid hole with static lid particles (2026-10-08: "
                              "the rotating shaft inside the lid hole leaked top-layer fluid particles in the 54 m3 tank "
                              "at 25 mm); default: the shaft runs through the lid shell as before")
+    parser.add_argument("--shaft-to-floor", action="store_true",
+                        help="run the shaft down to the floor (as in the figures of Haringa 2016, 2023), not only to the "
+                             "lower edge of the lowest blades")
+    parser.add_argument("--sparger-ring", action="store_true",
+                        help="static solid ring of the preset's sparger_ring below the lower impeller")
     parser.add_argument("--baffle-extension", choices=("all", "lid", "none"), default="none",
                         help="diagnostics: how far the baffle outline continues into the shells")
     parser.add_argument("--only-plates", default=None, help="diagnostics: keep only plates whose name contains this")
@@ -776,7 +788,7 @@ def main() -> int:
     # 3.9M lost in 0.34 s, correction fallbacks). --shaft-stop-at-lid ends the shaft at the lid plane; the hole is
     # then filled with static lid particles and the fluid never sees a moving solid next to a static one.
     shaft_top = top if args.shaft_stop_at_lid else top + shell
-    shaft = y_cylinder(shaft_radius, lowest, shaft_top)
+    shaft = y_cylinder(shaft_radius, 0.0 if args.shaft_to_floor else lowest, shaft_top)
     sdf_interior = interior.signed_distance(sites)
     is_rotor = shaft.signed_distance(sites) <= 0.0
 
@@ -855,6 +867,18 @@ def main() -> int:
         is_baffle &= ~is_rotor & ~in_plate
         print(f"sheet baffles: 2 layers on lattice planes (baffle planes offset by {0.5 * dx * 1e3:.1f} mm along e_t), "
               f"{int(is_baffle.sum()):,} particles")
+    if args.sparger_ring:
+        if "sparger_ring" not in preset:
+            parser.error("--sparger-ring: this preset has no sparger_ring")
+        ring = preset["sparger_ring"]
+        section_radius = 0.5 * ring["section_diameter"]
+        centre_radius = 0.5 * ring["outer_diameter"] - section_radius
+        distance_to_section_centre = np.hypot(np.hypot(sites[:, 0], sites[:, 2]) - centre_radius,
+                                              sites[:, 1] - ring["center_height"])
+        is_ring = (distance_to_section_centre < section_radius) & ~is_rotor & ~in_plate
+        is_baffle |= is_ring
+        print(f"sparger ring: outer diameter {ring['outer_diameter']} m, section {ring['section_diameter']} m, "
+              f"centre at y = {ring['center_height']} m, {int(is_ring.sum()):,} wall particles")
     print(f"thin plates: {len(plates)} plates, {kept.shape[0]:,} particles, {int(in_plate.sum()):,} lattice sites dropped")
 
     # Fluid: lattice sites inside the tank; shell: `border` layers outside. Bottom and lid lie half a
