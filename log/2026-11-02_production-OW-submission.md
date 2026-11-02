@@ -15,7 +15,7 @@
 | OW-2 | Mahuika g01，PRO 6000 | 10383502 | 30 L，2 mm，Monod 1110 / 9.8e-6，10 个示踪脉冲 | 90 s | 2,056,600 | 6 d |
 | OW-25 | Mahuika g03，PRO 6000 | 10383503 | 54 m³，25 mm，Monod 1600 / 7.8e-6，8 个示踪脉冲 | 240 s | 2,846,160 | 4 d |
 | OW-4 | Paratera gpu_5090, gpu_4090 | 1760074，排队 | 30 L，4 mm，Monod 1110 / 9.8e-6，10 个示踪脉冲 | 90 s | 1,028,340 | 10 h |
-| OW-3 | Paratera gpu_5090, gpu_4090 | 1760075，排队 | 30 L，3 mm，Monod 1110 / 9.8e-6，兼作 9P-OW | 90 s | 1,371,133 | 20 h |
+| OW-3 | Paratera gpu_5090 | 1760361，排队（原 1760075 在 4090 上，用户要求重排） | 30 L，3 mm，Monod 1110 / 9.8e-6，兼作 9P-OW | 90 s | 1,371,133 | 20 h |
 
 共同设置：Δ = 2.4 dx，55 g/kg，lifeline 2 万条，从 t = 0 记录，字段 substrate、uptake，30 L 每 0.03 s，54 m³ 每 0.1 s；每小时检查点；Paratera 排除节点 wqd10nbj04g3。
 
