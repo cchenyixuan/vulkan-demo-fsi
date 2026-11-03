@@ -33,7 +33,7 @@ for name, (x, y, z) in PROBE_POINTS + extra_probes:
 
 4. 算例 `mix_3mm_sheets_W24_bp`：与 W24 相同（本地生成的 case.yaml 与 W24 的逐行比较，只多三个探针），只算到 55 s（838,000 步）。最后一个脉冲 34 s，之后还有 21 s。
 
-- Paratera gpu_5090，作业 1767469，`job_mix_pb.sh mix_3mm_sheets_W24_bp 0.003 838000 305 1 0`，`-t 08:00:00`，排除节点 wqd10nbj04g3。
+- Paratera，`job_mix_pb.sh mix_3mm_sheets_W24_bp 0.003 838000 305 1 0`，`-t 08:00:00`，排除节点 wqd10nbj04g3。先提交到 gpu_5090（作业 1767469，分区没有空卡，排队）；用户说 hp_5090 价格相同、可以随意用，取消后改投 hp_5090 `-A hp5090`，作业 1767472，节点 wqd10nbj11g2，立即开始。
 - 代码目录 `~/run/sph/vulkan-demo-fsi_688e87a_bp`：复制 688e87a，只换了生成器文件。
 - `EXTRA_FLAGS` = 生产配置（`--skin 0 --solid-pressure accumulate --solid-reaction-force --pair-correction reverse --thin-plates --background-pressure 2000 --smooth-walls --conformal-baffles --thin-layers 2`）加 `--sgs-filter-width 2.4` 和三个 `--probe`。
 - 预计按 W24 的速度（70 s 约 6 h）约 4.7 h，约 4.7 卡时。输出 `~/run/sph/mixing/mix_3mm_sheets_W24_bp_probes.csv`。
