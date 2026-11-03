@@ -925,7 +925,8 @@ def scalars_block(args, h) -> str:
                      f"{INJECTION_POINT[2]}], radius: {args.injection_radius:.4f}, start: {start:.4f}, "
                      f"duration: {args.injection_duration:.4f}, value: 1.0}}")
     lines += ["  probes:", f"    radius: {h:.6f}", "    points:"]
-    for name, (x, y, z) in PROBE_POINTS:
+    extra_probes = tuple((name, (float(x), float(y), float(z))) for name, x, y, z in args.extra_probe)
+    for name, (x, y, z) in PROBE_POINTS + extra_probes:
         lines.append(f"      - {{name: {name}, position: [{x}, {y}, {z}]}}")
     if args.shift_correction:
         # Taylor shift correction of the scalars (default off, see
@@ -1084,6 +1085,10 @@ def main() -> int:
     parser.add_argument("--sgs-filter-width", type=float, default=None, metavar="FACTOR",
                         help="filter width Delta of the scalar Smagorinsky diffusivity in units of dx (default: dx); "
                              "2.35 = the box-equivalent width of the h = 3 dx Wendland C4 kernel (2026-10-29)")
+    parser.add_argument("--probe", dest="extra_probe", action="append", default=[], nargs=4,
+                        metavar=("NAME", "X", "Y", "Z"), type=str,
+                        help="extra scalar probe point (repeatable), added to the paper's two probes; "
+                             "e.g. the bottom probe of the circulation time (2026-11-04)")
     parser.add_argument("--shift-correction", action="store_true",
                         help="interpolate the tracers along the particle shift (scalars.shift_correction; "
                              "default off: the tracers move with the particles)")
