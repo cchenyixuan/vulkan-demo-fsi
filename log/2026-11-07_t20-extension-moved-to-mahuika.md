@@ -28,3 +28,10 @@
 
 - 两个 own 续算各占 PRO 6000 一张，mean 排队多久不确定；若超过半天可考虑改投 H100（`job_prod.sh` 的 `--gres` 要改）。
 - Paratera `~/run/sph/xfer/` 里的两个检查点和一个 lifeline 测试文件（共 1.7 GB）用完后可删；本机 `output/xfer/` 的副本同样。
+
+## 补记（2026-11-07 中午）
+
+- mean 在 Mahuika 排队不动（Priority，PRO 6000 空卡被 planned 给多节点 CPU 作业，调度器估计 11-08 11:46 开始）。按用户决定，mean 续算同时在跳板机 ws8 的 RTX 5090 上开跑：`C:\Users\WS8\Documents\sph\queue_X4.ps1`（queue_X3 去掉等待 own\DONE 的循环，其余参数相同），WMI 分离启动，pid 28056，队列日志 `runs\queue_X4.log`，运行日志 `runs\G24_SL_t20_mean\run.log`。日志确认 `restored checkpoint: step=2371800 t=240.001349 s alive=2,282,450`，lifeline 恢复 20,000 条、2400 记录；约 33 步/s，预计 11-08 清晨（NZDT）到 480 s。Mahuika 的 10620768 按用户要求继续排队，两边谁先完成用谁，另一份取消。
+- ws8 上 lifeline 恢复时报 21 块而 Mahuika 报 20 块：ws8 的 lifeline 目录里多一个 240 s 收尾时写出的小块文件，续算从第 21 块起写，按块文件拼接时不影响。
+- Paratera 上曾按用户要求准备 mean 的续算布局（`~/run/sph/production/G24_SL_t20_mean_{case,lifelines}`、probes / torque csv，检查点在 `/data/run01/scxm138/sph/ckpt/G24_SL_t20_mean_ckpt/`，校验和一致），随后用户取消，未提交作业；文件留在原处，用完后与 `~/run/sph/xfer/` 一起删。
+- own 在 Mahuika 约 39 步/s，预计 11-08 00:40 NZDT 左右完成。
