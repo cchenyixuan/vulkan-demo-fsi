@@ -35,3 +35,4 @@
 - ws8 上 lifeline 恢复时报 21 块而 Mahuika 报 20 块：ws8 的 lifeline 目录里多一个 240 s 收尾时写出的小块文件，续算从第 21 块起写，按块文件拼接时不影响。
 - Paratera 上曾按用户要求准备 mean 的续算布局（`~/run/sph/production/G24_SL_t20_mean_{case,lifelines}`、probes / torque csv，检查点在 `/data/run01/scxm138/sph/ckpt/G24_SL_t20_mean_ckpt/`，校验和一致），随后用户取消，未提交作业；文件留在原处，用完后与 `~/run/sph/xfer/` 一起删。
 - own 在 Mahuika 约 39 步/s，预计 11-08 00:40 NZDT 左右完成。
+- 13:50 NZDT 用户决定 `scancel 10620768`：Mahuika 上的 mean 续算取消（从未开始运行），mean 只在 ws8 上跑；Mahuika 剩 τ45 一对和 τ20 own 三个作业。
